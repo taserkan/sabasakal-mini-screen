@@ -2262,31 +2262,6 @@ def add_cs2_backdrop(image: Image.Image, colors: dict[str, str]) -> None:
         base = Image.blend(hero, tint, 0.52)
         base = Image.blend(base, Image.new("RGB", (width, height), (0, 0, 0)), 0.12)
     overlay = base.convert("RGBA")
-    effects = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(effects, "RGBA")
-    muted = ImageColor.getrgb(colors["muted"])
-    edge = ImageColor.getrgb(colors["edge"])
-    accent = ImageColor.getrgb(colors["cpu"])
-
-    # Quiet tactical detail keeps the different CS2 views visually connected.
-    for offset in range(-height, width, 42):
-        draw.polygon(
-            ((offset, 0), (offset + 18, 0), (offset + height + 18, height),
-             (offset + height, height)),
-            fill=(*edge, 23),
-        )
-    radar_center = (382, 90)
-    for radius in (28, 50, 72, 94):
-        box = (
-            radar_center[0] - radius, radar_center[1] - radius,
-            radar_center[0] + radius, radar_center[1] + radius,
-        )
-        draw.arc(box, 150, 330, fill=(*muted, 30), width=1)
-    draw.line((radar_center[0], radar_center[1], 444, 45), fill=(*accent, 22), width=2)
-    for x, y in ((328, 50), (367, 109), (420, 72)):
-        draw.polygon(((x, y - 4), (x + 4, y), (x, y + 4), (x - 4, y)), fill=(*muted, 38))
-
-    overlay = Image.alpha_composite(overlay, effects)
 
     mask = Image.new("L", (width, height), 0)
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, width - 1, height - 1), radius=7, fill=255)
