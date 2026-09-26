@@ -24,6 +24,20 @@ battery information in one compact, themeable interface.
 
 ![English mini-display modes](docs/images/mini-screen-modes-en.png)
 
+## CS2 previews
+
+### CT bomb panel
+
+![CS2 CT bomb panel](docs/images/cs2-ct.png)
+
+### T bomb panel
+
+![CS2 T bomb panel](docs/images/cs2-t.png)
+
+### Deathmatch panel
+
+![CS2 deathmatch panel](docs/images/cs2-deathmatch.png)
+
 ## Download and run
 
 1. Open the latest GitHub **Release**.
