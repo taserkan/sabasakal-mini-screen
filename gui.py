@@ -56,6 +56,8 @@ SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
 RUNTIME_FALLBACK_LOG_PATH = APP_DATA / "runtime-current.log"
 ACTIVATE_REQUEST_PATH = APP_DATA / "show-window.request"
+ACTIVATE_ACK_PATH = APP_DATA / "show-window.ack"
+INSTANCE_STATE_PATH = APP_DATA / "instance.json"
 SENSOR_TASK_STATE_PATH = APP_DATA / "sensor-task.json"
 SENSOR_TASK_NAME = "CS2ScreenSensors"
 SENSOR_HOST_ROOT = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Sabasakal Mini Ekran"
@@ -347,8 +349,12 @@ TOP_DIRTY_TILES = tuple(
     )
 )
 _SINGLE_INSTANCE_HANDLE = None
+_RECOVERED_STALE_INSTANCE = False
 APP_DISPLAY_NAME = "Sabasakal Mini Ekran 3,5″"
 WINDOW_TITLE = f"{APP_DISPLAY_NAME} · Ayarlar"
+INSTANCE_HEARTBEAT_INTERVAL_MS = 1000
+INSTANCE_STALE_SECONDS = 5.0
+DISPLAY_STALL_SECONDS = 8.0
 
 
 def _runtime_log(message: str) -> None:
@@ -570,13 +576,94 @@ def _activate_existing_window(timeout_seconds: float = 12.0) -> bool:
         time.sleep(0.15)
 
 
-def _request_existing_window() -> bool:
+def _request_existing_window() -> str | None:
     """Ask a tray-only primary instance to restore its control panel."""
     try:
         APP_DATA.mkdir(parents=True, exist_ok=True)
-        ACTIVATE_REQUEST_PATH.write_text(str(time.time()), encoding="ascii")
-        return True
+        token = f"{os.getpid()}-{time.time_ns()}"
+        ACTIVATE_ACK_PATH.unlink(missing_ok=True)
+        ACTIVATE_REQUEST_PATH.write_text(token, encoding="ascii")
+        return token
     except OSError:
+        return None
+
+
+def _wait_for_activation_ack(token: str, timeout_seconds: float = 2.0) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while time.monotonic() < deadline:
+        try:
+            if ACTIVATE_ACK_PATH.read_text(encoding="ascii").strip() == token:
+                ACTIVATE_ACK_PATH.unlink(missing_ok=True)
+                return True
+        except OSError:
+            pass
+        time.sleep(0.10)
+    return False
+
+
+def _instance_state() -> dict:
+    try:
+        state = json.loads(INSTANCE_STATE_PATH.read_text(encoding="utf-8"))
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_instance_state() -> None:
+    """Publish a UI-thread heartbeat so a frozen tray process is recoverable."""
+    try:
+        APP_DATA.mkdir(parents=True, exist_ok=True)
+        process = psutil.Process(os.getpid())
+        payload = {
+            "pid": os.getpid(),
+            "created_at": process.create_time(),
+            "heartbeat": time.time(),
+            "executable": str(Path(sys.executable).resolve()),
+        }
+        temporary = INSTANCE_STATE_PATH.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temporary, INSTANCE_STATE_PATH)
+    except (OSError, psutil.Error):
+        pass
+
+
+def _cleanup_instance_state() -> None:
+    state = _instance_state()
+    if state.get("pid") != os.getpid():
+        return
+    try:
+        INSTANCE_STATE_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _terminate_unresponsive_primary() -> bool:
+    """Terminate only the verified owner of a stale single-instance heartbeat."""
+    state = _instance_state()
+    try:
+        heartbeat = float(state.get("heartbeat", 0.0))
+        pid = int(state.get("pid", 0))
+        expected_created_at = float(state.get("created_at", 0.0))
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or pid == os.getpid() or time.time() - heartbeat <= INSTANCE_STALE_SECONDS:
+        return False
+    try:
+        process = psutil.Process(pid)
+        if abs(process.create_time() - expected_created_at) > 1.0:
+            return False
+        expected_executable = os.path.normcase(str(state.get("executable") or ""))
+        if expected_executable and os.path.normcase(process.exe()) != expected_executable:
+            return False
+        process.terminate()
+        try:
+            process.wait(timeout=3.0)
+        except psutil.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2.0)
+        _runtime_log(f"unresponsive primary recovered; pid={pid}")
+        return True
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
         return False
 
 
@@ -621,7 +708,7 @@ def _terminate_stale_instances(minimum_age_seconds: float = 30.0) -> bool:
 
 
 def _acquire_single_instance(recovery_attempt: bool = False) -> bool:
-    global _SINGLE_INSTANCE_HANDLE
+    global _SINGLE_INSTANCE_HANDLE, _RECOVERED_STALE_INSTANCE
     if os.name != "nt":
         return True
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -632,15 +719,25 @@ def _acquire_single_instance(recovery_attempt: bool = False) -> bool:
         return True
     if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
         kernel32.CloseHandle(handle)
-        if not _activate_existing_window(timeout_seconds=0.8):
-            _request_existing_window()
+        if _activate_existing_window(timeout_seconds=0.8):
+            _runtime_log("duplicate launch redirected to existing instance")
+            return False
+        token = _request_existing_window()
+        if token and _wait_for_activation_ack(token):
+            _runtime_log("duplicate launch restored tray instance")
+            return False
+        if not recovery_attempt and _terminate_unresponsive_primary():
+            _RECOVERED_STALE_INSTANCE = True
+            time.sleep(0.35)
+            return _acquire_single_instance(recovery_attempt=True)
         # Never create parallel control panels: they can compete for the same
         # serial display and cut the media animation frame rate. The primary
         # instance also receives the restore request when it only lives in
         # the system tray and therefore has no discoverable native window.
-        _runtime_log("duplicate launch redirected to existing instance")
+        _runtime_log("duplicate launch found a live or unrecoverable primary instance")
         return False
     _SINGLE_INSTANCE_HANDLE = handle
+    _write_instance_state()
     try:
         ACTIVATE_REQUEST_PATH.unlink(missing_ok=True)
     except OSError:
@@ -797,6 +894,9 @@ class ControlPanel(QWidget):
         self._tray_enabled = not smoke_test
         self._autorun = autorun
         self._tray_setup_attempts = 0
+        self._smoke_test = smoke_test
+        self._screen_progress_at = 0.0
+        self._watchdog_restart_started = False
         self.tray_icon: QSystemTrayIcon | None = None
         self.signals = WorkerSignals()
         self.signals.preview.connect(self._show_preview)
@@ -816,6 +916,9 @@ class ControlPanel(QWidget):
         self.activation_timer = QTimer(self)
         self.activation_timer.timeout.connect(self._consume_activation_request)
         self.activation_timer.start(250)
+        self.liveness_timer = QTimer(self)
+        self.liveness_timer.timeout.connect(self._liveness_tick)
+        self.liveness_timer.start(INSTANCE_HEARTBEAT_INTERVAL_MS)
         self._refresh_preview()
         _runtime_log(f"control panel ready; autorun={autorun}; smoke_test={smoke_test}")
         if smoke_test:
@@ -825,12 +928,58 @@ class ControlPanel(QWidget):
         if not ACTIVATE_REQUEST_PATH.exists():
             return
         try:
+            token = ACTIVATE_REQUEST_PATH.read_text(encoding="ascii").strip()
             ACTIVATE_REQUEST_PATH.unlink(missing_ok=True)
         except OSError:
             return
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        try:
+            ACTIVATE_ACK_PATH.write_text(token, encoding="ascii")
+        except OSError:
+            pass
+
+    def _liveness_tick(self) -> None:
+        if self._smoke_test:
+            return
+        _write_instance_state()
+        worker = self.worker
+        if (
+            self._watchdog_restart_started
+            or self.stop_event.is_set()
+            or worker is None
+            or not worker.is_alive()
+        ):
+            return
+        if self._screen_progress_at and time.monotonic() - self._screen_progress_at > DISPLAY_STALL_SECONDS:
+            self._restart_after_display_stall()
+
+    def _restart_after_display_stall(self) -> None:
+        """Replace the process when a native USB display write blocks forever."""
+        if self._watchdog_restart_started:
+            return
+        self._watchdog_restart_started = True
+        _runtime_log("display watchdog detected a stalled frame loop; restarting application")
+        command = (
+            [sys.executable, "--autorun", "--recover-pid", str(os.getpid())]
+            if getattr(sys, "frozen", False)
+            else [
+                sys.executable, str(Path(__file__).resolve()),
+                "--autorun", "--recover-pid", str(os.getpid()),
+            ]
+        )
+        try:
+            subprocess.Popen(command, cwd=str(APP_DATA), creationflags=_hidden_flags())
+        except OSError as exc:
+            self._watchdog_restart_started = False
+            _runtime_log(f"display watchdog restart failed: {type(exc).__name__}: {exc}")
+            return
+        self._exit_requested = True
+        self.stop_event.set()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _style_sheet(self) -> str:
         return f"""
@@ -1843,6 +1992,8 @@ class ControlPanel(QWidget):
             self._install_gsi(quiet=True)
             self.stop_event.clear()
             self.screen_connected.clear()
+            self._screen_progress_at = time.monotonic()
+            self._watchdog_restart_started = False
             self.worker = threading.Thread(target=self._screen_worker, name="screen-worker", daemon=True)
             self.worker.start()
             self.start_button.setEnabled(False)
@@ -1960,6 +2111,11 @@ class ControlPanel(QWidget):
             last_media_gauge_slice = 0.0
             last_media_ring_refresh = 0.0
             while not self.stop_event.is_set():
+                # This heartbeat advances even while the display is unplugged
+                # and reconnect attempts fail. If a native USB call blocks,
+                # the UI watchdog can distinguish that hang from a normal
+                # retry loop and replace the process automatically.
+                self._screen_progress_at = time.monotonic()
                 current = dict(self.settings)
                 if screen is None:
                     try:
@@ -2214,6 +2370,7 @@ class ControlPanel(QWidget):
                     )
                     if last_view_mode is None:
                         screen.show(frame)
+                        self._screen_progress_at = time.monotonic()
                         sent_frame = frame.copy()
                         self.screen_connected.set()
                         last_full_gauge_refresh = time.monotonic()
@@ -2410,6 +2567,7 @@ class ControlPanel(QWidget):
                     self.stop_event.wait(1.5)
                     continue
                 last_view_mode = view_mode
+                self._screen_progress_at = time.monotonic()
                 last_match_signature = match_signature
                 if bomb_tick != last_bomb_tick:
                     if bomb_tick >= 0 and (last_bomb_tick is None or last_bomb_tick < 0):
@@ -2542,6 +2700,9 @@ class ControlPanel(QWidget):
             app = QApplication.instance()
             if app is not None:
                 app.quit()
+        elif not self.stop_event.is_set() and not self._smoke_test:
+            _runtime_log("screen worker stopped unexpectedly; scheduling automatic restart")
+            QTimer.singleShot(1000, self.start_screen)
 
     def _set_editing_enabled(self, enabled: bool) -> None:
         self._editing_enabled = enabled
@@ -2608,6 +2769,25 @@ def present_initial_window(panel: ControlPanel, autorun: bool) -> None:
     panel.activateWindow()
 
 
+def _wait_for_recovery_parent(pid: int, timeout_seconds: float = 10.0) -> None:
+    """Wait for a stalled parent to release the display and instance mutex."""
+    if pid <= 0 or pid == os.getpid():
+        return
+    try:
+        process = psutil.Process(pid)
+        try:
+            process.wait(timeout=timeout_seconds)
+        except psutil.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=2.0)
+            except psutil.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2.0)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+        pass
+
+
 def main() -> int:
     # Windows Run-key applications inherit System32 as their working folder.
     # Set a writable, stable folder before any screen driver is imported/used.
@@ -2625,7 +2805,10 @@ def main() -> int:
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--language", choices=tuple(SUPPORTED_LANGUAGES))
+    parser.add_argument("--recover-pid", type=int, default=0)
     args, _unknown = parser.parse_known_args()
+    if args.recover_pid:
+        _wait_for_recovery_parent(args.recover_pid)
     if not args.smoke_test and args.capture is None and not _acquire_single_instance():
         return 0
     app = QApplication(sys.argv[:1])
@@ -2650,8 +2833,9 @@ def main() -> int:
     app.aboutToQuit.connect(panel.prepare_system_shutdown)
     if not args.smoke_test and args.capture is None:
         QTimer.singleShot(350, ensure_sensor_task)
-    if args.autorun:
-        present_initial_window(panel, autorun=True)
+    start_automatically = args.autorun or _RECOVERED_STALE_INSTANCE
+    if start_automatically:
+        present_initial_window(panel, autorun=args.autorun)
         panel.start_screen()
 
         def report_autorun_result(retries: int = 10) -> None:
@@ -2679,7 +2863,10 @@ def main() -> int:
             panel.grab().save(str(args.capture))
             panel._exit_application()
         QTimer.singleShot(700, capture_and_close)
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        _cleanup_instance_state()
 
 
 if __name__ == "__main__":

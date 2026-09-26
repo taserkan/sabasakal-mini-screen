@@ -2848,19 +2848,41 @@ def draw_battery_devices(
     draw: ImageDraw.ImageDraw,
     devices: tuple[BatteryDevice, ...],
     colors: dict[str, str],
+    game_overlay: bool = False,
 ) -> None:
     devices = devices[:3]
     if not devices:
         return
-    # Keep the always-on device rail legible over game artwork as well as the
-    # plain media panel.
-    draw.rectangle((338, 203, 455, 294), fill=colors["panel"])
-    draw.line((337, 202, 337, 294), fill=colors["edge"], width=1)
+    if game_overlay:
+        # Blend the device rail into the CS2 artwork instead of placing a hard,
+        # opaque rectangle over the character and weapon.  The gradual shade
+        # keeps labels readable while preserving the scene behind them.
+        shade = Image.new("RGBA", (142, 130), (0, 0, 0, 0))
+        shade_draw = ImageDraw.Draw(shade, "RGBA")
+        panel_rgb = ImageColor.getrgb(colors["panel"])
+        for x in range(shade.width):
+            progress = x / max(1, shade.width - 1)
+            alpha = round(25 + (185 * progress * progress))
+            shade_draw.line((x, 0, x, shade.height), fill=(*panel_rgb, alpha))
+        if image.mode == "RGBA":
+            image.alpha_composite(shade, (323, 169))
+        else:
+            image.paste(shade, (323, 169), shade)
+        draw.line((337, 207, 337, 290), fill=colors["edge"], width=1)
+    else:
+        draw.rectangle((338, 176, 455, 294), fill=colors["panel"])
+        draw.line((337, 176, 337, 294), fill=colors["edge"], width=1)
+    # A single, centred battery glyph labels the rail without spending the
+    # horizontal space needed by three peripheral rows.
+    header_color = colors["muted"]
+    draw.rounded_rectangle((376, 181, 410, 193), radius=3, outline=header_color, width=2)
+    draw.rectangle((410, 184, 415, 190), fill=header_color)
+    draw.rounded_rectangle((381, 184, 401, 190), radius=1, fill=header_color)
     labels = {"mouse": "Mouse", "headset": _t("Kulaklık"), "keyboard": _t("Klavye")}
     row_centers = {
-        1: (251,),
-        2: (232, 270),
-        3: (215, 250, 285),
+        1: (248,),
+        2: (228, 270),
+        3: (215, 251, 286),
     }[len(devices)]
     for device, center_y in zip(devices, row_centers):
         color = _battery_color(device.percent, colors)
@@ -3277,7 +3299,7 @@ def render_screen(
             draw, matchmaking_pings or [], colors, matchmaking_source, content_right,
         )
     if battery_devices:
-        draw_battery_devices(image, draw, battery_devices, colors)
+        draw_battery_devices(image, draw, battery_devices, colors, game_overlay=True)
 
     return image
 

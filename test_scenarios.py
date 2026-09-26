@@ -2265,11 +2265,44 @@ class UiAndConnectionScenarios(unittest.TestCase):
     def test_tray_only_instance_can_receive_a_restore_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request_path = Path(directory) / "show-window.request"
+            ack_path = Path(directory) / "show-window.ack"
             with patch.object(gui, "APP_DATA", request_path.parent), patch.object(
                 gui, "ACTIVATE_REQUEST_PATH", request_path,
-            ):
-                self.assertTrue(gui._request_existing_window())
+            ), patch.object(gui, "ACTIVATE_ACK_PATH", ack_path):
+                token = gui._request_existing_window()
+                self.assertTrue(token)
                 self.assertTrue(request_path.is_file())
+                self.assertEqual(request_path.read_text(encoding="ascii"), token)
+
+    def test_instance_heartbeat_records_exact_process_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "instance.json"
+            with patch.object(gui, "APP_DATA", root), patch.object(
+                gui, "INSTANCE_STATE_PATH", state_path,
+            ):
+                gui._write_instance_state()
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["pid"], os.getpid())
+            self.assertGreater(state["created_at"], 0)
+            self.assertLess(abs(state["heartbeat"] - time.time()), 2.0)
+
+    def test_display_watchdog_restarts_only_a_stalled_worker(self) -> None:
+        panel = self.make_panel()
+        panel.worker = SimpleNamespace(is_alive=lambda: True)
+        panel._screen_progress_at = time.monotonic() - gui.DISPLAY_STALL_SECONDS - 1.0
+        with patch.object(gui, "_write_instance_state"), patch.object(
+            panel, "_restart_after_display_stall",
+        ) as restart:
+            panel._liveness_tick()
+        restart.assert_called_once_with()
+        panel._screen_progress_at = time.monotonic()
+        with patch.object(gui, "_write_instance_state"), patch.object(
+            panel, "_restart_after_display_stall",
+        ) as restart:
+            panel._liveness_tick()
+        restart.assert_not_called()
+        panel.close()
 
     def test_system_tray_has_open_start_stop_and_exit_actions(self) -> None:
         with patch.object(gui.QSystemTrayIcon, "isSystemTrayAvailable", return_value=True):

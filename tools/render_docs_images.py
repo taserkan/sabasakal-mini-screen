@@ -30,6 +30,11 @@ PINGS = [
     RelayPing("fra", "Frankfurt", "127.0.0.1", 57.0),
     RelayPing("ams", "Amsterdam", "127.0.0.1", 63.0),
 ]
+GAME_BATTERIES = (
+    BatteryDevice("mouse", "PRO X SUPERLIGHT 2", 75, "mouse"),
+    BatteryDevice("headset", "PRO X WIRELESS", 74, "headset"),
+    BatteryDevice("keyboard", "G915 TKL", 61, "keyboard"),
+)
 
 
 def frame(snapshot: GameSnapshot | None = None, active: bool = False, **kwargs) -> Image.Image:
@@ -51,25 +56,28 @@ def main() -> None:
                 artist="Live rhythm visualisation", status="playing",
             ),
             audio_spectrum=AudioSpectrumSnapshot(bars=bars, level=0.62, active=True),
+            battery_devices=GAME_BATTERIES,
         )),
         ("Valve ping before queue", frame(
             active=True, matchmaking_pings=PINGS, matchmaking_source="VALVE",
+            battery_devices=GAME_BATTERIES,
         )),
         ("FACEIT ping before queue", frame(
             active=True, matchmaking_pings=PINGS, matchmaking_source="FACEIT",
+            battery_devices=GAME_BATTERIES,
         )),
         ("CS2 · CT", frame(GameSnapshot(
             connected=True, in_match=True, team="CT", money=4250,
             has_defuse_kit=True, bomb_planted=True, bomb_seconds=8.0,
-        ), True)),
+        ), True, battery_devices=GAME_BATTERIES)),
         ("CS2 · T", frame(GameSnapshot(
             connected=True, in_match=True, team="T", money=4250,
             bomb_planted=True, bomb_seconds=4.0,
-        ), True)),
+        ), True, battery_devices=GAME_BATTERIES)),
         ("CS2 · Deathmatch", frame(GameSnapshot(
             connected=True, in_match=True, team="CT", game_mode="deathmatch",
             kills=42, headshot_kills=21, headshot_percent=50,
-        ), True)),
+        ), True, battery_devices=GAME_BATTERIES)),
         ("MSFS 2024", frame(
             msfs_active=True,
             flight_telemetry=FlightTelemetry(
@@ -78,6 +86,7 @@ def main() -> None:
                 connected=True, updated_at=1.0,
             ),
             msfs_layout="cockpit",
+            battery_devices=GAME_BATTERIES,
         )),
         ("Weather + wireless", frame(
             weather_readings=(
@@ -85,10 +94,7 @@ def main() -> None:
                 WeatherReading("Berlin", 21.0, 3),
                 WeatherReading("Madrid", 29.0, 0),
             ),
-            battery_devices=(
-                BatteryDevice("mouse", "PRO X SUPERLIGHT 2", 85, "mouse"),
-                BatteryDevice("headset", "PRO X WIRELESS", 52, "headset"),
-            ),
+            battery_devices=GAME_BATTERIES,
         )),
     ]
 
