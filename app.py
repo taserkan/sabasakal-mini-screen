@@ -2236,17 +2236,39 @@ def temperature_number_color(
     return temperature_unit_color(value, component, colors, animation_time)
 
 
+@functools.lru_cache(maxsize=1)
+def _load_cs2_hero() -> Image.Image | None:
+    """Load the bundled CS2 showcase background once per process."""
+    path = ROOT / "cs2-hero.jpg"
+    if not path.is_file():
+        return None
+    try:
+        return Image.open(path).convert("RGB").resize((450, 144), Image.Resampling.LANCZOS)
+    except (OSError, ValueError):
+        return None
+
+
 def add_cs2_backdrop(image: Image.Image, colors: dict[str, str]) -> None:
-    """Draw an original, licence-free tactical texture behind CS2 panels."""
+    """Draw the CS2 hero image with a theme-aware tactical overlay."""
     width, height = 450, 144
-    overlay = Image.new("RGBA", (width, height), (*ImageColor.getrgb(colors["panel"]), 255))
-    draw = ImageDraw.Draw(overlay, "RGBA")
+    hero = _load_cs2_hero()
+    panel_rgb = ImageColor.getrgb(colors["panel"])
+    if hero is None:
+        base = Image.new("RGB", (width, height), panel_rgb)
+    else:
+        # Retain the recognisable artwork while keeping live values readable
+        # in every light/dark colour preset.
+        tint = Image.new("RGB", (width, height), panel_rgb)
+        base = Image.blend(hero, tint, 0.52)
+        base = Image.blend(base, Image.new("RGB", (width, height), (0, 0, 0)), 0.12)
+    overlay = base.convert("RGBA")
+    effects = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(effects, "RGBA")
     muted = ImageColor.getrgb(colors["muted"])
     edge = ImageColor.getrgb(colors["edge"])
     accent = ImageColor.getrgb(colors["cpu"])
 
-    # Quiet diagonal lanes and a radar motif add depth without competing with
-    # the timer, economy values or warning colours.
+    # Quiet tactical detail keeps the different CS2 views visually connected.
     for offset in range(-height, width, 42):
         draw.polygon(
             ((offset, 0), (offset + 18, 0), (offset + height + 18, height),
@@ -2263,6 +2285,8 @@ def add_cs2_backdrop(image: Image.Image, colors: dict[str, str]) -> None:
     draw.line((radar_center[0], radar_center[1], 444, 45), fill=(*accent, 22), width=2)
     for x, y in ((328, 50), (367, 109), (420, 72)):
         draw.polygon(((x, y - 4), (x + 4, y), (x, y + 4), (x - 4, y)), fill=(*muted, 38))
+
+    overlay = Image.alpha_composite(overlay, effects)
 
     mask = Image.new("L", (width, height), 0)
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, width - 1, height - 1), radius=7, fill=255)
