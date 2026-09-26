@@ -1,0 +1,3 @@
+LibreHardwareMonitorLib is bundled as a headless sensor component.
+LibreHardwareMonitor is licensed under the Mozilla Public License 2.0.
+Source: https://github.com/LibreHardwareMonitor/LibreHardwareMonitor
