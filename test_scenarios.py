@@ -187,6 +187,64 @@ class SettingsScenarios(unittest.TestCase):
             self.assertFalse(gui.reconcile_windows_autostart(True))
         self.assertIn("autostart reconciliation failed", runtime_log.call_args.args[0])
 
+    def test_startup_task_xml_is_resilient_and_targets_current_app(self) -> None:
+        with patch.object(gui, "_startup_action", return_value=(r"C:\Apps\Sabasakal.exe", "--autorun")):
+            xml = gui._startup_task_xml()
+        self.assertIn("<LogonTrigger>", xml)
+        self.assertIn("<Delay>PT7S</Delay>", xml)
+        self.assertIn("<StartWhenAvailable>true</StartWhenAvailable>", xml)
+        self.assertIn("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>", xml)
+        self.assertIn("<RestartOnFailure>", xml)
+        self.assertIn(r"<Command>C:\Apps\Sabasakal.exe</Command>", xml)
+        self.assertIn("<Arguments>--autorun</Arguments>", xml)
+
+    def test_autostart_uses_task_and_registry_fallback(self) -> None:
+        with patch.object(gui, "_install_windows_startup_task", return_value=True) as task, patch.object(
+            gui, "_install_windows_startup_shortcut", return_value=True,
+        ) as shortcut, patch.object(
+            gui, "_set_windows_run_fallback",
+        ) as fallback:
+            gui.set_windows_autostart(True)
+        task.assert_called_once_with()
+        shortcut.assert_called_once_with()
+        fallback.assert_called_once_with(True)
+
+    def test_autostart_survives_task_failure_when_fallback_succeeds(self) -> None:
+        with patch.object(gui, "_install_windows_startup_task", return_value=False), patch.object(
+            gui, "_install_windows_startup_shortcut", return_value=True,
+        ), patch.object(
+            gui, "_set_windows_run_fallback",
+        ):
+            gui.set_windows_autostart(True)
+
+    def test_autostart_disable_removes_both_launch_paths(self) -> None:
+        with patch.object(gui, "_remove_windows_startup_task", return_value=True) as task, patch.object(
+            gui, "_remove_windows_startup_shortcut", return_value=True,
+        ) as shortcut, patch.object(
+            gui, "_set_windows_run_fallback",
+        ) as fallback:
+            gui.set_windows_autostart(False)
+        task.assert_called_once_with()
+        shortcut.assert_called_once_with()
+        fallback.assert_called_once_with(False)
+
+    def test_startup_shortcut_targets_current_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            gui, "_windows_startup_shortcut_path",
+            return_value=Path(directory) / gui.STARTUP_SHORTCUT_NAME,
+        ), patch.object(
+            gui, "_startup_action", return_value=(r"C:\Apps\Sabasakal.exe", "--autorun"),
+        ), patch.object(gui.subprocess, "run") as run:
+            def create_shortcut(command, **_kwargs):
+                script = command[-1]
+                self.assertIn(r"C:\Apps\Sabasakal.exe", script)
+                self.assertIn("--autorun", script)
+                (Path(directory) / gui.STARTUP_SHORTCUT_NAME).touch()
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+            run.side_effect = create_shortcut
+            self.assertTrue(gui._install_windows_startup_shortcut())
+
     def test_runtime_working_directory_is_writable_and_not_inherited(self) -> None:
         previous = Path.cwd()
         with tempfile.TemporaryDirectory() as directory:
@@ -2273,6 +2331,39 @@ class UiAndConnectionScenarios(unittest.TestCase):
                 self.assertTrue(token)
                 self.assertTrue(request_path.is_file())
                 self.assertEqual(request_path.read_text(encoding="ascii"), token)
+
+    def test_duplicate_launch_restores_through_qt_before_native_window_api(self) -> None:
+        with patch.object(gui, "_request_existing_window", return_value="token") as request, patch.object(
+            gui, "_wait_for_activation_ack", return_value=True,
+        ) as wait, patch.object(gui, "_activate_existing_window") as native:
+            self.assertTrue(gui._restore_existing_instance_window())
+        request.assert_called_once_with()
+        wait.assert_called_once_with("token")
+        native.assert_not_called()
+
+    def test_duplicate_launch_uses_native_activation_only_as_fallback(self) -> None:
+        with patch.object(gui, "_request_existing_window", return_value="token"), patch.object(
+            gui, "_wait_for_activation_ack", return_value=False,
+        ), patch.object(gui, "_activate_existing_window", return_value=True) as native:
+            self.assertTrue(gui._restore_existing_instance_window())
+        native.assert_called_once_with(timeout_seconds=0.8)
+
+    def test_duplicate_autorun_never_reveals_existing_window(self) -> None:
+        def create_mutex(*_args):
+            return 123
+
+        # ctypes assigns signatures to these callables at runtime.
+        create_mutex.argtypes = None
+        create_mutex.restype = None
+        kernel = SimpleNamespace(CreateMutexW=create_mutex, CloseHandle=lambda _handle: None)
+        with patch.object(gui.ctypes, "WinDLL", return_value=kernel), patch.object(
+            gui.ctypes, "get_last_error", return_value=183,
+        ), patch.object(gui, "_restore_existing_instance_window") as restore, patch.object(
+            gui, "_runtime_log",
+        ) as runtime_log:
+            self.assertFalse(gui._acquire_single_instance(activate_existing=False))
+        restore.assert_not_called()
+        self.assertIn("duplicate autorun ignored", runtime_log.call_args.args[0])
 
     def test_instance_heartbeat_records_exact_process_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

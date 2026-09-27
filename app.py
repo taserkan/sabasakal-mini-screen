@@ -2875,9 +2875,9 @@ def draw_battery_devices(
     # A single, centred battery glyph labels the rail without spending the
     # horizontal space needed by three peripheral rows.
     header_color = colors["muted"]
-    draw.rounded_rectangle((376, 181, 410, 193), radius=3, outline=header_color, width=2)
-    draw.rectangle((410, 184, 415, 190), fill=header_color)
-    draw.rounded_rectangle((381, 184, 401, 190), radius=1, fill=header_color)
+    draw.rounded_rectangle((378, 182, 409, 192), radius=3, outline=header_color, width=2)
+    draw.rectangle((409, 185, 413, 189), fill=header_color)
+    draw.rounded_rectangle((382, 185, 400, 189), radius=1, fill=header_color)
     labels = {"mouse": "Mouse", "headset": _t("Kulaklık"), "keyboard": _t("Klavye")}
     row_centers = {
         1: (248,),

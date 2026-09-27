@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 from PIL import Image, ImageChops
 import psutil
@@ -51,6 +52,8 @@ from i18n import SUPPORTED_LANGUAGES, normalize_language, translate
 
 
 RUN_VALUE_NAME = "CS2Screen"
+STARTUP_TASK_NAME = "SabasakalMiniScreen"
+STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -601,6 +604,21 @@ def _wait_for_activation_ack(token: str, timeout_seconds: float = 2.0) -> bool:
     return False
 
 
+def _restore_existing_instance_window() -> bool:
+    """Restore through Qt first so a hidden window is laid out and repainted."""
+    token = _request_existing_window()
+    if token and _wait_for_activation_ack(token):
+        _runtime_log("duplicate launch restored tray instance")
+        return True
+    # Keep native activation only as a last-resort fallback for an instance
+    # whose Qt event loop cannot acknowledge the request. Calling ShowWindow
+    # first on a never-shown Qt widget can expose an unpainted white surface.
+    if _activate_existing_window(timeout_seconds=0.8):
+        _runtime_log("duplicate launch redirected to existing instance")
+        return True
+    return False
+
+
 def _instance_state() -> dict:
     try:
         state = json.loads(INSTANCE_STATE_PATH.read_text(encoding="utf-8"))
@@ -707,7 +725,9 @@ def _terminate_stale_instances(minimum_age_seconds: float = 30.0) -> bool:
     return True
 
 
-def _acquire_single_instance(recovery_attempt: bool = False) -> bool:
+def _acquire_single_instance(
+    recovery_attempt: bool = False, activate_existing: bool = True,
+) -> bool:
     global _SINGLE_INSTANCE_HANDLE, _RECOVERED_STALE_INSTANCE
     if os.name != "nt":
         return True
@@ -719,17 +739,20 @@ def _acquire_single_instance(recovery_attempt: bool = False) -> bool:
         return True
     if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
         kernel32.CloseHandle(handle)
-        if _activate_existing_window(timeout_seconds=0.8):
-            _runtime_log("duplicate launch redirected to existing instance")
+        # Windows may launch both the Startup-folder shortcut and HKCU Run
+        # fallback at nearly the same time. An autorun duplicate must exit
+        # silently; only an explicit/manual launch should reveal the UI.
+        if not activate_existing:
+            _runtime_log("duplicate autorun ignored; primary remains in tray")
             return False
-        token = _request_existing_window()
-        if token and _wait_for_activation_ack(token):
-            _runtime_log("duplicate launch restored tray instance")
+        if _restore_existing_instance_window():
             return False
         if not recovery_attempt and _terminate_unresponsive_primary():
             _RECOVERED_STALE_INSTANCE = True
             time.sleep(0.35)
-            return _acquire_single_instance(recovery_attempt=True)
+            return _acquire_single_instance(
+                recovery_attempt=True, activate_existing=activate_existing,
+            )
         # Never create parallel control panels: they can compete for the same
         # serial display and cut the media animation frame rate. The primary
         # instance also receives the restore request when it only lives in
@@ -827,7 +850,46 @@ def startup_command() -> str:
     return f'"{Path(sys.executable)}" "{Path(__file__).resolve()}" --autorun'
 
 
-def set_windows_autostart(enabled: bool) -> None:
+def _startup_action() -> tuple[str, str]:
+    if getattr(sys, "frozen", False):
+        return str(Path(sys.executable).resolve()), "--autorun"
+    return str(Path(sys.executable).resolve()), f'"{Path(__file__).resolve()}" --autorun'
+
+
+def _startup_task_xml() -> str:
+    executable, arguments = _startup_action()
+    account = "\\".join(filter(None, (
+        os.environ.get("USERDOMAIN"), os.environ.get("USERNAME"),
+    ))) or os.environ.get("USERNAME", "")
+    # Task Scheduler is the primary launch path. A short delay lets Windows
+    # finish enumerating the USB display and audio devices before the first
+    # frame, while StartWhenAvailable and RestartOnFailure cover slow logons.
+    return f'''<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Sabasakal Mini Screen automatic startup</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><Delay>PT7S</Delay></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>{xml_escape(account)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>{xml_escape(executable)}</Command><Arguments>{xml_escape(arguments)}</Arguments><WorkingDirectory>{xml_escape(str(APP_DATA))}</WorkingDirectory></Exec>
+  </Actions>
+</Task>'''
+
+
+def _set_windows_run_fallback(enabled: bool) -> None:
     import winreg
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
     # Some Windows cleanup/startup configurations remove an empty Run key.
@@ -842,8 +904,134 @@ def set_windows_autostart(enabled: bool) -> None:
                 pass
 
 
+def _windows_startup_shortcut_path() -> Path:
+    return (
+        Path(os.environ.get("APPDATA", APP_DATA.parent))
+        / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+        / STARTUP_SHORTCUT_NAME
+    )
+
+
+def _powershell_literal(value: str | Path) -> str:
+    return str(value).replace("'", "''")
+
+
+def _install_windows_startup_shortcut() -> bool:
+    """Create a per-user Startup shortcut without requiring administrator rights."""
+    shortcut = _windows_startup_shortcut_path()
+    executable, arguments = _startup_action()
+    try:
+        shortcut.parent.mkdir(parents=True, exist_ok=True)
+        script = (
+            "$w=New-Object -ComObject WScript.Shell;"
+            f"$s=$w.CreateShortcut('{_powershell_literal(shortcut)}');"
+            f"$s.TargetPath='{_powershell_literal(executable)}';"
+            f"$s.Arguments='{_powershell_literal(arguments)}';"
+            f"$s.WorkingDirectory='{_powershell_literal(APP_DATA)}';"
+            f"$s.IconLocation='{_powershell_literal(executable)},0';"
+            "$s.Description='Sabasakal Mini Screen automatic startup';"
+            "$s.Save()"
+        )
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+             "-Command", script],
+            capture_output=True, text=True, timeout=20,
+            creationflags=_hidden_flags(),
+        )
+        if result.returncode != 0 or not shortcut.is_file():
+            _runtime_log(
+                "startup shortcut install failed: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            return False
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        _runtime_log(f"startup shortcut install exception: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _remove_windows_startup_shortcut() -> bool:
+    try:
+        _windows_startup_shortcut_path().unlink(missing_ok=True)
+        return True
+    except OSError as exc:
+        _runtime_log(f"startup shortcut removal exception: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _install_windows_startup_task() -> bool:
+    APP_DATA.mkdir(parents=True, exist_ok=True)
+    task_file = APP_DATA / "startup-task.xml"
+    temporary = task_file.with_suffix(".tmp")
+    try:
+        temporary.write_text(_startup_task_xml(), encoding="utf-16")
+        os.replace(temporary, task_file)
+        result = subprocess.run(
+            ["schtasks.exe", "/Create", "/TN", STARTUP_TASK_NAME,
+             "/XML", str(task_file), "/F"],
+            capture_output=True, text=True, timeout=20,
+            creationflags=_hidden_flags(),
+        )
+        if result.returncode != 0:
+            _runtime_log(
+                "startup task install failed: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            return False
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        _runtime_log(f"startup task install exception: {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _remove_windows_startup_task() -> bool:
+    try:
+        result = subprocess.run(
+            ["schtasks.exe", "/Delete", "/TN", STARTUP_TASK_NAME, "/F"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=_hidden_flags(),
+        )
+        # Windows returns a non-zero code when an already absent task is
+        # deleted. Absence is the requested end state, so accept that case.
+        if result.returncode == 0:
+            return True
+        query = subprocess.run(
+            ["schtasks.exe", "/Query", "/TN", STARTUP_TASK_NAME],
+            capture_output=True, timeout=10, creationflags=_hidden_flags(),
+        )
+        return query.returncode != 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        _runtime_log(f"startup task removal exception: {type(exc).__name__}: {exc}")
+        return False
+
+
+def set_windows_autostart(enabled: bool) -> None:
+    """Maintain three independent per-user startup paths.
+
+    Some managed Windows installations deny creation of scheduled tasks to a
+    normal user. The Startup-folder shortcut is equally path-aware and needs no
+    elevation; HKCU Run remains a final fallback. Single-instance locking makes
+    simultaneous triggers harmless.
+    """
+    task_ok = _install_windows_startup_task() if enabled else _remove_windows_startup_task()
+    shortcut_ok = (
+        _install_windows_startup_shortcut()
+        if enabled else _remove_windows_startup_shortcut()
+    )
+    registry_ok = True
+    try:
+        _set_windows_run_fallback(enabled)
+    except Exception as exc:
+        registry_ok = False
+        _runtime_log(f"startup Run fallback failed: {type(exc).__name__}: {exc}")
+    if not task_ok and not shortcut_ok and not registry_ok:
+        raise OSError("all Windows startup methods failed")
+
+
 def reconcile_windows_autostart(enabled: bool) -> bool:
-    """Repair the per-user startup entry and follow the current EXE path."""
+    """Repair both startup paths and follow the current EXE path."""
     try:
         set_windows_autostart(enabled)
         return True
@@ -932,9 +1120,7 @@ class ControlPanel(QWidget):
             ACTIVATE_REQUEST_PATH.unlink(missing_ok=True)
         except OSError:
             return
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
+        self._show_from_tray()
         try:
             ACTIVATE_ACK_PATH.write_text(token, encoding="ascii")
         except OSError:
@@ -1528,6 +1714,8 @@ class ControlPanel(QWidget):
 
     def _show_from_tray(self) -> None:
         self.showNormal()
+        self.ensurePolished()
+        self.update()
         self.raise_()
         self.activateWindow()
 
@@ -2809,7 +2997,9 @@ def main() -> int:
     args, _unknown = parser.parse_known_args()
     if args.recover_pid:
         _wait_for_recovery_parent(args.recover_pid)
-    if not args.smoke_test and args.capture is None and not _acquire_single_instance():
+    if not args.smoke_test and args.capture is None and not _acquire_single_instance(
+        activate_existing=not args.autorun,
+    ):
         return 0
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_DISPLAY_NAME)
