@@ -75,12 +75,15 @@ Open-Meteo. See [PRIVACY.md](PRIVACY.md) for details.
 
 ## Build from source
 
-Python 3.12 and Windows are recommended.
+Python 3.12, the .NET 10 SDK and Windows are recommended. Build the hidden
+native sensor helper first; PyInstaller then embeds that helper in the portable
+application.
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m unittest test_scenarios.py -v
+dotnet publish sensor-helper\SensorBridge.csproj -c Release -r win-x64 -o sensor-helper\publish
 .\.venv\Scripts\python.exe -m PyInstaller --clean Sabasakal-Mini-Screen.spec
 ```
 

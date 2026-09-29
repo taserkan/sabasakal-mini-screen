@@ -7,6 +7,7 @@ import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 import ctypes
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -36,7 +37,7 @@ from app import (
     STEAM_PING_MONITOR, cs2_is_running, faceit_ac_is_running,
     get_auto_hardware_labels, get_metrics, install_gsi_config, normalise_hardware_label,
     msfs_session_seconds, render_media_visual_patch, render_screen,
-    resolve_hardware_labels, run_sensor_bridge,
+    resolve_hardware_labels,
     run_steam_ping_bridge, WIDTH,
 )
 from battery_runtime import BatteryDevice, BatteryDeviceMonitor
@@ -63,9 +64,16 @@ ACTIVATE_ACK_PATH = APP_DATA / "show-window.ack"
 INSTANCE_STATE_PATH = APP_DATA / "instance.json"
 SENSOR_TASK_STATE_PATH = APP_DATA / "sensor-task.json"
 SENSOR_TASK_NAME = "CS2ScreenSensors"
+SENSOR_TASK_MODE = "hidden-native-winexe-v3"
+SENSOR_OWNER_STALE_SECONDS = 12.0
 SENSOR_HOST_ROOT = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Sabasakal Mini Ekran"
 SENSOR_HOST_PATH = SENSOR_HOST_ROOT / "SabasakalSensorHost.exe"
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+SENSOR_HOST_SOURCE_PATH = (
+    RESOURCE_ROOT / "sensor-helper" / "SabasakalSensorHost.exe"
+    if getattr(sys, "frozen", False)
+    else RESOURCE_ROOT / "sensor-helper" / "publish" / "SabasakalSensorHost.exe"
+)
 APP_ICON_PATH = RESOURCE_ROOT / "sabasakal-logo.ico"
 APP_LOGO_PATH = RESOURCE_ROOT / "sabasakal-logo.png"
 WINDOW_BG, CARD_BG, CARD_2 = "#0D0F13", "#15181E", "#101319"
@@ -392,17 +400,70 @@ def _sensor_task_action() -> tuple[str, str]:
     # portable control-panel EXE may then be moved, renamed or replaced
     # without invalidating the elevated sensor task, and an unprivileged
     # process cannot replace what the highest-privilege task executes.
-    return str(SENSOR_HOST_PATH), "--sensor-file-bridge"
+    return str(SENSOR_HOST_PATH), "--managed"
+
+
+def _expected_sensor_task_state() -> dict[str, str]:
+    executable, arguments = _sensor_task_action()
+    return {
+        "executable": str(Path(executable).resolve()),
+        "arguments": arguments,
+        "mode": SENSOR_TASK_MODE,
+    }
+
+
+def _sensor_task_xml() -> str:
+    """Create a non-interactive, hidden, on-demand elevated sensor task."""
+    executable, arguments = _sensor_task_action()
+    account = "\\".join(filter(None, (
+        os.environ.get("USERDOMAIN"), os.environ.get("USERNAME"),
+    ))) or os.environ.get("USERNAME", "")
+    return f'''<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Sabasakal Mini Screen hidden sensor helper</Description></RegistrationInfo>
+  <Triggers />
+  <Principals>
+    <Principal id="Author">
+      <UserId>{xml_escape(account)}</UserId>
+      <LogonType>S4U</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{xml_escape(executable)}</Command>
+      <Arguments>{xml_escape(arguments)}</Arguments>
+      <WorkingDirectory>{xml_escape(str(SENSOR_HOST_ROOT))}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>'''
 
 
 def _sensor_host_is_current(source: Path, target: Path = SENSOR_HOST_PATH) -> bool:
+    """Compare host contents, not timestamps changed by one-file extraction."""
     try:
-        source_stat = source.stat()
-        target_stat = target.stat()
-        return (
-            source_stat.st_size == target_stat.st_size
-            and source_stat.st_mtime_ns == target_stat.st_mtime_ns
-        )
+        if source.stat().st_size != target.stat().st_size:
+            return False
+        def digest(path: Path) -> bytes:
+            checksum = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    checksum.update(block)
+            return checksum.digest()
+        return digest(source) == digest(target)
     except OSError:
         return False
 
@@ -411,7 +472,7 @@ def _install_sensor_host_copy(
     source: Path | None = None, target: Path = SENSOR_HOST_PATH,
 ) -> bool:
     """Atomically install the protected sensor host from an elevated process."""
-    source = Path(source or sys.executable).resolve()
+    source = Path(source or SENSOR_HOST_SOURCE_PATH).resolve()
     target = Path(target).resolve()
     if source == target or _sensor_host_is_current(source, target):
         return True
@@ -436,36 +497,85 @@ def _install_sensor_host_copy(
             pass
 
 
+def _end_sensor_task() -> bool:
+    """Stop the managed helper without deleting its reusable task definition."""
+    try:
+        result = subprocess.run(
+            ["schtasks.exe", "/End", "/TN", SENSOR_TASK_NAME],
+            capture_output=True, timeout=8, creationflags=_hidden_flags(),
+        )
+        # An absent or already-stopped task is also an acceptable end state.
+        return result.returncode == 0 or not _sensor_task_exists()
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _sensor_task_exists() -> bool:
+    try:
+        result = subprocess.run(
+            ["schtasks.exe", "/Query", "/TN", SENSOR_TASK_NAME],
+            capture_output=True, timeout=8, creationflags=_hidden_flags(),
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _terminate_sensor_host_copies() -> int:
+    """Terminate only processes executing the protected SensorHost path."""
+    expected = os.path.normcase(str(SENSOR_HOST_PATH.resolve()))
+    matches: list[psutil.Process] = []
+    for process in psutil.process_iter(("pid", "exe")):
+        try:
+            executable = process.info.get("exe") or ""
+            if os.path.normcase(str(Path(executable).resolve())) == expected:
+                matches.append(process)
+        except (OSError, psutil.Error):
+            continue
+    for process in matches:
+        try:
+            process.terminate()
+        except psutil.Error:
+            pass
+    _gone, alive = psutil.wait_procs(matches, timeout=2.0)
+    for process in alive:
+        try:
+            process.kill()
+        except psutil.Error:
+            pass
+    return len(matches)
+
+
 def install_sensor_task() -> int:
     """Install the user-approved elevated sensor reader and start it now."""
     if os.name != "nt":
         return 0
     if not getattr(sys, "frozen", False):
         return 1
-    if not _install_sensor_host_copy():
+    _end_sensor_task()
+    removed = _terminate_sensor_host_copies()
+    if removed:
+        _runtime_log(f"removed {removed} legacy sensor host process(es)")
+    if not _install_sensor_host_copy(SENSOR_HOST_SOURCE_PATH, SENSOR_HOST_PATH):
         _runtime_log("sensor host install failed: stable copy could not be created")
         return 1
     executable, arguments = _sensor_task_action()
-    task_command = f'"{executable}" {arguments}'
-    account = "\\".join(filter(None, (
-        os.environ.get("USERDOMAIN"), os.environ.get("USERNAME"),
-    )))
-    command = [
-        "schtasks.exe", "/Create", "/TN", SENSOR_TASK_NAME,
-        "/TR", task_command, "/SC", "ONLOGON", "/RL", "HIGHEST", "/IT", "/F",
-    ]
-    if account:
-        command.extend(["/RU", account])
+    task_file = APP_DATA / "sensor-task.xml"
+    temporary = task_file.with_suffix(".tmp")
     try:
+        APP_DATA.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(_sensor_task_xml(), encoding="utf-16")
+        os.replace(temporary, task_file)
         created = subprocess.run(
-            command, capture_output=True, text=True, timeout=20,
+            ["schtasks.exe", "/Create", "/TN", SENSOR_TASK_NAME,
+             "/XML", str(task_file), "/F"],
+            capture_output=True, text=True, timeout=20,
             creationflags=_hidden_flags(),
         )
         if created.returncode != 0:
             _runtime_log(f"sensor task install failed: {created.stderr.strip() or created.stdout.strip()}")
             return 1
-        APP_DATA.mkdir(parents=True, exist_ok=True)
-        state = {"executable": str(Path(executable).resolve()), "arguments": arguments}
+        state = _expected_sensor_task_state()
         temporary = SENSOR_TASK_STATE_PATH.with_suffix(".tmp")
         temporary.write_text(json.dumps(state), encoding="utf-8")
         os.replace(temporary, SENSOR_TASK_STATE_PATH)
@@ -481,25 +591,24 @@ def install_sensor_task() -> int:
     except (OSError, subprocess.SubprocessError) as exc:
         _runtime_log(f"sensor task install exception: {type(exc).__name__}: {exc}")
         return 1
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def ensure_sensor_task() -> None:
     """Keep the approved sensor task attached to the current portable EXE."""
     if os.name != "nt" or not getattr(sys, "frozen", False):
         return
-    executable, arguments = _sensor_task_action()
-    expected = {"executable": str(Path(executable).resolve()), "arguments": arguments}
+    executable, _arguments = _sensor_task_action()
+    expected = _expected_sensor_task_state()
     matches = False
     try:
         saved = json.loads(SENSOR_TASK_STATE_PATH.read_text(encoding="utf-8"))
-        query = subprocess.run(
-            ["schtasks.exe", "/Query", "/TN", SENSOR_TASK_NAME],
-            capture_output=True, timeout=8, creationflags=_hidden_flags(),
-        )
         matches = (
             saved == expected
-            and query.returncode == 0
+            and _sensor_task_exists()
             and Path(executable).is_file()
+            and _sensor_host_is_current(SENSOR_HOST_SOURCE_PATH, SENSOR_HOST_PATH)
         )
     except (OSError, TypeError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
         matches = False
@@ -534,6 +643,20 @@ def nudge_sensor_task_if_stale(
             return False
     except OSError:
         pass
+    # Never wake a legacy Python/PyInstaller host.  On upgrades the display
+    # worker can reach this watchdog before the one-time elevated migration;
+    # running that old task is the exact path that used to flash a console and
+    # steal focus from fullscreen games.
+    try:
+        if (
+            json.loads(SENSOR_TASK_STATE_PATH.read_text(encoding="utf-8"))
+            != _expected_sensor_task_state()
+            or not SENSOR_HOST_PATH.is_file()
+            or not _sensor_host_is_current(SENSOR_HOST_SOURCE_PATH, SENSOR_HOST_PATH)
+        ):
+            return False
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
     try:
         result = subprocess.run(
             ["schtasks.exe", "/Run", "/TN", SENSOR_TASK_NAME],
@@ -625,6 +748,24 @@ def _instance_state() -> dict:
         return state if isinstance(state, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
+
+
+def _sensor_owner_alive(
+    state_path: Path = INSTANCE_STATE_PATH,
+    max_age: float = SENSOR_OWNER_STALE_SECONDS,
+) -> bool:
+    """Keep SensorHost alive only while the exact control-panel owner is healthy."""
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        pid = int(state.get("pid", 0))
+        created_at = float(state.get("created_at", 0.0))
+        heartbeat = float(state.get("heartbeat", 0.0))
+        if pid <= 0 or time.time() - heartbeat > max_age:
+            return False
+        process = psutil.Process(pid)
+        return abs(process.create_time() - created_at) <= 1.0 and process.is_running()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, psutil.Error):
+        return False
 
 
 def _write_instance_state() -> None:
@@ -930,7 +1071,10 @@ def _install_windows_startup_shortcut() -> bool:
             f"$s.WorkingDirectory='{_powershell_literal(APP_DATA)}';"
             f"$s.IconLocation='{_powershell_literal(executable)},0';"
             "$s.Description='Sabasakal Mini Screen automatic startup';"
-            "$s.Save()"
+            "$s.Save();"
+            f"$v=$w.CreateShortcut('{_powershell_literal(shortcut)}');"
+            f"if([IO.Path]::GetFullPath($v.TargetPath) -ne "
+            f"[IO.Path]::GetFullPath('{_powershell_literal(executable)}')){{exit 2}}"
         )
         result = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
@@ -1008,30 +1152,25 @@ def _remove_windows_startup_task() -> bool:
 
 
 def set_windows_autostart(enabled: bool) -> None:
-    """Maintain three independent per-user startup paths.
-
-    Some managed Windows installations deny creation of scheduled tasks to a
-    normal user. The Startup-folder shortcut is equally path-aware and needs no
-    elevation; HKCU Run remains a final fallback. Single-instance locking makes
-    simultaneous triggers harmless.
-    """
-    task_ok = _install_windows_startup_task() if enabled else _remove_windows_startup_task()
+    """Maintain exactly one startup path and remove legacy duplicate launchers."""
+    # Old releases registered both Task Scheduler and HKCU Run fallbacks.  They
+    # can start two control panels and, indirectly, more than one sensor helper.
+    # Keep only the per-user Startup shortcut, which needs no elevation.
+    _remove_windows_startup_task()
+    try:
+        _set_windows_run_fallback(False)
+    except Exception as exc:
+        _runtime_log(f"legacy startup Run cleanup failed: {type(exc).__name__}: {exc}")
     shortcut_ok = (
         _install_windows_startup_shortcut()
         if enabled else _remove_windows_startup_shortcut()
     )
-    registry_ok = True
-    try:
-        _set_windows_run_fallback(enabled)
-    except Exception as exc:
-        registry_ok = False
-        _runtime_log(f"startup Run fallback failed: {type(exc).__name__}: {exc}")
-    if not task_ok and not shortcut_ok and not registry_ok:
-        raise OSError("all Windows startup methods failed")
+    if not shortcut_ok:
+        raise OSError("Windows Startup shortcut could not be updated")
 
 
 def reconcile_windows_autostart(enabled: bool) -> bool:
-    """Repair both startup paths and follow the current EXE path."""
+    """Repair the single Startup shortcut and follow the current EXE path."""
     try:
         set_windows_autostart(enabled)
         return True
@@ -1163,9 +1302,25 @@ class ControlPanel(QWidget):
             return
         self._exit_requested = True
         self.stop_event.set()
+        # A blocked vendor USB call can keep the screen worker (and therefore
+        # the old PyInstaller process) alive after Qt has quit.  Give normal
+        # shutdown a brief chance, then guarantee that the stale instance
+        # releases the single-instance mutex and USB handle.  The replacement
+        # process above waits for this PID before it starts its own worker.
+        threading.Thread(
+            target=self._force_exit_after_display_stall,
+            name="DisplayStallHardExit",
+            daemon=True,
+        ).start()
         app = QApplication.instance()
         if app is not None:
             app.quit()
+
+    @staticmethod
+    def _force_exit_after_display_stall(delay_seconds: float = 2.0) -> None:
+        time.sleep(delay_seconds)
+        _runtime_log("display watchdog forcing stale process exit")
+        os._exit(0)
 
     def _style_sheet(self) -> str:
         return f"""
@@ -2982,10 +3137,6 @@ def main() -> int:
     prepare_runtime_working_directory()
     if "--install-sensor-task" in sys.argv:
         return install_sensor_task()
-    if "--sensor-bridge" in sys.argv:
-        return run_sensor_bridge()
-    if "--sensor-file-bridge" in sys.argv:
-        return run_sensor_bridge(SENSOR_CACHE_PATH)
     if "--steam-ping-bridge" in sys.argv:
         return run_steam_ping_bridge()
     parser = argparse.ArgumentParser(add_help=False)
@@ -3057,6 +3208,7 @@ def main() -> int:
         return app.exec()
     finally:
         _cleanup_instance_state()
+        _end_sensor_task()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,4 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
 from pathlib import Path
 
 driver_root = (
@@ -17,16 +16,14 @@ datas = [
     (str(driver_root / 'library'), 'library'),
     ('vendor', 'vendor'),
 ]
-binaries = []
+binaries = [
+    ('sensor-helper/publish/SabasakalSensorHost.exe', 'sensor-helper'),
+]
 hiddenimports = [
-    'clr', 'serial.tools.list_ports', 'logging.handlers',
+    'serial.tools.list_ports', 'logging.handlers',
     '_portaudiowpatch', 'winrt._winrt', 'winrt._winrt_windows_media_control',
     'winrt._winrt_windows_devices_enumeration',
 ]
-tmp_ret = collect_all('pythonnet')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('clr_loader')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
@@ -38,7 +35,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['pythonnet', 'clr', 'clr_loader'],
     noarchive=False,
     optimize=0,
 )

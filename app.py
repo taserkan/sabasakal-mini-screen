@@ -27,6 +27,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import psutil
 from PIL import Image, ImageColor, ImageDraw, ImageFont
@@ -1434,7 +1435,11 @@ class EmbeddedSensorMonitor:
                 except Exception:
                     pass
             return cached
-        self.start()
+        # Never start the legacy Python/pythonnet fallback from the live UI.
+        # Loading CoreCLR used to create dotnet/conhost processes whenever the
+        # cache went stale; those short-lived windows could steal focus from a
+        # fullscreen game.  The dedicated native WinExe sensor host owns all
+        # retries now.  Missing data is safer than changing the foreground app.
         with self._lock:
             return dict(self._values)
 
@@ -1518,7 +1523,10 @@ class EmbeddedSensorMonitor:
                 self._process = None
 
 
-def run_sensor_bridge(cache_path: Path | None = None) -> int:
+def run_sensor_bridge(
+    cache_path: Path | None = None,
+    continue_running: Callable[[], bool] | None = None,
+) -> int:
     """Isolated sensor process; a native sensor failure cannot close the UI."""
     computer = None
     try:
@@ -1542,7 +1550,7 @@ def run_sensor_bridge(cache_path: Path | None = None) -> int:
         computer.IsStorageEnabled = False
         computer.IsNetworkEnabled = False
         computer.Open()
-        while True:
+        while continue_running is None or continue_running():
             sensors: list[object] = []
             pending = list(computer.Hardware)
             while pending:
@@ -1986,19 +1994,115 @@ def resolve_hardware_labels(overrides: object = None) -> dict[str, str]:
     }
 
 
-def get_gpu_metrics() -> tuple[float, float, float]:
-    command = [
-        "nvidia-smi",
-        "--query-gpu=utilization.gpu,temperature.gpu,memory.used",
-        "--format=csv,noheader,nounits",
+class _NvmlUtilization(ctypes.Structure):
+    _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+
+class _NvmlMemoryInfo(ctypes.Structure):
+    _fields_ = [
+        ("total", ctypes.c_ulonglong),
+        ("free", ctypes.c_ulonglong),
+        ("used", ctypes.c_ulonglong),
     ]
-    try:
-        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        output = subprocess.check_output(command, text=True, timeout=3, creationflags=flags).splitlines()[0]
-        load, temperature, memory = (float(part.strip()) for part in output.split(","))
-        return load, temperature, memory
-    except Exception:
-        return 0.0, 0.0, 0.0
+
+
+class NvidiaNvmlMonitor:
+    """Read the dedicated NVIDIA GPU without spawning nvidia-smi/conhost."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._dll = None
+        self._handle = ctypes.c_void_p()
+        self._initialised = False
+
+    def _initialise(self) -> bool:
+        if self._initialised:
+            return self._dll is not None and bool(self._handle.value)
+        self._initialised = True
+        if os.name != "nt":
+            return False
+        try:
+            dll = ctypes.WinDLL("nvml.dll")
+            dll.nvmlInit_v2.restype = ctypes.c_int
+            dll.nvmlDeviceGetCount_v2.argtypes = [ctypes.POINTER(ctypes.c_uint)]
+            dll.nvmlDeviceGetCount_v2.restype = ctypes.c_int
+            dll.nvmlDeviceGetHandleByIndex_v2.argtypes = [
+                ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p),
+            ]
+            dll.nvmlDeviceGetHandleByIndex_v2.restype = ctypes.c_int
+            dll.nvmlDeviceGetUtilizationRates.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(_NvmlUtilization),
+            ]
+            dll.nvmlDeviceGetUtilizationRates.restype = ctypes.c_int
+            dll.nvmlDeviceGetTemperature.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint),
+            ]
+            dll.nvmlDeviceGetTemperature.restype = ctypes.c_int
+            dll.nvmlDeviceGetMemoryInfo.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(_NvmlMemoryInfo),
+            ]
+            dll.nvmlDeviceGetMemoryInfo.restype = ctypes.c_int
+            if dll.nvmlInit_v2() != 0:
+                return False
+            count = ctypes.c_uint()
+            if dll.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0 or count.value == 0:
+                return False
+            selected = ctypes.c_void_p()
+            selected_total = -1
+            for index in range(count.value):
+                handle = ctypes.c_void_p()
+                if dll.nvmlDeviceGetHandleByIndex_v2(index, ctypes.byref(handle)) != 0:
+                    continue
+                memory = _NvmlMemoryInfo()
+                total = 0
+                if dll.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) == 0:
+                    total = int(memory.total)
+                if selected.value is None or total > selected_total:
+                    selected = handle
+                    selected_total = total
+            if not selected.value:
+                return False
+            self._dll = dll
+            self._handle = selected
+            return True
+        except (AttributeError, OSError, TypeError, ValueError):
+            self._dll = None
+            self._handle = ctypes.c_void_p()
+            return False
+
+    def read(self) -> tuple[float, float, float]:
+        with self._lock:
+            if not self._initialise() or self._dll is None:
+                return 0.0, 0.0, 0.0
+            utilization = _NvmlUtilization()
+            temperature = ctypes.c_uint()
+            memory = _NvmlMemoryInfo()
+            load = (
+                float(utilization.gpu)
+                if self._dll.nvmlDeviceGetUtilizationRates(
+                    self._handle, ctypes.byref(utilization),
+                ) == 0 else 0.0
+            )
+            heat = (
+                float(temperature.value)
+                if self._dll.nvmlDeviceGetTemperature(
+                    self._handle, 0, ctypes.byref(temperature),
+                ) == 0 else 0.0
+            )
+            used_mb = (
+                float(memory.used) / (1024.0 ** 2)
+                if self._dll.nvmlDeviceGetMemoryInfo(
+                    self._handle, ctypes.byref(memory),
+                ) == 0 else 0.0
+            )
+            return load, heat, used_mb
+
+
+NVIDIA_MONITOR = NvidiaNvmlMonitor()
+
+
+def get_gpu_metrics() -> tuple[float, float, float]:
+    return NVIDIA_MONITOR.read()
 
 
 def get_metrics() -> dict[str, float | None]:

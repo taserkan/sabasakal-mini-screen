@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import sqlite3
@@ -10,7 +11,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -187,37 +188,54 @@ class SettingsScenarios(unittest.TestCase):
             self.assertFalse(gui.reconcile_windows_autostart(True))
         self.assertIn("autostart reconciliation failed", runtime_log.call_args.args[0])
 
-    def test_startup_task_xml_is_resilient_and_targets_current_app(self) -> None:
-        with patch.object(gui, "_startup_action", return_value=(r"C:\Apps\Sabasakal.exe", "--autorun")):
-            xml = gui._startup_task_xml()
-        self.assertIn("<LogonTrigger>", xml)
-        self.assertIn("<Delay>PT7S</Delay>", xml)
-        self.assertIn("<StartWhenAvailable>true</StartWhenAvailable>", xml)
-        self.assertIn("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>", xml)
-        self.assertIn("<RestartOnFailure>", xml)
-        self.assertIn(r"<Command>C:\Apps\Sabasakal.exe</Command>", xml)
-        self.assertIn("<Arguments>--autorun</Arguments>", xml)
-
-    def test_autostart_uses_task_and_registry_fallback(self) -> None:
-        with patch.object(gui, "_install_windows_startup_task", return_value=True) as task, patch.object(
+    def test_autostart_uses_only_the_startup_shortcut(self) -> None:
+        with patch.object(gui, "_remove_windows_startup_task", return_value=True) as task, patch.object(
             gui, "_install_windows_startup_shortcut", return_value=True,
-        ) as shortcut, patch.object(
-            gui, "_set_windows_run_fallback",
-        ) as fallback:
+        ) as shortcut, patch.object(gui, "_set_windows_run_fallback") as fallback:
             gui.set_windows_autostart(True)
         task.assert_called_once_with()
         shortcut.assert_called_once_with()
-        fallback.assert_called_once_with(True)
+        fallback.assert_called_once_with(False)
 
-    def test_autostart_survives_task_failure_when_fallback_succeeds(self) -> None:
-        with patch.object(gui, "_install_windows_startup_task", return_value=False), patch.object(
+    def test_all_scheduled_task_commands_are_forced_hidden(self) -> None:
+        """A console-backed schtasks call must never steal focus from a game."""
+        source = (Path(__file__).parent / "gui.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        scheduled_task_calls = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            if not (
+                isinstance(function, ast.Attribute)
+                and function.attr == "run"
+                and isinstance(function.value, ast.Name)
+                and function.value.id == "subprocess"
+                and node.args
+                and isinstance(node.args[0], (ast.List, ast.Tuple))
+                and node.args[0].elts
+                and isinstance(node.args[0].elts[0], ast.Constant)
+                and node.args[0].elts[0].value == "schtasks.exe"
+            ):
+                continue
+            scheduled_task_calls.append(node)
+            creation_flags = next(
+                (keyword.value for keyword in node.keywords if keyword.arg == "creationflags"),
+                None,
+            )
+            self.assertIsNotNone(creation_flags, f"line {node.lineno}")
+            self.assertEqual(ast.unparse(creation_flags), "_hidden_flags()", f"line {node.lineno}")
+        self.assertGreaterEqual(len(scheduled_task_calls), 8)
+
+    def test_autostart_survives_legacy_task_cleanup_failure(self) -> None:
+        with patch.object(gui, "_remove_windows_startup_task", return_value=False), patch.object(
             gui, "_install_windows_startup_shortcut", return_value=True,
         ), patch.object(
             gui, "_set_windows_run_fallback",
         ):
             gui.set_windows_autostart(True)
 
-    def test_autostart_disable_removes_both_launch_paths(self) -> None:
+    def test_autostart_disable_removes_all_legacy_launch_paths(self) -> None:
         with patch.object(gui, "_remove_windows_startup_task", return_value=True) as task, patch.object(
             gui, "_remove_windows_startup_shortcut", return_value=True,
         ) as shortcut, patch.object(
@@ -239,6 +257,7 @@ class SettingsScenarios(unittest.TestCase):
                 script = command[-1]
                 self.assertIn(r"C:\Apps\Sabasakal.exe", script)
                 self.assertIn("--autorun", script)
+                self.assertIn("GetFullPath($v.TargetPath)", script)
                 (Path(directory) / gui.STARTUP_SHORTCUT_NAME).touch()
                 return SimpleNamespace(returncode=0, stderr="", stdout="")
 
@@ -1812,6 +1831,66 @@ class PerformanceCounterScenarios(unittest.TestCase):
         )
         self.assertEqual(value, 768.0)
 
+    def test_gpu_metrics_never_spawns_nvidia_smi(self) -> None:
+        with patch.object(
+            screen_app.NVIDIA_MONITOR, "read", return_value=(42.0, 55.0, 3072.0),
+        ) as read, patch.object(screen_app.subprocess, "check_output") as external:
+            self.assertEqual(screen_app.get_gpu_metrics(), (42.0, 55.0, 3072.0))
+        read.assert_called_once_with()
+        external.assert_not_called()
+
+    def test_nvml_monitor_selects_the_nvidia_gpu_with_most_vram(self) -> None:
+        class FakeFunction:
+            def __init__(self, callback):
+                self.callback = callback
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.callback(*args)
+
+        class FakeNvml:
+            def __init__(self):
+                self.nvmlInit_v2 = FakeFunction(lambda: 0)
+                self.nvmlDeviceGetCount_v2 = FakeFunction(self._count)
+                self.nvmlDeviceGetHandleByIndex_v2 = FakeFunction(self._handle)
+                self.nvmlDeviceGetMemoryInfo = FakeFunction(self._memory)
+                self.nvmlDeviceGetUtilizationRates = FakeFunction(self._utilization)
+                self.nvmlDeviceGetTemperature = FakeFunction(self._temperature)
+
+            @staticmethod
+            def _count(pointer):
+                pointer._obj.value = 2
+                return 0
+
+            @staticmethod
+            def _handle(index, pointer):
+                pointer._obj.value = 101 if int(index) == 0 else 202
+                return 0
+
+            @staticmethod
+            def _memory(handle, pointer):
+                pointer._obj.total = (8 if handle.value == 101 else 12) * 1024 ** 3
+                pointer._obj.free = 8 * 1024 ** 3
+                pointer._obj.used = (1 if handle.value == 101 else 3) * 1024 ** 3
+                return 0
+
+            @staticmethod
+            def _utilization(handle, pointer):
+                pointer._obj.gpu = 37 if handle.value == 202 else 5
+                pointer._obj.memory = 12
+                return 0
+
+            @staticmethod
+            def _temperature(handle, _sensor_type, pointer):
+                pointer._obj.value = 54 if handle.value == 202 else 41
+                return 0
+
+        monitor = screen_app.NvidiaNvmlMonitor()
+        with patch.object(screen_app.ctypes, "WinDLL", return_value=FakeNvml()):
+            self.assertEqual(monitor.read(), (37.0, 54.0, 3072.0))
+        self.assertEqual(monitor._handle.value, 202)
+
     def test_metrics_prefers_task_manager_counters_and_task_manager_ram_formula(self) -> None:
         memory = SimpleNamespace(total=1000, available=375, used=700, percent=70.0)
         with patch.object(screen_app.psutil, "cpu_percent", return_value=99.0), patch.object(
@@ -1845,6 +1924,14 @@ class PerformanceCounterScenarios(unittest.TestCase):
             self.assertEqual(screen_app.EmbeddedSensorMonitor._read_elevated_cache(path), {
                 "cpu_temp": 51.25, "cpu_freq": 4.35,
             })
+
+    def test_stale_cache_never_spawns_legacy_pythonnet_helper(self) -> None:
+        monitor = screen_app.EmbeddedSensorMonitor()
+        with patch.object(monitor, "_read_elevated_cache", return_value=None), patch.object(
+            monitor, "start",
+        ) as start:
+            self.assertEqual(monitor.read(), {"cpu_temp": None, "cpu_freq": None})
+        start.assert_not_called()
 
 
 class LocalizationScenarios(unittest.TestCase):
@@ -2048,8 +2135,109 @@ class UiAndConnectionScenarios(unittest.TestCase):
     def test_sensor_task_uses_a_stable_per_user_host_path(self) -> None:
         executable, arguments = gui._sensor_task_action()
         self.assertEqual(Path(executable), gui.SENSOR_HOST_PATH)
-        self.assertEqual(arguments, "--sensor-file-bridge")
+        self.assertEqual(arguments, "--managed")
         self.assertNotEqual(Path(executable), Path(sys.executable))
+
+    def test_sensor_task_installs_the_dedicated_native_host(self) -> None:
+        self.assertEqual(gui.SENSOR_TASK_MODE, "hidden-native-winexe-v3")
+        self.assertNotEqual(gui.SENSOR_HOST_SOURCE_PATH, Path(sys.executable))
+        self.assertTrue(gui.SENSOR_HOST_SOURCE_PATH.is_file())
+        image = gui.SENSOR_HOST_SOURCE_PATH.read_bytes()
+        pe_offset = int.from_bytes(image[0x3C:0x40], "little")
+        subsystem = int.from_bytes(image[pe_offset + 0x5C:pe_offset + 0x5E], "little")
+        self.assertEqual(subsystem, 2)  # IMAGE_SUBSYSTEM_WINDOWS_GUI
+
+    def test_sensor_task_is_hidden_non_interactive_and_on_demand(self) -> None:
+        with patch.object(
+            gui, "_sensor_task_action",
+            return_value=(r"C:\Program Files\Sabasakal Mini Ekran\SabasakalSensorHost.exe", "--managed"),
+        ):
+            xml = gui._sensor_task_xml()
+        self.assertIn("<LogonType>S4U</LogonType>", xml)
+        self.assertIn("<RunLevel>HighestAvailable</RunLevel>", xml)
+        self.assertIn("<Hidden>true</Hidden>", xml)
+        self.assertIn("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>", xml)
+        self.assertIn("<AllowStartOnDemand>true</AllowStartOnDemand>", xml)
+        self.assertIn("<Triggers />", xml)
+        self.assertNotIn("InteractiveToken", xml)
+        self.assertNotIn("LogonTrigger", xml)
+
+    def test_sensor_task_install_uses_hidden_xml_and_starts_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "sensor-task.json"
+            completed = SimpleNamespace(returncode=0, stderr="", stdout="")
+            with patch.object(gui, "APP_DATA", root), patch.object(
+                gui, "SENSOR_TASK_STATE_PATH", state_path,
+            ), patch.object(gui.sys, "frozen", True, create=True), patch.object(
+                gui, "_end_sensor_task", return_value=True,
+            ), patch.object(
+                gui, "_terminate_sensor_host_copies", return_value=3,
+            ), patch.object(gui, "_install_sensor_host_copy", return_value=True), patch.object(
+                gui, "_sensor_task_action",
+                return_value=(r"C:\Program Files\Sabasakal Mini Ekran\SabasakalSensorHost.exe", "--managed"),
+            ), patch.object(gui, "_sensor_task_xml", return_value="<Task />"), patch.object(
+                gui.subprocess, "run", side_effect=[completed, completed],
+            ) as run, patch.object(gui, "_runtime_log"):
+                self.assertEqual(gui.install_sensor_task(), 0)
+            create_command = run.call_args_list[0].args[0]
+            start_command = run.call_args_list[1].args[0]
+            self.assertIn("/XML", create_command)
+            self.assertNotIn("/IT", create_command)
+            self.assertNotIn("ONLOGON", create_command)
+            self.assertEqual(start_command[:3], ["schtasks.exe", "/Run", "/TN"])
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["mode"], gui.SENSOR_TASK_MODE)
+
+    def test_outdated_protected_sensor_host_is_reinstalled(self) -> None:
+        def shell_execute(*_args):
+            shell_execute.calls += 1
+            return 42
+
+        shell_execute.calls = 0
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_host = root / "SabasakalSensorHost.exe"
+            protected_host.write_bytes(b"old-host")
+            state_path = root / "sensor-task.json"
+            expected = {
+                "executable": str(protected_host.resolve()),
+                "arguments": "--managed",
+                "mode": gui.SENSOR_TASK_MODE,
+            }
+            state_path.write_text(json.dumps(expected), encoding="utf-8")
+            shell32 = SimpleNamespace(ShellExecuteW=shell_execute)
+            with patch.object(gui.sys, "frozen", True, create=True), patch.object(
+                gui, "SENSOR_TASK_STATE_PATH", state_path,
+            ), patch.object(
+                gui, "_sensor_task_action",
+                return_value=(str(protected_host), "--managed"),
+            ), patch.object(gui, "_sensor_task_exists", return_value=True), patch.object(
+                gui, "_sensor_host_is_current", return_value=False,
+            ), patch.object(gui.ctypes, "windll", SimpleNamespace(shell32=shell32)), patch.object(
+                gui, "_runtime_log",
+            ):
+                gui.ensure_sensor_task()
+        self.assertEqual(shell_execute.calls, 1)
+
+    def test_sensor_owner_uses_pid_identity_and_fresh_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "instance.json"
+            process = gui.psutil.Process(os.getpid())
+            state_path.write_text(json.dumps({
+                "pid": os.getpid(),
+                "created_at": process.create_time(),
+                "heartbeat": time.time(),
+            }), encoding="utf-8")
+            self.assertTrue(gui._sensor_owner_alive(state_path, max_age=5.0))
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            payload["heartbeat"] = time.time() - 10.0
+            state_path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertFalse(gui._sensor_owner_alive(state_path, max_age=5.0))
+
+    def test_gui_has_no_legacy_pythonnet_sensor_entrypoint(self) -> None:
+        source = Path(gui.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('"--sensor-bridge" in sys.argv', source)
+        self.assertNotIn('"--sensor-file-bridge" in sys.argv', source)
 
     def test_protected_sensor_host_copy_is_installed_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2061,20 +2249,45 @@ class UiAndConnectionScenarios(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"version-one")
             self.assertTrue(gui._sensor_host_is_current(source, target))
 
-            source.write_bytes(b"version-two-is-new")
             stat = source.stat()
             os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+            self.assertTrue(gui._sensor_host_is_current(source, target))
+
+            source.write_bytes(b"version-two-is-new")
             self.assertFalse(gui._sensor_host_is_current(source, target))
             self.assertTrue(gui._install_sensor_host_copy(source, target))
             self.assertEqual(target.read_bytes(), b"version-two-is-new")
 
     def test_stale_sensor_cache_restarts_existing_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            missing = Path(directory) / "elevated-sensors.json"
+            root = Path(directory)
+            missing = root / "elevated-sensors.json"
+            source = root / "source.exe"
+            target = root / "target.exe"
+            source.write_bytes(b"native-host")
+            target.write_bytes(b"native-host")
+            state = root / "sensor-task.json"
             completed = SimpleNamespace(returncode=0)
-            with patch.object(gui.subprocess, "run", return_value=completed) as run:
-                self.assertTrue(gui.nudge_sensor_task_if_stale(missing))
-                run.assert_called_once()
+            with patch.object(gui, "SENSOR_TASK_STATE_PATH", state), patch.object(
+                gui, "SENSOR_HOST_SOURCE_PATH", source,
+            ), patch.object(gui, "SENSOR_HOST_PATH", target), patch.object(
+                gui, "_sensor_task_action", return_value=(str(target), "--managed"),
+            ):
+                state.write_text(json.dumps(gui._expected_sensor_task_state()), encoding="utf-8")
+                with patch.object(gui.subprocess, "run", return_value=completed) as run:
+                    self.assertTrue(gui.nudge_sensor_task_if_stale(missing))
+                    run.assert_called_once()
+
+    def test_stale_cache_never_wakes_a_legacy_sensor_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "sensor-task.json"
+            state.write_text(json.dumps({"mode": "hidden-s4u-on-demand-v2"}), encoding="utf-8")
+            with patch.object(gui, "SENSOR_TASK_STATE_PATH", state), patch.object(
+                gui.subprocess, "run",
+            ) as run:
+                self.assertFalse(gui.nudge_sensor_task_if_stale(root / "missing.json"))
+                run.assert_not_called()
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -2394,6 +2607,34 @@ class UiAndConnectionScenarios(unittest.TestCase):
             panel._liveness_tick()
         restart.assert_not_called()
         panel.close()
+
+    def test_display_watchdog_arms_hard_exit_for_a_blocked_usb_worker(self) -> None:
+        panel = self.make_panel()
+        fake_app = SimpleNamespace(quit=Mock())
+        fake_thread = Mock()
+        with patch.object(gui.subprocess, "Popen"), patch.object(
+            gui.threading, "Thread", return_value=fake_thread,
+        ) as thread_class, patch.object(
+            gui.QApplication, "instance", return_value=fake_app,
+        ):
+            panel._restart_after_display_stall()
+        thread_class.assert_called_once_with(
+            target=panel._force_exit_after_display_stall,
+            name="DisplayStallHardExit",
+            daemon=True,
+        )
+        fake_thread.start.assert_called_once_with()
+        fake_app.quit.assert_called_once_with()
+        panel.close()
+
+    def test_display_watchdog_hard_exit_is_delayed(self) -> None:
+        with patch.object(gui.time, "sleep") as sleep, patch.object(
+            gui, "_runtime_log",
+        ) as runtime_log, patch.object(gui.os, "_exit") as hard_exit:
+            gui.ControlPanel._force_exit_after_display_stall(1.25)
+        sleep.assert_called_once_with(1.25)
+        self.assertIn("forcing stale process exit", runtime_log.call_args.args[0])
+        hard_exit.assert_called_once_with(0)
 
     def test_system_tray_has_open_start_stop_and_exit_actions(self) -> None:
         with patch.object(gui.QSystemTrayIcon, "isSystemTrayAvailable", return_value=True):

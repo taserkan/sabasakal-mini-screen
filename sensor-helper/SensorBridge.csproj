@@ -1,15 +1,45 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <DebugType>none</DebugType>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <AssemblyName>CS2Screen.SensorBridge</AssemblyName>
+    <AssemblyName>SabasakalSensorHost</AssemblyName>
     <RootNamespace>CS2Screen.SensorBridge</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="LibreHardwareMonitorLib">
       <HintPath>..\vendor\LibreHardwareMonitorLib.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="System.Management">
+      <HintPath>..\vendor\System.Management.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="System.IO.Ports">
+      <HintPath>..\vendor\System.IO.Ports.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="HidSharp">
+      <HintPath>..\vendor\HidSharp.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="BlackSharp.Core">
+      <HintPath>..\vendor\BlackSharp.Core.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="DiskInfoToolkit">
+      <HintPath>..\vendor\DiskInfoToolkit.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="RAMSPDToolkit-NDD">
+      <HintPath>..\vendor\RAMSPDToolkit-NDD.dll</HintPath>
       <Private>true</Private>
     </Reference>
   </ItemGroup>

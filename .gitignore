@@ -4,6 +4,9 @@ __pycache__/
 venv/
 build/
 dist/
+sensor-helper/bin/
+sensor-helper/obj/
+sensor-helper/publish/
 *.spec.bak
 *.log
 *.zip
@@ -16,4 +19,3 @@ sdr_cache.json
 elevated-sensors.json
 deathmatch-state.json
 *.SYS
-
