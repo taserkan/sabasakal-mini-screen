@@ -27,7 +27,8 @@ binaries = [
 hiddenimports = [
     'serial.tools.list_ports', 'logging.handlers',
     '_portaudiowpatch', 'winrt._winrt', 'winrt._winrt_windows_foundation',
-    'winrt._winrt_windows_media_control',
+    'winrt._winrt_windows_foundation_collections', 'winrt._winrt_windows_media',
+    'winrt._winrt_windows_media_control', 'winrt._winrt_windows_storage_streams',
     'winrt._winrt_windows_devices_enumeration',
 ]
 
