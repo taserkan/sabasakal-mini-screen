@@ -64,10 +64,42 @@ class AntiCheatSafetyScenarios(unittest.TestCase):
             "readprocessmemory", "writeprocessmemory", "createremotethread",
             "virtualallocex", "setwindowshookex", "sendinput", "keybd_event",
             "mouse_event", "import pymem", "import pyautogui", "import scapy",
-            "winpcap", "npcap",
+            "winpcap", "npcap", "steam_api64.dll", "steamappid", "steamgameid",
         )
         for api in forbidden:
             self.assertNotIn(api, source, api)
+
+    def test_gsi_server_is_loopback_only(self) -> None:
+        source = (Path(__file__).parent / "app.py").read_text(encoding="utf-8")
+        self.assertIn('ThreadingHTTPServer(("127.0.0.1", GSI_PORT)', source)
+        self.assertNotIn('ThreadingHTTPServer(("0.0.0.0", GSI_PORT)', source)
+
+    def test_runtime_never_loads_cs2_or_steam_game_libraries(self) -> None:
+        source = "\n".join(
+            (Path(__file__).parent / name).read_text(encoding="utf-8").lower()
+            for name in ("app.py", "gui.py")
+        )
+        forbidden = (
+            "steam_api64.dll", "steamappid", "steamgameid",
+            "--steam-ping-bridge", "steaminternal_findorcreateuserinterface",
+        )
+        for marker in forbidden:
+            self.assertNotIn(marker, source, marker)
+
+    def test_cs2_integration_requests_only_local_player_state(self) -> None:
+        config = screen_app.gsi_config_text().lower()
+        self.assertIn('"uri" "http://127.0.0.1:', config)
+        self.assertNotIn("allplayers_", config)
+        self.assertLessEqual(screen_app.GSI_MAX_PAYLOAD_BYTES, 1024 * 1024)
+
+    def test_obsolete_valve_probe_scanner_is_not_shipped(self) -> None:
+        source = (Path(__file__).parent / "app.py").read_text(encoding="utf-8").lower()
+        self.assertNotIn("getsdRconfig".lower(), source)
+        self.assertNotIn("fetch_relay_targets", source)
+        specification = (Path(__file__).parent / "Sabasakal-Mini-Screen.spec").read_text(
+            encoding="utf-8",
+        )
+        self.assertNotIn("(str(driver_root / 'library'), 'library')", specification)
 
 
 class SettingsScenarios(unittest.TestCase):
@@ -1357,11 +1389,10 @@ class PerformanceCounterScenarios(unittest.TestCase):
         self.assertLessEqual(gui.LIVE_GAME_WORKER_INTERVAL, 0.20)
         self.assertLessEqual(gui.BOMB_WORKER_INTERVAL, 0.20)
 
-    def test_steam_matchmaking_ping_refresh_is_fresh_without_probe_spam(self) -> None:
-        self.assertEqual(screen_app.STEAM_MATCHMAKING_PING_MODE, "direct_pop")
-        self.assertLessEqual(screen_app.STEAM_PING_DATA_MAX_AGE_SECONDS, 10.0)
-        self.assertGreaterEqual(screen_app.STEAM_PING_DATA_MAX_AGE_SECONDS, 5.0)
-        self.assertLessEqual(screen_app.STEAM_PING_OUTPUT_INTERVAL_SECONDS, 1.0)
+    def test_matchmaking_ping_uses_only_cs2_console_output(self) -> None:
+        self.assertEqual(screen_app.CS2_EXACT_PING_MODE, "console_log")
+        monitor = screen_app.MatchmakingPingMonitor()
+        self.assertFalse(hasattr(monitor, "fallback"))
 
     def test_cs2_console_ping_parser_reads_game_table_and_excludes_falkenstein(self) -> None:
         parsed = screen_app.CS2ConsolePingMonitor.parse_ping_text(
@@ -1382,15 +1413,13 @@ class PerformanceCounterScenarios(unittest.TestCase):
         self.assertEqual(parsed["ams"], 64)
         self.assertNotIn("dvie", parsed)
 
-    def test_matchmaking_monitor_prefers_cs2_values_and_falls_back_cleanly(self) -> None:
+    def test_matchmaking_monitor_returns_only_cs2_values(self) -> None:
         exact = [screen_app.RelayPing("vie", "Viyana", "", 54.0)]
-        fallback = [screen_app.RelayPing("fra", "Frankfurt", "", 60.0)]
         monitor = screen_app.MatchmakingPingMonitor()
         monitor.exact = SimpleNamespace(read=lambda: exact, close=lambda: None)
-        monitor.fallback = SimpleNamespace(read=lambda: fallback, close=lambda: None)
         self.assertEqual(monitor.read(), exact)
         monitor.exact = SimpleNamespace(read=lambda: [], close=lambda: None)
-        self.assertEqual(monitor.read(), fallback)
+        self.assertEqual(monitor.read(), [])
 
     def test_cs2_console_log_launch_option_preserves_existing_user_options(self) -> None:
         original = '''"Software"\n{\n\t"730"\n\t{\n\t\t"LastPlayed" "1"\n\t\t"LaunchOptions" "+exec autoexec.cfg -novid"\n\t\t"cloud" { "state" "ok" }\n\t}\n}\n'''

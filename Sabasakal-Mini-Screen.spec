@@ -13,7 +13,12 @@ datas = [
     ('cs2-hero.jpg', '.'),
     ('icons/png', 'icons/png'),
     ('icons/LICENSES.md', 'icons'),
-    (str(driver_root / 'library'), 'library'),
+    (str(driver_root / 'library' / 'lcd' / 'lcd_comm.py'), 'library/lcd'),
+    (str(driver_root / 'library' / 'lcd' / 'lcd_comm_rev_a.py'), 'library/lcd'),
+    (str(driver_root / 'library' / 'lcd' / 'serialize.py'), 'library/lcd'),
+    (str(driver_root / 'library' / 'lcd' / 'color.py'), 'library/lcd'),
+    (str(driver_root / 'library' / 'log.py'), 'library'),
+    (str(driver_root / 'library' / 'LICENSE'), 'library'),
     ('vendor', 'vendor'),
 ]
 binaries = [

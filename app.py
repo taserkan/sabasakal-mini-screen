@@ -24,7 +24,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -48,9 +47,7 @@ HEIGHT = 320
 # transfers in about 40 ms instead of the old 123 ms 309x51 rectangle.
 MEDIA_VIS_REGION = (154, 266, 327, 295)
 MEDIA_VIS_REGION_WITH_BATTERY = (96, 266, 269, 295)
-SDR_URL = "https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid=730&partner=valve"
 ROOT = Path(__file__).resolve().parent
-CACHE_PATH = ROOT / "sdr_cache.json"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SENSOR_CACHE_PATH = APP_DATA / "elevated-sensors.json"
 DEATHMATCH_CACHE_PATH = APP_DATA / "deathmatch-state.json"
@@ -65,6 +62,7 @@ SENSOR_ROOT = ROOT / "vendor"
 GSI_PORT = 38791
 GSI_TOKEN = "cs2-screen-local-v1"
 GSI_THROTTLE_SECONDS = 0.2
+GSI_MAX_PAYLOAD_BYTES = 1024 * 1024
 DEATHMATCH_RESULT_HOLD_SECONDS = 7.0
 MAX_HARDWARE_LABEL_LENGTH = 12
 _RENDER_LANGUAGE = contextvars.ContextVar("render_language", default="tr")
@@ -704,6 +702,10 @@ class _GSIHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler name
         try:
             length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > GSI_MAX_PAYLOAD_BYTES:
+                self.send_response(413)
+                self.end_headers()
+                return
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             token = str((payload.get("auth") or {}).get("token") or "")
             if token == GSI_TOKEN:
@@ -734,112 +736,11 @@ class GSIServer:
 
 
 @dataclass(frozen=True)
-class RelayTarget:
-    code: str
-    name: str
-    ip: str
-
-
-@dataclass(frozen=True)
 class RelayPing:
     code: str
     name: str
     ip: str
     latency_ms: float
-
-
-def relay_city_key(item: RelayPing) -> str:
-    name = item.name.lower().strip()
-    for provider in ("datapacket ", "valve ", "partner "):
-        if name.startswith(provider):
-            name = name[len(provider):]
-    return name
-
-
-def unique_city_relays(items: list[RelayPing], limit: int) -> list[RelayPing]:
-    unique: list[RelayPing] = []
-    seen: set[str] = set()
-    for item in items:
-        city = relay_city_key(item)
-        if city in seen:
-            continue
-        seen.add(city)
-        unique.append(item)
-        if len(unique) >= limit:
-            break
-    return unique
-
-
-def fetch_relay_targets() -> list[RelayTarget]:
-    try:
-        with urllib.request.urlopen(SDR_URL, timeout=12) as response:
-            data = json.load(response)
-        CACHE_PATH.write_text(json.dumps(data), encoding="utf-8")
-    except Exception:
-        if not CACHE_PATH.exists():
-            raise
-        data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-
-    targets: list[RelayTarget] = []
-    for code, pop in data.get("pops", {}).items():
-        relays = pop.get("relays") or []
-        if not relays:
-            continue
-        ip = relays[0].get("ipv4")
-        if not ip:
-            continue
-        full_name = pop.get("desc", code.upper())
-        # Partner-operated Datapacket POPs are intentionally hidden.  The
-        # display is meant to show only Valve's own connection points.
-        if full_name.lower().startswith("datapacket "):
-            continue
-        short_name = full_name.split(" (")[0].split(" - ")[0]
-        targets.append(RelayTarget(code=code.upper(), name=short_name, ip=ip))
-    return targets
-
-
-def ping_target(target: RelayTarget, timeout: float = 0.8) -> RelayPing | None:
-    try:
-        latency = ping(target.ip, timeout=timeout, unit="ms")
-    except Exception:
-        latency = None
-    if latency is None or latency <= 0:
-        return None
-    return RelayPing(target.code, target.name, target.ip, float(latency))
-
-
-def find_nearest_relays(limit: int = 3) -> list[RelayPing]:
-    targets = fetch_relay_targets()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=24) as executor:
-        results = list(executor.map(ping_target, targets))
-    valid = sorted((result for result in results if result is not None), key=lambda item: item.latency_ms)
-    return unique_city_relays(valid, limit)
-
-
-class RelayMonitor:
-    """Scan all Valve POPs occasionally, then refresh only the fastest candidates."""
-
-    def __init__(self) -> None:
-        self.candidates: list[RelayTarget] = []
-        self.last_full_scan = 0.0
-
-    def _full_scan(self) -> list[RelayPing]:
-        targets = fetch_relay_targets()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=24) as executor:
-            results = list(executor.map(ping_target, targets))
-        valid = sorted((result for result in results if result is not None), key=lambda item: item.latency_ms)
-        nearest_cities = unique_city_relays(valid, 8)
-        self.candidates = [RelayTarget(item.code, item.name, item.ip) for item in nearest_cities]
-        self.last_full_scan = time.monotonic()
-        return nearest_cities[:3]
-
-    def update(self) -> list[RelayPing]:
-        if not self.candidates or time.monotonic() - self.last_full_scan > 300:
-            return self._full_scan()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.candidates)) as executor:
-            results = list(executor.map(ping_target, self.candidates))
-        valid = sorted((result for result in results if result is not None), key=lambda item: item.latency_ms)
-        return unique_city_relays(valid, 3)
 
 
 MATCHMAKING_POP_NAMES = {
@@ -852,88 +753,8 @@ MATCHMAKING_POP_NAMES = {
     "sgp": "Singapur", "sto": "Stockholm", "syd": "Sidney", "tyo": "Tokyo",
     "vie": "Viyana", "waw": "Varşova",
 }
-STEAM_PING_DATA_MAX_AGE_SECONDS = 10.0
-STEAM_PING_OUTPUT_INTERVAL_SECONDS = 1.0
-STEAM_MATCHMAKING_PING_MODE = "direct_pop"
 CS2_CONSOLE_PING_READ_INTERVAL_SECONDS = 1.0
 CS2_EXACT_PING_MODE = "console_log"
-
-
-def _pop_code(value: int) -> str:
-    raw = bytes(((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF, (value >> 24) & 0xFF))
-    return raw.rstrip(b"\0").decode("ascii", errors="replace").lower()
-
-
-class SteamPingMonitor:
-    """Read Valve SDR matchmaking estimates from an isolated Steam helper process."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._started = False
-        self._process: subprocess.Popen[str] | None = None
-        self._values: list[RelayPing] = []
-
-    def start(self) -> None:
-        with self._lock:
-            if self._started:
-                return
-            self._started = True
-        threading.Thread(target=self._run, name="steam-ping-reader", daemon=True).start()
-
-    def read(self) -> list[RelayPing]:
-        self.start()
-        with self._lock:
-            return list(self._values)
-
-    def close(self) -> None:
-        with self._lock:
-            process = self._process
-        if process is not None and process.poll() is None:
-            try:
-                process.terminate()
-            except Exception:
-                pass
-
-    def _run(self) -> None:
-        process = None
-        try:
-            command = [sys.executable, "--steam-ping-bridge"] if getattr(sys, "frozen", False) else [
-                sys.executable, str(ROOT / "app.py"), "--steam-ping-bridge",
-            ]
-            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            process = subprocess.Popen(
-                command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, encoding="utf-8", creationflags=flags,
-            )
-            with self._lock:
-                self._process = process
-            if process.stdout is None:
-                return
-            for line in process.stdout:
-                try:
-                    payload = json.loads(line)
-                    parsed = [
-                        RelayPing(
-                            str(item["code"]), str(item["name"]), "", float(item["latency_ms"]),
-                        )
-                        for item in payload.get("pings", [])
-                        if float(item.get("latency_ms", -1)) >= 0
-                    ]
-                    with self._lock:
-                        self._values = parsed[:3]
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                    continue
-        except Exception:
-            pass
-        finally:
-            if process is not None and process.poll() is None:
-                try:
-                    process.terminate()
-                except Exception:
-                    pass
-            with self._lock:
-                self._started = False
-                self._process = None
 
 
 class CS2ConsolePingMonitor:
@@ -1011,128 +832,16 @@ class CS2ConsolePingMonitor:
 
 
 class MatchmakingPingMonitor:
-    """Prefer CS2's exact table and retain Steamworks as a safe fallback."""
+    """Read only the matchmaking table that CS2 writes to its own log."""
 
     def __init__(self) -> None:
         self.exact = CS2ConsolePingMonitor()
-        self.fallback = SteamPingMonitor()
 
     def read(self) -> list[RelayPing]:
-        exact = self.exact.read()
-        return exact if exact else self.fallback.read()
+        return self.exact.read()
 
     def close(self) -> None:
         self.exact.close()
-        self.fallback.close()
-
-
-def _steam_paths() -> tuple[Path, Path]:
-    cfg_dir = find_cs2_cfg_dir()
-    if cfg_dir is None:
-        raise FileNotFoundError("CS2 kurulum klasörü bulunamadı.")
-    game_dir = cfg_dir.parents[1]
-    steam_api = game_dir / "bin" / "win64" / "steam_api64.dll"
-    if not steam_api.exists():
-        raise FileNotFoundError("CS2 Steam ağ kitaplığı bulunamadı.")
-    steam_dir = next((path.parent for path in steam_api.parents if path.name.lower() == "steamapps"), None)
-    if steam_dir is None:
-        raise FileNotFoundError("Steam kurulum klasörü bulunamadı.")
-    return steam_api, steam_dir
-
-
-def _bridge_write(payload: dict) -> None:
-    line = json.dumps(payload, ensure_ascii=False) + "\n"
-    if sys.stdout is not None:
-        sys.stdout.write(line)
-        sys.stdout.flush()
-    elif os.name == "nt":
-        import ctypes
-        encoded = line.encode("utf-8")
-        written = ctypes.c_ulong(0)
-        handle = ctypes.windll.kernel32.GetStdHandle(-11)
-        ctypes.windll.kernel32.WriteFile(handle, encoded, len(encoded), ctypes.byref(written), None)
-
-
-def run_steam_ping_bridge() -> int:
-    """Use CS2's installed Steamworks library to obtain Valve's own route estimates."""
-    import ctypes
-
-    steam_api = None
-    try:
-        steam_api_path, steam_dir = _steam_paths()
-        os.environ["SteamAppId"] = "730"
-        os.environ["SteamGameId"] = "730"
-        if hasattr(os, "add_dll_directory"):
-            os.add_dll_directory(str(steam_api_path.parent))
-            os.add_dll_directory(str(steam_dir))
-        steam_api = ctypes.WinDLL(str(steam_api_path))
-        error = ctypes.create_string_buffer(1024)
-        steam_api.SteamAPI_InitFlat.argtypes = [ctypes.c_void_p]
-        steam_api.SteamAPI_InitFlat.restype = ctypes.c_int
-        if steam_api.SteamAPI_InitFlat(error) != 0:
-            return 2
-        steam_api.SteamInternal_FindOrCreateUserInterface.argtypes = [ctypes.c_int, ctypes.c_char_p]
-        steam_api.SteamInternal_FindOrCreateUserInterface.restype = ctypes.c_void_p
-        utils = steam_api.SteamInternal_FindOrCreateUserInterface(0, b"SteamNetworkingUtils004")
-        if not utils:
-            return 3
-
-        check = steam_api.SteamAPI_ISteamNetworkingUtils_CheckPingDataUpToDate
-        check.argtypes = [ctypes.c_void_p, ctypes.c_float]
-        check.restype = ctypes.c_bool
-        pop_count = steam_api.SteamAPI_ISteamNetworkingUtils_GetPOPCount
-        pop_count.argtypes = [ctypes.c_void_p]
-        pop_count.restype = ctypes.c_int
-        pop_list = steam_api.SteamAPI_ISteamNetworkingUtils_GetPOPList
-        pop_list.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_int]
-        pop_list.restype = ctypes.c_int
-        # CS2's matchmaking settings show direct latency to each Valve POP.
-        # GetPingToDataCenter is a relayed-route estimate and can reorder close
-        # locations (for example Frankfurt and Falkenstein) by a few ms.
-        get_ping = steam_api.SteamAPI_ISteamNetworkingUtils_GetDirectPingToPOP
-        get_ping.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        get_ping.restype = ctypes.c_int
-
-        # CS2 may leave a much older estimate in Steam's shared cache. Force
-        # one fresh measurement when the pre-match panel opens, then keep a
-        # modest age limit instead of continuously generating probe traffic.
-        check(utils, 0.0)
-        last_refresh = time.monotonic()
-        while True:
-            now = time.monotonic()
-            if now - last_refresh >= STEAM_PING_DATA_MAX_AGE_SECONDS:
-                check(utils, STEAM_PING_DATA_MAX_AGE_SECONDS)
-                last_refresh = now
-            steam_api.SteamAPI_RunCallbacks()
-            count = max(0, pop_count(utils))
-            values: list[dict[str, object]] = []
-            if count:
-                pops = (ctypes.c_uint32 * count)()
-                filled = pop_list(utils, pops, count)
-                for pop in pops[:filled]:
-                    code = _pop_code(pop)
-                    # Four-letter d-prefixed POPs are partner/DataPacket locations
-                    # that CS2's official matchmaking list does not offer.
-                    if len(code) == 4 and code.startswith("d"):
-                        continue
-                    latency = get_ping(utils, pop)
-                    if latency >= 0:
-                        values.append({
-                            "code": code,
-                            "name": MATCHMAKING_POP_NAMES.get(code, code.upper()),
-                            "latency_ms": latency,
-                        })
-            values.sort(key=lambda item: float(item["latency_ms"]))
-            _bridge_write({"pings": values[:3]})
-            time.sleep(STEAM_PING_OUTPUT_INTERVAL_SECONDS)
-    except Exception:
-        return 1
-    finally:
-        if steam_api is not None:
-            try:
-                steam_api.SteamAPI_Shutdown()
-            except Exception:
-                pass
 
 
 STEAM_PING_MONITOR = MatchmakingPingMonitor()
@@ -3491,16 +3200,12 @@ def main() -> int:
     parser.add_argument("--cycles", type=int, default=0, help="Stop continuous mode after N frames; 0 means unlimited")
     parser.add_argument("--sensor-bridge", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--sensor-file-bridge", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--steam-ping-bridge", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.sensor_bridge:
         return run_sensor_bridge()
     if args.sensor_file_bridge:
         return run_sensor_bridge(SENSOR_CACHE_PATH)
-    if args.steam_ping_bridge:
-        return run_steam_ping_bridge()
-
     game_state = CS2GameState()
     game_active = args.force_cs2 or cs2_is_running()
     faceit_active = faceit_ac_is_running()

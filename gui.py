@@ -38,7 +38,7 @@ from app import (
     get_auto_hardware_labels, get_metrics, install_gsi_config, normalise_hardware_label,
     msfs_session_seconds, render_media_visual_patch, render_screen,
     resolve_hardware_labels,
-    run_steam_ping_bridge, WIDTH,
+    WIDTH,
 )
 from battery_runtime import BatteryDevice, BatteryDeviceMonitor
 from media_runtime import (
@@ -3154,8 +3154,6 @@ def main() -> int:
     prepare_runtime_working_directory()
     if "--install-sensor-task" in sys.argv:
         return install_sensor_task()
-    if "--steam-ping-bridge" in sys.argv:
-        return run_steam_ping_bridge()
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--autorun", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
