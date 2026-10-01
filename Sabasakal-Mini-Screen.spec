@@ -60,6 +60,7 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
+    uac_admin=True,
     icon='sabasakal-logo.ico',
     disable_windowed_traceback=False,
     argv_emulation=False,

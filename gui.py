@@ -62,18 +62,19 @@ RUNTIME_FALLBACK_LOG_PATH = APP_DATA / "runtime-current.log"
 ACTIVATE_REQUEST_PATH = APP_DATA / "show-window.request"
 ACTIVATE_ACK_PATH = APP_DATA / "show-window.ack"
 INSTANCE_STATE_PATH = APP_DATA / "instance.json"
-SENSOR_TASK_STATE_PATH = APP_DATA / "sensor-task.json"
-SENSOR_TASK_NAME = "CS2ScreenSensors"
-SENSOR_TASK_MODE = "hidden-native-winexe-v3"
+STARTUP_TASK_STATE_PATH = APP_DATA / "startup-task-state.json"
 SENSOR_OWNER_STALE_SECONDS = 12.0
-SENSOR_HOST_ROOT = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Sabasakal Mini Ekran"
-SENSOR_HOST_PATH = SENSOR_HOST_ROOT / "SabasakalSensorHost.exe"
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 SENSOR_HOST_SOURCE_PATH = (
     RESOURCE_ROOT / "sensor-helper" / "SabasakalSensorHost.exe"
     if getattr(sys, "frozen", False)
     else RESOURCE_ROOT / "sensor-helper" / "publish" / "SabasakalSensorHost.exe"
 )
+LEGACY_SENSOR_TASK_NAMES = ("CS2ScreenSensors", "SabasakalScreenSensors")
+_SENSOR_HOST_PROCESS: subprocess.Popen | None = None
+_SENSOR_HOST_STARTED_AT = 0.0
+_SENSOR_HOST_LOCK = threading.RLock()
+_LEGACY_SENSOR_TASKS_CLEANED = False
 APP_ICON_PATH = RESOURCE_ROOT / "sabasakal-logo.ico"
 APP_LOGO_PATH = RESOURCE_ROOT / "sabasakal-logo.png"
 WINDOW_BG, CARD_BG, CARD_2 = "#0D0F13", "#15181E", "#101319"
@@ -407,281 +408,130 @@ def _clean_restart_environment() -> dict[str, str]:
     return environment
 
 
-def _sensor_task_action() -> tuple[str, str]:
-    # The scheduled task always targets an administrator-protected host. The
-    # portable control-panel EXE may then be moved, renamed or replaced
-    # without invalidating the elevated sensor task, and an unprivileged
-    # process cannot replace what the highest-privilege task executes.
-    return str(SENSOR_HOST_PATH), "--managed"
-
-
-def _expected_sensor_task_state() -> dict[str, str]:
-    executable, arguments = _sensor_task_action()
-    return {
-        "executable": str(Path(executable).resolve()),
-        "arguments": arguments,
-        "mode": SENSOR_TASK_MODE,
-    }
-
-
-def _sensor_task_xml() -> str:
-    """Create a non-interactive, hidden, on-demand elevated sensor task."""
-    executable, arguments = _sensor_task_action()
-    account = "\\".join(filter(None, (
-        os.environ.get("USERDOMAIN"), os.environ.get("USERNAME"),
-    ))) or os.environ.get("USERNAME", "")
-    return f'''<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>Sabasakal Mini Screen hidden sensor helper</Description></RegistrationInfo>
-  <Triggers />
-  <Principals>
-    <Principal id="Author">
-      <UserId>{xml_escape(account)}</UserId>
-      <LogonType>S4U</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>false</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>true</Hidden>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>{xml_escape(executable)}</Command>
-      <Arguments>{xml_escape(arguments)}</Arguments>
-      <WorkingDirectory>{xml_escape(str(SENSOR_HOST_ROOT))}</WorkingDirectory>
-    </Exec>
-  </Actions>
-</Task>'''
-
-
-def _sensor_host_is_current(source: Path, target: Path = SENSOR_HOST_PATH) -> bool:
-    """Compare host contents, not timestamps changed by one-file extraction."""
-    try:
-        if source.stat().st_size != target.stat().st_size:
-            return False
-        def digest(path: Path) -> bytes:
-            checksum = hashlib.sha256()
-            with path.open("rb") as handle:
-                for block in iter(lambda: handle.read(1024 * 1024), b""):
-                    checksum.update(block)
-            return checksum.digest()
-        return digest(source) == digest(target)
-    except OSError:
-        return False
-
-
-def _install_sensor_host_copy(
-    source: Path | None = None, target: Path = SENSOR_HOST_PATH,
-) -> bool:
-    """Atomically install the protected sensor host from an elevated process."""
-    source = Path(source or SENSOR_HOST_SOURCE_PATH).resolve()
-    target = Path(target).resolve()
-    if source == target or _sensor_host_is_current(source, target):
-        return True
-    temporary = target.with_name(f"{target.stem}.new{target.suffix}")
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary.unlink(missing_ok=True)
-        shutil.copy2(source, temporary)
-        for _attempt in range(20):
-            try:
-                os.replace(temporary, target)
-                return True
-            except PermissionError:
-                time.sleep(0.20)
-        return False
-    except OSError:
-        return False
-    finally:
+def _remove_legacy_sensor_tasks_once() -> None:
+    """Remove obsolete task-based sensor launchers after elevation is available."""
+    global _LEGACY_SENSOR_TASKS_CLEANED
+    if _LEGACY_SENSOR_TASKS_CLEANED or os.name != "nt":
+        return
+    _LEGACY_SENSOR_TASKS_CLEANED = True
+    for task_name in LEGACY_SENSOR_TASK_NAMES:
         try:
-            temporary.unlink(missing_ok=True)
+            subprocess.run(
+                ["schtasks.exe", "/End", "/TN", task_name],
+                capture_output=True, timeout=8, creationflags=_hidden_flags(),
+            )
+            subprocess.run(
+                ["schtasks.exe", "/Delete", "/TN", task_name, "/F"],
+                capture_output=True, timeout=8, creationflags=_hidden_flags(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    for stale_path in (
+        APP_DATA / "sensor-task.json",
+        APP_DATA / "sensor-task.xml",
+    ):
+        try:
+            stale_path.unlink(missing_ok=True)
         except OSError:
             pass
 
 
-def _end_sensor_task() -> bool:
-    """Stop the managed helper without deleting its reusable task definition."""
-    try:
-        result = subprocess.run(
-            ["schtasks.exe", "/End", "/TN", SENSOR_TASK_NAME],
-            capture_output=True, timeout=8, creationflags=_hidden_flags(),
-        )
-        # An absent or already-stopped task is also an acceptable end state.
-        return result.returncode == 0 or not _sensor_task_exists()
-    except (OSError, subprocess.SubprocessError):
+def _sensor_host_is_running() -> bool:
+    process = _SENSOR_HOST_PROCESS
+    return process is not None and process.poll() is None
+
+
+def _serialize_sensor_host(function):
+    """Make UI-timer and display-watchdog sensor actions atomic."""
+    def serialized(*args, **kwargs):
+        with _SENSOR_HOST_LOCK:
+            return function(*args, **kwargs)
+    return serialized
+
+
+@_serialize_sensor_host
+def ensure_sensor_host(restart: bool = False) -> bool:
+    """Run exactly one hidden sensor child under the already-elevated UI."""
+    global _SENSOR_HOST_PROCESS, _SENSOR_HOST_STARTED_AT
+    if os.name != "nt" or not getattr(sys, "frozen", False):
         return False
-
-
-def _sensor_task_exists() -> bool:
-    try:
-        result = subprocess.run(
-            ["schtasks.exe", "/Query", "/TN", SENSOR_TASK_NAME],
-            capture_output=True, timeout=8, creationflags=_hidden_flags(),
-        )
-        return result.returncode == 0
-    except (OSError, subprocess.SubprocessError):
+    _remove_legacy_sensor_tasks_once()
+    if _sensor_host_is_running() and not restart:
+        return True
+    stop_sensor_host()
+    if not SENSOR_HOST_SOURCE_PATH.is_file():
+        _runtime_log(f"sensor host missing: {SENSOR_HOST_SOURCE_PATH}")
         return False
-
-
-def _terminate_sensor_host_copies() -> int:
-    """Terminate only processes executing the protected SensorHost path."""
-    expected = os.path.normcase(str(SENSOR_HOST_PATH.resolve()))
-    matches: list[psutil.Process] = []
-    for process in psutil.process_iter(("pid", "exe")):
-        try:
-            executable = process.info.get("exe") or ""
-            if os.path.normcase(str(Path(executable).resolve())) == expected:
-                matches.append(process)
-        except (OSError, psutil.Error):
-            continue
-    for process in matches:
-        try:
-            process.terminate()
-        except psutil.Error:
-            pass
-    _gone, alive = psutil.wait_procs(matches, timeout=2.0)
-    for process in alive:
-        try:
-            process.kill()
-        except psutil.Error:
-            pass
-    return len(matches)
-
-
-def install_sensor_task() -> int:
-    """Install the user-approved elevated sensor reader and start it now."""
-    if os.name != "nt":
-        return 0
-    if not getattr(sys, "frozen", False):
-        return 1
-    _end_sensor_task()
-    removed = _terminate_sensor_host_copies()
-    if removed:
-        _runtime_log(f"removed {removed} legacy sensor host process(es)")
-    if not _install_sensor_host_copy(SENSOR_HOST_SOURCE_PATH, SENSOR_HOST_PATH):
-        _runtime_log("sensor host install failed: stable copy could not be created")
-        return 1
-    executable, arguments = _sensor_task_action()
-    task_file = APP_DATA / "sensor-task.xml"
-    temporary = task_file.with_suffix(".tmp")
+    environment = _clean_restart_environment()
+    # Keep .NET single-file extraction out of the volatile Windows Temp
+    # directory. This prevents cleanup warnings and partially removed hosts.
+    environment["DOTNET_BUNDLE_EXTRACT_BASE_DIR"] = str(
+        APP_DATA / "sensor-host-runtime"
+    )
     try:
         APP_DATA.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(_sensor_task_xml(), encoding="utf-16")
-        os.replace(temporary, task_file)
-        created = subprocess.run(
-            ["schtasks.exe", "/Create", "/TN", SENSOR_TASK_NAME,
-             "/XML", str(task_file), "/F"],
-            capture_output=True, text=True, timeout=20,
+        _SENSOR_HOST_PROCESS = subprocess.Popen(
+            [
+                str(SENSOR_HOST_SOURCE_PATH),
+                "--managed",
+                "--cache", str(SENSOR_CACHE_PATH),
+                "--owner-state", str(INSTANCE_STATE_PATH),
+            ],
+            cwd=str(SENSOR_HOST_SOURCE_PATH.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             creationflags=_hidden_flags(),
+            env=environment,
         )
-        if created.returncode != 0:
-            _runtime_log(f"sensor task install failed: {created.stderr.strip() or created.stdout.strip()}")
-            return 1
-        state = _expected_sensor_task_state()
-        temporary = SENSOR_TASK_STATE_PATH.with_suffix(".tmp")
-        temporary.write_text(json.dumps(state), encoding="utf-8")
-        os.replace(temporary, SENSOR_TASK_STATE_PATH)
-        started = subprocess.run(
-            ["schtasks.exe", "/Run", "/TN", SENSOR_TASK_NAME],
-            capture_output=True, text=True, timeout=10, creationflags=_hidden_flags(),
-        )
-        if started.returncode != 0:
-            _runtime_log(f"sensor task start failed: {started.stderr.strip() or started.stdout.strip()}")
-            return 1
-        _runtime_log("sensor task installed and started")
-        return 0
-    except (OSError, subprocess.SubprocessError) as exc:
-        _runtime_log(f"sensor task install exception: {type(exc).__name__}: {exc}")
-        return 1
-    finally:
-        temporary.unlink(missing_ok=True)
+        _SENSOR_HOST_STARTED_AT = time.monotonic()
+        _runtime_log(f"sensor host started directly; pid={_SENSOR_HOST_PROCESS.pid}")
+        return True
+    except OSError as exc:
+        _SENSOR_HOST_PROCESS = None
+        _runtime_log(f"sensor host start failed: {type(exc).__name__}: {exc}")
+        return False
 
 
-def ensure_sensor_task() -> None:
-    """Keep the approved sensor task attached to the current portable EXE."""
-    if os.name != "nt" or not getattr(sys, "frozen", False):
+@_serialize_sensor_host
+def stop_sensor_host() -> None:
+    """Stop only the child process owned by this control-panel instance."""
+    global _SENSOR_HOST_PROCESS, _SENSOR_HOST_STARTED_AT
+    process = _SENSOR_HOST_PROCESS
+    _SENSOR_HOST_PROCESS = None
+    _SENSOR_HOST_STARTED_AT = 0.0
+    if process is None or process.poll() is not None:
         return
-    executable, _arguments = _sensor_task_action()
-    expected = _expected_sensor_task_state()
-    matches = False
     try:
-        saved = json.loads(SENSOR_TASK_STATE_PATH.read_text(encoding="utf-8"))
-        matches = (
-            saved == expected
-            and _sensor_task_exists()
-            and Path(executable).is_file()
-            and _sensor_host_is_current(SENSOR_HOST_SOURCE_PATH, SENSOR_HOST_PATH)
-        )
-    except (OSError, TypeError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
-        matches = False
-    if matches:
-        subprocess.run(
-            ["schtasks.exe", "/Run", "/TN", SENSOR_TASK_NAME],
-            capture_output=True, timeout=8, creationflags=_hidden_flags(),
-        )
-        return
-    _runtime_log("sensor task missing or EXE moved; requesting approved setup")
-    shell_execute = ctypes.windll.shell32.ShellExecuteW
-    shell_execute.argtypes = [
-        ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
-        ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int,
-    ]
-    shell_execute.restype = ctypes.c_void_p
-    result = shell_execute(
-        None, "runas", sys.executable, "--install-sensor-task",
-        str(Path(sys.executable).parent), 0,
-    )
-    result_code = int(result or 0)
-    if result_code <= 32:
-        _runtime_log(f"sensor task elevation was declined or failed: code={result_code}")
+        process.terminate()
+        process.wait(timeout=2.0)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=1.0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
-def nudge_sensor_task_if_stale(
+def nudge_sensor_host_if_stale(
     path: Path = SENSOR_CACHE_PATH, max_age: float = 5.0,
 ) -> bool:
-    """Restart the existing sensor task when its cache stops advancing."""
+    """Restart the invisible child if its sensor cache stops advancing."""
     try:
         if time.time() - path.stat().st_mtime <= max_age:
             return False
     except OSError:
         pass
-    # Never wake a legacy Python/PyInstaller host.  On upgrades the display
-    # worker can reach this watchdog before the one-time elevated migration;
-    # running that old task is the exact path that used to flash a console and
-    # steal focus from fullscreen games.
-    try:
-        if (
-            json.loads(SENSOR_TASK_STATE_PATH.read_text(encoding="utf-8"))
-            != _expected_sensor_task_state()
-            or not SENSOR_HOST_PATH.is_file()
-            or not _sensor_host_is_current(SENSOR_HOST_SOURCE_PATH, SENSOR_HOST_PATH)
-        ):
-            return False
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    # LibreHardwareMonitor needs a short discovery pass on first launch.
+    # Do not kill a healthy new child before it can publish its first sample.
+    if _sensor_host_is_running() and time.monotonic() - _SENSOR_HOST_STARTED_AT < max_age:
         return False
-    try:
-        result = subprocess.run(
-            ["schtasks.exe", "/Run", "/TN", SENSOR_TASK_NAME],
-            capture_output=True, timeout=8, creationflags=_hidden_flags(),
-        )
-        if result.returncode == 0:
-            _runtime_log("stale sensor cache; existing task restarted")
-            return True
-        _runtime_log("stale sensor cache; task restart failed")
-    except (OSError, subprocess.SubprocessError) as exc:
-        _runtime_log(f"sensor task restart exception: {type(exc).__name__}: {exc}")
-    return False
-
+    restarted = ensure_sensor_host(restart=True)
+    _runtime_log(
+        "stale sensor cache; direct host restarted"
+        if restarted else "stale sensor cache; direct host restart failed"
+    )
+    return restarted
 
 def _activate_existing_window(timeout_seconds: float = 12.0) -> bool:
     if os.name != "nt":
@@ -1020,8 +870,8 @@ def _startup_task_xml() -> str:
     return f'''<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>Sabasakal Mini Screen automatic startup</Description></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled><Delay>PT7S</Delay></LogonTrigger></Triggers>
-  <Principals><Principal id="Author"><UserId>{xml_escape(account)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><Delay>PT3S</Delay></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>{xml_escape(account)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
@@ -1031,7 +881,7 @@ def _startup_task_xml() -> str:
     <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
     <AllowStartOnDemand>true</AllowStartOnDemand>
     <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
+    <Hidden>true</Hidden>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>7</Priority>
     <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
@@ -1065,53 +915,40 @@ def _windows_startup_shortcut_path() -> Path:
     )
 
 
-def _powershell_literal(value: str | Path) -> str:
-    return str(value).replace("'", "''")
-
-
-def _install_windows_startup_shortcut() -> bool:
-    """Create a per-user Startup shortcut without requiring administrator rights."""
-    shortcut = _windows_startup_shortcut_path()
-    executable, arguments = _startup_action()
-    try:
-        shortcut.parent.mkdir(parents=True, exist_ok=True)
-        script = (
-            "$w=New-Object -ComObject WScript.Shell;"
-            f"$s=$w.CreateShortcut('{_powershell_literal(shortcut)}');"
-            f"$s.TargetPath='{_powershell_literal(executable)}';"
-            f"$s.Arguments='{_powershell_literal(arguments)}';"
-            f"$s.WorkingDirectory='{_powershell_literal(APP_DATA)}';"
-            f"$s.IconLocation='{_powershell_literal(executable)},0';"
-            "$s.Description='Sabasakal Mini Screen automatic startup';"
-            "$s.Save();"
-            f"$v=$w.CreateShortcut('{_powershell_literal(shortcut)}');"
-            f"if([IO.Path]::GetFullPath($v.TargetPath) -ne "
-            f"[IO.Path]::GetFullPath('{_powershell_literal(executable)}')){{exit 2}}"
-        )
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
-             "-Command", script],
-            capture_output=True, text=True, timeout=20,
-            creationflags=_hidden_flags(),
-        )
-        if result.returncode != 0 or not shortcut.is_file():
-            _runtime_log(
-                "startup shortcut install failed: "
-                f"{result.stderr.strip() or result.stdout.strip()}"
-            )
-            return False
-        return True
-    except (OSError, subprocess.SubprocessError) as exc:
-        _runtime_log(f"startup shortcut install exception: {type(exc).__name__}: {exc}")
-        return False
-
-
 def _remove_windows_startup_shortcut() -> bool:
     try:
         _windows_startup_shortcut_path().unlink(missing_ok=True)
         return True
     except OSError as exc:
         _runtime_log(f"startup shortcut removal exception: {type(exc).__name__}: {exc}")
+        return False
+
+
+def _expected_startup_task_state() -> dict[str, str]:
+    executable, arguments = _startup_action()
+    return {
+        "executable": str(Path(executable).resolve()),
+        "arguments": arguments,
+        "mode": "elevated-interactive-v1",
+    }
+
+
+def _startup_task_exists() -> bool:
+    try:
+        result = subprocess.run(
+            ["schtasks.exe", "/Query", "/TN", STARTUP_TASK_NAME],
+            capture_output=True, timeout=10, creationflags=_hidden_flags(),
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _startup_task_is_current() -> bool:
+    try:
+        saved = json.loads(STARTUP_TASK_STATE_PATH.read_text(encoding="utf-8"))
+        return saved == _expected_startup_task_state() and _startup_task_exists()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
 
 
@@ -1134,6 +971,10 @@ def _install_windows_startup_task() -> bool:
                 f"{result.stderr.strip() or result.stdout.strip()}"
             )
             return False
+        state = _expected_startup_task_state()
+        state_temporary = STARTUP_TASK_STATE_PATH.with_suffix(".tmp")
+        state_temporary.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(state_temporary, STARTUP_TASK_STATE_PATH)
         return True
     except (OSError, subprocess.SubprocessError) as exc:
         _runtime_log(f"startup task install exception: {type(exc).__name__}: {exc}")
@@ -1152,12 +993,16 @@ def _remove_windows_startup_task() -> bool:
         # Windows returns a non-zero code when an already absent task is
         # deleted. Absence is the requested end state, so accept that case.
         if result.returncode == 0:
+            STARTUP_TASK_STATE_PATH.unlink(missing_ok=True)
             return True
         query = subprocess.run(
             ["schtasks.exe", "/Query", "/TN", STARTUP_TASK_NAME],
             capture_output=True, timeout=10, creationflags=_hidden_flags(),
         )
-        return query.returncode != 0
+        absent = query.returncode != 0
+        if absent:
+            STARTUP_TASK_STATE_PATH.unlink(missing_ok=True)
+        return absent
     except (OSError, subprocess.SubprocessError) as exc:
         _runtime_log(f"startup task removal exception: {type(exc).__name__}: {exc}")
         return False
@@ -1165,24 +1010,23 @@ def _remove_windows_startup_task() -> bool:
 
 def set_windows_autostart(enabled: bool) -> None:
     """Maintain exactly one startup path and remove legacy duplicate launchers."""
-    # Old releases registered both Task Scheduler and HKCU Run fallbacks.  They
-    # can start two control panels and, indirectly, more than one sensor helper.
-    # Keep only the per-user Startup shortcut, which needs no elevation.
-    _remove_windows_startup_task()
+    # The elevated task is the sole startup authority. MultipleInstancesPolicy
+    # and the process mutex independently prevent duplicate control panels.
     try:
         _set_windows_run_fallback(False)
     except Exception as exc:
         _runtime_log(f"legacy startup Run cleanup failed: {type(exc).__name__}: {exc}")
-    shortcut_ok = (
-        _install_windows_startup_shortcut()
-        if enabled else _remove_windows_startup_shortcut()
-    )
-    if not shortcut_ok:
-        raise OSError("Windows Startup shortcut could not be updated")
+    if not _remove_windows_startup_shortcut():
+        raise OSError("Legacy Windows Startup shortcut could not be removed")
+    if enabled:
+        if not _startup_task_is_current() and not _install_windows_startup_task():
+            raise OSError("Elevated Windows startup task could not be installed")
+    elif not _remove_windows_startup_task():
+        raise OSError("Elevated Windows startup task could not be removed")
 
 
 def reconcile_windows_autostart(enabled: bool) -> bool:
-    """Repair the single Startup shortcut and follow the current EXE path."""
+    """Repair the sole elevated startup task and follow the current EXE path."""
     try:
         set_windows_autostart(enabled)
         return True
@@ -2513,7 +2357,7 @@ class ControlPanel(QWidget):
                         getattr(sys, "frozen", False)
                         and cycle_started - last_sensor_watchdog >= 5.0
                     ):
-                        nudge_sensor_task_if_stale()
+                        nudge_sensor_host_if_stale()
                         last_sensor_watchdog = cycle_started
                     display_settings = (effective_brightness(current), current["rotation"])
                     if display_settings != applied_display_settings:
@@ -3152,8 +2996,6 @@ def main() -> int:
     # Windows Run-key applications inherit System32 as their working folder.
     # Set a writable, stable folder before any screen driver is imported/used.
     prepare_runtime_working_directory()
-    if "--install-sensor-task" in sys.argv:
-        return install_sensor_task()
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--autorun", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
@@ -3188,7 +3030,7 @@ def main() -> int:
         app.commitDataRequest.connect(lambda _manager: panel.prepare_system_shutdown())
     app.aboutToQuit.connect(panel.prepare_system_shutdown)
     if not args.smoke_test and args.capture is None:
-        QTimer.singleShot(350, ensure_sensor_task)
+        QTimer.singleShot(350, ensure_sensor_host)
     start_automatically = args.autorun or _RECOVERED_STALE_INSTANCE
     if start_automatically:
         present_initial_window(panel, autorun=args.autorun)
@@ -3223,7 +3065,7 @@ def main() -> int:
         return app.exec()
     finally:
         _cleanup_instance_state()
-        _end_sensor_task()
+        stop_sensor_host()
 
 
 if __name__ == "__main__":
