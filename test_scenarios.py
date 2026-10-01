@@ -2612,12 +2612,16 @@ class UiAndConnectionScenarios(unittest.TestCase):
         panel = self.make_panel()
         fake_app = SimpleNamespace(quit=Mock())
         fake_thread = Mock()
-        with patch.object(gui.subprocess, "Popen"), patch.object(
+        with patch.object(gui.subprocess, "Popen") as popen, patch.object(
             gui.threading, "Thread", return_value=fake_thread,
         ) as thread_class, patch.object(
             gui.QApplication, "instance", return_value=fake_app,
+        ), patch.object(
+            gui, "_clean_restart_environment", return_value={"RESET": "1"},
         ):
             panel._restart_after_display_stall()
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.kwargs["env"], {"RESET": "1"})
         thread_class.assert_called_once_with(
             target=panel._force_exit_after_display_stall,
             name="DisplayStallHardExit",
@@ -2635,6 +2639,21 @@ class UiAndConnectionScenarios(unittest.TestCase):
         sleep.assert_called_once_with(1.25)
         self.assertIn("forcing stale process exit", runtime_log.call_args.args[0])
         hard_exit.assert_called_once_with(0)
+
+    def test_packaged_restart_forces_a_fresh_pyinstaller_runtime(self) -> None:
+        with patch.object(gui.sys, "frozen", True, create=True), patch.dict(
+            gui.os.environ, {"_PYI_APPLICATION_HOME_DIR": r"C:\Temp\_MEI-old"}, clear=True,
+        ):
+            environment = gui._clean_restart_environment()
+        self.assertEqual(environment["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+        self.assertEqual(environment["_PYI_APPLICATION_HOME_DIR"], r"C:\Temp\_MEI-old")
+
+    def test_packaging_uses_folder_runtime_instead_of_temporary_mei_extraction(self) -> None:
+        specification = Path(gui.__file__).with_name("Sabasakal-Mini-Screen.spec").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("exclude_binaries=True", specification)
+        self.assertIn("coll = COLLECT(", specification)
 
     def test_system_tray_has_open_start_stop_and_exit_actions(self) -> None:
         with patch.object(gui.QSystemTrayIcon, "isSystemTrayAvailable", return_value=True):

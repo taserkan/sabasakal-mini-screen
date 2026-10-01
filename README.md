@@ -48,7 +48,9 @@ battery information in one compact, themeable interface.
    **Save and start**.
 
 Windows SmartScreen may warn about an unsigned community binary. Verify the
-published SHA-256 file before running it. No installer is required.
+published SHA-256 file before running it. No installer is required. Keep the
+extracted `_internal` folder beside the EXE; the folder-based portable package
+avoids temporary `_MEI` extraction and its associated startup/cleanup failures.
 
 ## Supported environment
 

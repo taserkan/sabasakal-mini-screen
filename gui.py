@@ -395,6 +395,18 @@ def _hidden_flags() -> int:
     return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
+def _clean_restart_environment() -> dict[str, str]:
+    """Force a new one-file extraction when the packaged app restarts itself."""
+    environment = os.environ.copy()
+    if getattr(sys, "frozen", False):
+        # Without this PyInstaller treats the replacement as another child of
+        # the current bootloader and reuses its _MEI directory.  The old
+        # bootloader then removes that directory during shutdown, leaving the
+        # replacement alive but without the bundled display-driver package.
+        environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return environment
+
+
 def _sensor_task_action() -> tuple[str, str]:
     # The scheduled task always targets an administrator-protected host. The
     # portable control-panel EXE may then be moved, renamed or replaced
@@ -1295,7 +1307,12 @@ class ControlPanel(QWidget):
             ]
         )
         try:
-            subprocess.Popen(command, cwd=str(APP_DATA), creationflags=_hidden_flags())
+            subprocess.Popen(
+                command,
+                cwd=str(APP_DATA),
+                creationflags=_hidden_flags(),
+                env=_clean_restart_environment(),
+            )
         except OSError as exc:
             self._watchdog_restart_started = False
             _runtime_log(f"display watchdog restart failed: {type(exc).__name__}: {exc}")
