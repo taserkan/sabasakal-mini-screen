@@ -1,6 +1,15 @@
 # Sabasakal Mini Screen 3.5″
 
-Version 1.1.2
+Version 1.1.3
+
+1.1.3 fixes: CPU, GPU and RAM follow Windows Task Manager (1 s counters
+without extra averaging, GPU = busiest engine type, RAM "in use" with one
+decimal). While CS2 runs without match data (menu, loading) the Claude design
+shows a CS2 screen with system info and matchmaking pings instead of the
+desktop, and a "Restart CS2" hint appears when CS2 still runs with an outdated
+GSI config. In-game performance mode: audio capture paused, slower battery
+discovery, below-normal priority, sensor host without motherboard SuperIO
+polling. Battery discovery keeps known devices after a cancelled scan.
 
 1.1.2 fixes: "Save and start" really saves the chosen design, orientation and
 other options before the screen starts (a Qt signal argument skipped the save

@@ -1,6 +1,15 @@
 # Sabasakal Mini Screen 3.5″
 
-Sürüm 1.1.2
+Sürüm 1.1.3
+
+1.1.3 düzeltmeleri: CPU, GPU ve RAM değerleri Windows Görev Yöneticisi ile
+aynı (1 sn sayaçlar, ek ortalama yok, GPU = en yoğun motor türü, RAM
+"kullanımda" tek ondalık). CS2 açık ama maç verisi yokken (menü, yükleme)
+Claude tasarımı masaüstü yerine sistem bilgisi ve eşleştirme pingleri olan bir
+CS2 ekranı gösterir; CS2 eski GSI ayarıyla çalışıyorsa "CS2'yi yeniden başlat"
+uyarısı çıkar. Oyun içi performans modu: ses yakalama durur, pil taraması
+seyrekleşir, öncelik düşer, sensör yardımcısı anakart SuperIO okumaz. İptal
+edilen pil taraması bilinen cihazları gizlemez.
 
 1.1.2 düzeltmeleri: "Kaydet ve başlat" artık seçilen tasarımı, ekran yönünü ve
 diğer ayarları ekran başlamadan önce gerçekten kaydediyor (1.1.1'de bir Qt
