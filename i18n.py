@@ -214,6 +214,7 @@ ENGLISH: dict[str, str] = {
     "ft/dk": "ft/min",
     "km/sa": "km/h",
     "kullanımda": "in use",
+    "Otomatik başlatma ayarlanamadı · {error}": "Autostart could not be updated · {error}",
 }
 
 

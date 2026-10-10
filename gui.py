@@ -365,7 +365,9 @@ _RECOVERED_STALE_INSTANCE = False
 APP_DISPLAY_NAME = "Sabasakal Mini Ekran 3,5″"
 WINDOW_TITLE = f"{APP_DISPLAY_NAME} · Ayarlar"
 INSTANCE_HEARTBEAT_INTERVAL_MS = 1000
-INSTANCE_STALE_SECONDS = 5.0
+INSTANCE_STALE_SECONDS = 30.0
+EXIT_FALLBACK_MS = 5000
+WORKER_RESTART_MAX_DELAY_MS = 60000
 DISPLAY_STALL_SECONDS = 8.0
 
 
@@ -658,6 +660,48 @@ def _cleanup_instance_state() -> None:
         pass
 
 
+def _process_has_hung_window(pid: int, timeout_ms: int = 2000) -> bool:
+    """Return True only when a top-level window of ``pid`` does not answer.
+
+    A stale heartbeat alone is not proof of a hang (sleep/resume, a busy disk
+    or a debugger can delay it). WM_NULL with SMTO_ABORTIFHUNG confirms that
+    the primary's message loop is really blocked before it is terminated.
+    """
+    if os.name != "nt" or pid <= 0:
+        return False
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        windows: list[int] = []
+        enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def collect(hwnd, _lparam) -> bool:
+            owner = ctypes.c_ulong(0)
+            user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(owner))
+            if owner.value == pid:
+                windows.append(hwnd)
+            return True
+
+        user32.EnumWindows(enum_proc(collect), None)
+        if not windows:
+            return False
+        user32.SendMessageTimeoutW.argtypes = (
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_size_t),
+        )
+        user32.SendMessageTimeoutW.restype = ctypes.c_size_t
+        for hwnd in windows[:8]:
+            result = ctypes.c_size_t(0)
+            answered = user32.SendMessageTimeoutW(
+                ctypes.c_void_p(hwnd), 0x0000, None, None,  # WM_NULL
+                0x0002, timeout_ms, ctypes.byref(result),  # SMTO_ABORTIFHUNG
+            )
+            if answered:
+                return False
+        return True
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
 def _terminate_unresponsive_primary() -> bool:
     """Terminate only the verified owner of a stale single-instance heartbeat."""
     state = _instance_state()
@@ -675,6 +719,9 @@ def _terminate_unresponsive_primary() -> bool:
             return False
         expected_executable = os.path.normcase(str(state.get("executable") or ""))
         if expected_executable and os.path.normcase(process.exe()) != expected_executable:
+            return False
+        if not _process_has_hung_window(pid):
+            _runtime_log(f"stale primary heartbeat but its window still responds; pid={pid}")
             return False
         process.terminate()
         try:
@@ -842,9 +889,15 @@ def load_settings() -> dict:
 
 def save_settings_file(settings: dict) -> None:
     APP_DATA.mkdir(parents=True, exist_ok=True)
-    temporary = SETTINGS_PATH.with_suffix(".tmp")
-    temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, SETTINGS_PATH)
+    temporary = SETTINGS_PATH.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, SETTINGS_PATH)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def startup_command() -> str:
@@ -1056,6 +1109,7 @@ class WorkerSignals(QObject):
     status = Signal(str)
     error = Signal(str)
     stopped = Signal()
+    autostart_result = Signal(bool, str)
 
 
 class ControlPanel(QWidget):
@@ -1086,6 +1140,14 @@ class ControlPanel(QWidget):
         self.signals.status.connect(self._worker_status)
         self.signals.error.connect(self._worker_error)
         self.signals.stopped.connect(self._screen_stopped)
+        self.signals.autostart_result.connect(self._autostart_result)
+        # Autostart is reconciled by main() at launch; afterwards Task
+        # Scheduler is touched only when the user changes the checkbox.
+        self._applied_autostart: bool | None = bool(self.settings.get("autostart"))
+        self._autostart_thread: threading.Thread | None = None
+        self._restart_failures = 0
+        self._worker_started_at = 0.0
+        self._exit_fallback_armed = False
         self.setWindowTitle(self._window_title())
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
@@ -1626,11 +1688,24 @@ class ControlPanel(QWidget):
         for button in self.findChildren(QPushButton):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
 
+    # Labels whose text is rewritten at runtime. Restoring their construction
+    # text on a language change would show stale values (e.g. "Ekran hazır"
+    # while the screen is running, or an old brightness percentage).
+    DYNAMIC_LABEL_ATTRIBUTES = ("status_label", "brightness_value")
+
     def _register_static_translations(self) -> None:
+        dynamic = {id(getattr(self, name)) for name in self.DYNAMIC_LABEL_ATTRIBUTES if hasattr(self, name)}
+        for name in self.DYNAMIC_LABEL_ATTRIBUTES:
+            if hasattr(self, name):
+                getattr(self, name).setProperty("i18n_source", "")
         for widget_type in (QLabel, QPushButton, QCheckBox, QRadioButton):
             for widget in self.findChildren(widget_type):
+                if id(widget) in dynamic:
+                    continue
                 if widget.property("i18n_source") is None and widget.text():
                     widget.setProperty("i18n_source", widget.text())
+        for widget_type in (QLabel, QPushButton, QCheckBox, QRadioButton, QComboBox, QLineEdit, QSlider):
+            for widget in self.findChildren(widget_type):
                 if widget.toolTip() and widget.property("i18n_tooltip") is None:
                     widget.setProperty("i18n_tooltip", widget.toolTip())
 
@@ -1647,14 +1722,16 @@ class ControlPanel(QWidget):
 
     def _apply_language(self, refresh_preview: bool = True) -> None:
         self.setWindowTitle(self._window_title())
-        for widget_type in (QLabel, QPushButton, QCheckBox, QRadioButton):
+        for widget_type in (QLabel, QPushButton, QCheckBox, QRadioButton, QComboBox, QLineEdit, QSlider):
             for widget in self.findChildren(widget_type):
-                source = widget.property("i18n_source")
-                if source:
-                    widget.setText(self._tr(str(source)))
+                if widget_type in (QLabel, QPushButton, QCheckBox, QRadioButton):
+                    source = widget.property("i18n_source")
+                    if source:
+                        widget.setText(self._tr(str(source)))
                 tooltip = widget.property("i18n_tooltip")
                 if tooltip:
                     widget.setToolTip(self._tr(str(tooltip)))
+        self._sync_brightness_controls()
         self.hardware_limit_label.setText(self._tr(
             "En fazla {count} karakter", count=MAX_HARDWARE_LABEL_LENGTH,
         ))
@@ -1741,10 +1818,27 @@ class ControlPanel(QWidget):
             self.tray_icon.hide()
         if self.worker and self.worker.is_alive():
             self.stop_screen()
+            self._arm_exit_fallback()
             return
         app = QApplication.instance()
         if app is not None:
             app.quit()
+
+    def _arm_exit_fallback(self) -> None:
+        """Guarantee exit even if a native USB call keeps the worker blocked."""
+        if self._exit_fallback_armed or self._smoke_test:
+            return
+        self._exit_fallback_armed = True
+
+        def force_exit() -> None:
+            worker = self.worker
+            if worker is not None and worker.is_alive():
+                _runtime_log("exit fallback: worker did not stop within 5 s; forcing exit")
+                _cleanup_instance_state()
+                stop_sensor_host()
+                os._exit(0)
+
+        QTimer.singleShot(EXIT_FALLBACK_MS, force_exit)
 
     def prepare_system_shutdown(self) -> None:
         """Synchronously blank the LCD while Windows is ending the session."""
@@ -2163,11 +2257,37 @@ class ControlPanel(QWidget):
         if hasattr(self, "preview_label"):
             QTimer.singleShot(0, self._update_preview_pixmap)
 
+    def _apply_autostart_async(self, enabled: bool) -> None:
+        """Run schtasks.exe on a worker thread; it can take seconds."""
+        if self._applied_autostart == enabled:
+            return
+        self._applied_autostart = enabled
+        signals = self.signals
+
+        def apply() -> None:
+            try:
+                set_windows_autostart(enabled)
+                signals.autostart_result.emit(True, "")
+            except Exception as exc:
+                _runtime_log(f"autostart update failed: {type(exc).__name__}: {exc}")
+                signals.autostart_result.emit(False, str(exc))
+
+        self._autostart_thread = threading.Thread(target=apply, name="autostart", daemon=True)
+        self._autostart_thread.start()
+
+    def _autostart_result(self, ok: bool, error: str) -> None:
+        if ok:
+            return
+        # Allow a retry with the same value on the next save.
+        self._applied_autostart = None
+        self._set_status(
+            self._tr("Otomatik başlatma ayarlanamadı · {error}", error=error), "#E3B866",
+        )
+
     def save_settings(self, _checked: bool = False, quiet: bool = False) -> bool:
         self.settings = self._snapshot_settings()
         try:
             save_settings_file(self.settings)
-            set_windows_autostart(self.settings["autostart"])
         except Exception as exc:
             if quiet:
                 self._set_status(
@@ -2179,22 +2299,25 @@ class ControlPanel(QWidget):
             else:
                 QMessageBox.critical(self, self._tr("Ayarlar kaydedilemedi"), str(exc))
             return False
+        self._apply_autostart_async(bool(self.settings["autostart"]))
         if not quiet:
             self._set_status(
                 self._tr("Ayarlar kaydedildi ve çalışan ekrana uygulanacak"), ACCENT
             )
         return True
 
-    def start_screen(self) -> None:
+    def start_screen(self, persist: bool = True) -> None:
         _runtime_log("start_screen requested")
         if self.worker and self.worker.is_alive():
             _runtime_log("start_screen ignored; worker already alive")
             self._set_status(self._tr("Ekran zaten çalışıyor"), ACCENT)
             return
         try:
-            self.save_settings(quiet=True)
-            self._install_gsi(quiet=True)
+            if persist:
+                self.save_settings(quiet=True)
+                self._install_gsi(quiet=True)
             self.stop_event.clear()
+            self._worker_started_at = time.monotonic()
             self.screen_connected.clear()
             self._screen_progress_at = time.monotonic()
             self._watchdog_restart_started = False
@@ -2219,6 +2342,12 @@ class ControlPanel(QWidget):
             self._set_status(
                 self._tr("Ekran başlatılamadı · {error}", error=exc), "#E87878"
             )
+
+    def _restart_worker(self) -> None:
+        """Restart only the worker; settings were saved when it first started."""
+        if self._exit_requested or (self.worker and self.worker.is_alive()):
+            return
+        self.start_screen(persist=False)
 
     def stop_screen(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -2905,8 +3034,15 @@ class ControlPanel(QWidget):
             if app is not None:
                 app.quit()
         elif not self.stop_event.is_set() and not self._smoke_test:
-            _runtime_log("screen worker stopped unexpectedly; scheduling automatic restart")
-            QTimer.singleShot(1000, self.start_screen)
+            if time.monotonic() - self._worker_started_at > 120.0:
+                self._restart_failures = 0
+            delay_ms = min(WORKER_RESTART_MAX_DELAY_MS, 1000 * (2 ** self._restart_failures))
+            self._restart_failures += 1
+            _runtime_log(
+                "screen worker stopped unexpectedly; "
+                f"scheduling automatic restart in {delay_ms} ms"
+            )
+            QTimer.singleShot(delay_ms, self._restart_worker)
 
     def _set_editing_enabled(self, enabled: bool) -> None:
         self._editing_enabled = enabled
@@ -3023,14 +3159,20 @@ def main() -> int:
     if not args.smoke_test and args.capture is None:
         # A portable EXE can be moved after the option was saved. Repair the
         # Run entry only in a real application launch, never in UI tests.
-        reconcile_windows_autostart(bool(panel.settings.get("autostart")))
+        threading.Thread(
+            target=reconcile_windows_autostart,
+            args=(bool(panel.settings.get("autostart")),),
+            name="autostart-reconcile", daemon=True,
+        ).start()
     if panel.tray_icon is not None:
         app.setQuitOnLastWindowClosed(False)
     if hasattr(app, "commitDataRequest"):
         app.commitDataRequest.connect(lambda _manager: panel.prepare_system_shutdown())
     app.aboutToQuit.connect(panel.prepare_system_shutdown)
     if not args.smoke_test and args.capture is None:
-        QTimer.singleShot(350, ensure_sensor_host)
+        QTimer.singleShot(350, lambda: threading.Thread(
+            target=ensure_sensor_host, name="sensor-host-start", daemon=True,
+        ).start())
     start_automatically = args.autorun or _RECOVERED_STALE_INSTANCE
     if start_automatically:
         present_initial_window(panel, autorun=args.autorun)
