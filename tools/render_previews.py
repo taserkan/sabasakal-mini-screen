@@ -3,7 +3,10 @@
 
 No hardware, game or network access is needed:
 
-    python tools/render_previews.py [output_dir] [--language en]
+    python tools/render_previews.py [output_dir] [--language en] [--rotation 180]
+
+``--rotation 180`` additionally writes the exact pixels sent to a panel that
+is mounted upside down (``*-rot180.png``).
 
 PNGs are written to docs/images/new/ by default.
 """
@@ -18,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app import GameSnapshot  # noqa: E402
+from app import GameSnapshot, orient_frame  # noqa: E402
 from battery_runtime import BatteryDevice  # noqa: E402
 from msfs_runtime import FlightPhaseState, FlightTelemetry, LandingRecord  # noqa: E402
 from screens_new import AlertTracker, NewScreenContext, render_new_screen  # noqa: E402
@@ -122,6 +125,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", nargs="?", type=Path, default=ROOT / "docs" / "images" / "new")
     parser.add_argument("--language", default="tr", choices=("tr", "en"))
+    parser.add_argument("--rotation", default="normal", choices=("normal", "180"))
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     suffix = "" if args.language == "tr" else f"-{args.language}"
@@ -130,8 +134,13 @@ def main() -> int:
         if context.alerts:
             context.alerts = AlertTracker().update(context.metrics, language=args.language)
         path = args.output / f"{name}{suffix}.png"
-        render_new_screen(context).save(path)
+        frame = render_new_screen(context)
+        frame.save(path)
         print(path)
+        if args.rotation == "180":
+            rotated = args.output / f"{name}{suffix}-rot180.png"
+            orient_frame(frame, "180").save(rotated)
+            print(rotated)
     return 0
 
 

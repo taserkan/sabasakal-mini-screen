@@ -1,6 +1,12 @@
 # Sabasakal Mini Screen 3.5″
 
-Sürüm 1.1.0
+Sürüm 1.1.1
+
+1.1.1 düzeltmeleri: "Ekran" kartındaki seçiciler artık üst üste binmiyor,
+180° ekran yönü LCD'de gerçekten uygulanıyor (iki tasarımda da, USB yeniden
+bağlandığında da; döndürme yazılımla yapılır) ve Yeni/Klasik tasarım seçimi
+başlatıldığında hemen geçerli oluyor. Testler artık tamamen izole çalışır
+(geçici profil, gerçek donanım/zamanlanmış görev yok).
 
 Windows üzerinde 480×320 USB mini ekranlar için hazırlanmış modern bir bilgi
 panelidir. İşlemci, harici ekran kartı ve RAM değerlerinin yanında CS2, MSFS

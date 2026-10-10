@@ -15,6 +15,67 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Hermetic test environment. This block MUST run before gui/app are imported:
+# every module derives its data paths (settings.json, logs, GSI token,
+# instance.json, sensor cache, deathmatch state ...) from %APPDATA% at import
+# time. Redirect it to a throw-away directory so no test can ever read or
+# overwrite the real %APPDATA%\CS2Screen of the person running the suite.
+# ---------------------------------------------------------------------------
+_REAL_APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
+
+
+def _snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:
+    result: dict[str, tuple[int, int]] = {}
+    if not root.exists():
+        return result
+    for path in root.rglob("*"):
+        try:
+            if path.is_file():
+                stat = path.stat()
+                result[str(path)] = (stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            continue
+    return result
+
+
+_REAL_APP_DATA_BEFORE = _snapshot_tree(_REAL_APP_DATA)
+_TEST_ROOT = Path(tempfile.mkdtemp(prefix="sabasakal-tests-"))
+os.environ["APPDATA"] = str(_TEST_ROOT / "Roaming")
+os.environ["LOCALAPPDATA"] = str(_TEST_ROOT / "Local")
+(_TEST_ROOT / "Roaming").mkdir(parents=True, exist_ok=True)
+(_TEST_ROOT / "Local").mkdir(parents=True, exist_ok=True)
+
+
+class HardwareAccessBlocked(RuntimeError):
+    """A test tried to reach real hardware, processes or scheduled tasks."""
+
+
+def _blocked(name: str):
+    def guard(*_args, **_kwargs):
+        raise HardwareAccessBlocked(f"{name} is blocked in tests; patch it explicitly")
+    return guard
+
+
+def _install_hardware_guards() -> None:
+    import subprocess as _subprocess
+    import winreg as _winreg  # noqa: F401 - Windows only project
+    import serial as _serial
+
+    _serial.Serial = _blocked("serial.Serial")  # type: ignore[assignment]
+    for name in ("Popen", "run", "call", "check_call", "check_output"):
+        setattr(_subprocess, name, _blocked(f"subprocess.{name}"))
+    for name in ("SetValueEx", "DeleteValue", "CreateKey", "CreateKeyEx"):
+        setattr(_winreg, name, _blocked(f"winreg.{name}"))
+    os.startfile = _blocked("os.startfile")  # type: ignore[attr-defined]
+    os.kill = _blocked("os.kill")  # type: ignore[assignment]
+    import psutil as _psutil
+    for name in ("terminate", "kill", "suspend", "send_signal"):
+        setattr(_psutil.Process, name, _blocked(f"psutil.Process.{name}"))
+
+
+_install_hardware_guards()
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image, ImageChops, ImageColor, ImageDraw
@@ -23,6 +84,13 @@ from PySide6.QtWidgets import QApplication
 
 import gui
 import app as screen_app
+
+# No real LCD session may ever be opened by a test, and no test may edit the
+# real CS2/Steam configuration.
+screen_app._robust_display_class = _blocked("real LCD driver")  # type: ignore[assignment]
+for _name in ("install_gsi_config", "install_cs2_console_log_launch_option", "find_cs2_cfg_dir"):
+    setattr(screen_app, _name, _blocked(f"app.{_name}"))
+gui.install_gsi_config = _blocked("gui.install_gsi_config")  # type: ignore[assignment]
 from battery_runtime import (
     BatteryDevice,
     BatteryDeviceMonitor,
@@ -3024,6 +3092,738 @@ class RedesignAndFixScenarios(unittest.TestCase):
         self.assertEqual(panel.design_combo.toolTip()[:4], "New:")
         panel.close()
 
+
+# ---------------------------------------------------------------------------
+# v1.1.1 regression scenarios
+# ---------------------------------------------------------------------------
+from app import GameSnapshot  # noqa: E402
+from battery_runtime import BatterySnapshot  # noqa: E402
+
+
+class FakeLcd:
+    """Records every driver call the way the Rev-A LcdComm API receives them."""
+
+    instances: list["FakeLcd"] = []
+    fail_next_image = False
+
+    def __init__(self, com_port: str) -> None:
+        self.com_port = com_port
+        self.calls: list[tuple] = []
+        self.images: list[tuple[Image.Image, int, int]] = []
+        self.lcd_serial = SimpleNamespace(write_timeout=None, flush=lambda: None)
+        FakeLcd.instances.append(self)
+
+    def InitializeComm(self): self.calls.append(("init",))  # noqa: E704,N802
+    def ScreenOn(self): self.calls.append(("on",))  # noqa: E704,N802
+    def ScreenOff(self): self.calls.append(("off",))  # noqa: E704,N802
+    def SetOrientation(self, value): self.calls.append(("orientation", value))  # noqa: E704,N802
+    def SetBrightness(self, value): self.calls.append(("brightness", value))  # noqa: E704,N802
+    def closeSerial(self): self.calls.append(("close",))  # noqa: E704,N802
+
+    def DisplayPILImage(self, image, x=0, y=0):  # noqa: N802
+        if FakeLcd.fail_next_image:
+            FakeLcd.fail_next_image = False
+            raise OSError("write timeout")
+        self.calls.append(("image", image.size, x, y))
+        self.images.append((image.copy(), x, y))
+
+    def orientations(self) -> list:
+        return [call[1] for call in self.calls if call[0] == "orientation"]
+
+
+def _marker_frame() -> Image.Image:
+    """A frame whose four corners are different colours (detects rotation)."""
+    frame = Image.new("RGB", (480, 320), (0, 0, 0))
+    draw = ImageDraw.Draw(frame)
+    draw.rectangle((0, 0, 9, 9), fill=(255, 0, 0))        # top-left red
+    draw.rectangle((470, 0, 479, 9), fill=(0, 255, 0))    # top-right green
+    draw.rectangle((0, 310, 9, 319), fill=(0, 0, 255))    # bottom-left blue
+    draw.rectangle((470, 310, 479, 319), fill=(255, 255, 255))
+    return frame
+
+
+class CycleEvent(FastEvent):
+    """Stop event that ends the worker after ``max_cycles`` loop waits."""
+
+    def __init__(self, max_cycles: int, hooks: dict | None = None) -> None:
+        super().__init__()
+        self.max_cycles = max_cycles
+        self.hooks = hooks or {}
+        self.cycles = 0
+
+    def wait(self, _timeout: float | None = None) -> bool:
+        self.cycles += 1
+        hook = self.hooks.get(self.cycles)
+        if hook is not None:
+            hook()
+        if self.cycles >= self.max_cycles:
+            self.flag = True
+        return self.flag
+
+
+class RecordingScreen:
+    def __init__(self, port, brightness, rotation) -> None:
+        self.args = (port, brightness, rotation)
+        self.calls: list[tuple] = []
+        self.closed = False
+
+    def configure(self, brightness, rotation):
+        self.calls.append(("configure", brightness, rotation))
+        return None
+
+    def show(self, image) -> None:
+        self.calls.append(("show", image.size))
+
+    def show_regions(self, image, regions) -> None:
+        self.calls.append(("regions", image.size, tuple(regions)))
+
+    def power_off(self) -> None:
+        self.calls.append(("power_off",))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _varying_frames():
+    counter = {"n": 0}
+
+    def render(*_args, **_kwargs):
+        counter["n"] += 1
+        shade = (counter["n"] * 37) % 255
+        return Image.new("RGB", (480, 320), (shade, 0, 0))
+    return render
+
+
+class HermeticEnvironmentScenarios(unittest.TestCase):
+    """Tests must never see or change the real user profile or hardware."""
+
+    def test_all_data_paths_point_into_the_temporary_profile(self) -> None:
+        import app_log
+        import msfs_runtime
+        root = _TEST_ROOT.resolve()
+        for path in (
+            gui.APP_DATA, gui.SETTINGS_PATH, gui.RUNTIME_LOG_PATH, gui.INSTANCE_STATE_PATH,
+            gui.STARTUP_TASK_STATE_PATH, screen_app.APP_DATA, screen_app.GSI_TOKEN_PATH,
+            screen_app.SENSOR_CACHE_PATH, screen_app.DEATHMATCH_CACHE_PATH,
+            app_log.LOG_DIR, msfs_runtime.LANDING_HISTORY_PATH,
+        ):
+            self.assertTrue(Path(path).resolve().is_relative_to(root), path)
+            self.assertFalse(Path(path).resolve().is_relative_to(_REAL_APP_DATA.resolve()), path)
+
+    def test_hardware_processes_and_tasks_are_blocked(self) -> None:
+        import serial
+        import subprocess
+        import winreg
+        import psutil
+        with self.assertRaises(HardwareAccessBlocked):
+            serial.Serial("COM3", 115200)
+        with self.assertRaises(HardwareAccessBlocked):
+            subprocess.run(["schtasks.exe", "/Query"])
+        with self.assertRaises(HardwareAccessBlocked):
+            subprocess.Popen(["SabasakalSensorHost.exe"])
+        with self.assertRaises(HardwareAccessBlocked):
+            winreg.SetValueEx(None, "x", 0, 1, "y")
+        with self.assertRaises(HardwareAccessBlocked):
+            psutil.Process(os.getpid()).terminate()
+        with self.assertRaises(HardwareAccessBlocked):
+            screen_app.ScreenSession("COM3", 50)
+        with self.assertRaises(HardwareAccessBlocked):
+            gui.install_gsi_config()
+
+    def test_set_windows_autostart_cannot_reach_the_real_scheduler(self) -> None:
+        with self.assertRaises(Exception):
+            gui.set_windows_autostart(True)
+
+
+class ZZRealProfileGuardScenarios(unittest.TestCase):
+    """Runs last (alphabetical order): nothing may have touched the real profile."""
+
+    # Files a concurrently running real Sabasakal instance legitimately rewrites.
+    LIVE_APP_FILES = {
+        "runtime.log", "runtime-current.log", "elevated-sensors.json", "instance.json",
+        "show-window.request", "show-window.ack", "msfs-landings.json",
+    }
+
+    def _real_instance_running(self) -> bool:
+        import psutil
+        names = {"sabasakal-mini-screen.exe", "sabasakalsensorhost.exe"}
+        try:
+            return any(
+                (process.info.get("name") or "").lower() in names
+                for process in psutil.process_iter(["name"])
+            )
+        except Exception:
+            return True
+
+    def test_real_app_data_was_not_modified(self) -> None:
+        after = _snapshot_tree(_REAL_APP_DATA)
+        live = self._real_instance_running()
+        changed = []
+        for path in set(after) | set(_REAL_APP_DATA_BEFORE):
+            if after.get(path) == _REAL_APP_DATA_BEFORE.get(path):
+                continue
+            relative = Path(path).relative_to(_REAL_APP_DATA)
+            if live and (relative.parts[0] in ("logs", "sensor-host-runtime")
+                         or relative.name in self.LIVE_APP_FILES):
+                continue
+            changed.append(str(relative))
+        self.assertEqual(sorted(changed), [], "tests wrote under the real %APPDATA%\\CS2Screen")
+
+    def test_test_profile_received_the_writes(self) -> None:
+        gui.save_settings_file(default_settings())
+        self.assertTrue((_TEST_ROOT / "Roaming" / "CS2Screen" / "settings.json").is_file())
+
+
+class Fix111Base(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        FakeLcd.instances = []
+        FakeLcd.fail_next_image = False
+        autostart = patch.object(gui, "set_windows_autostart")
+        autostart.start()
+        self.addCleanup(autostart.stop)
+
+    def make_panel(self, settings: dict | None = None, language: str = "tr") -> gui.ControlPanel:
+        data = default_settings()
+        data["language"] = language
+        if settings:
+            data.update(settings)
+        with patch.object(gui, "load_settings", return_value=data), patch.object(
+            gui, "get_auto_hardware_labels", return_value={
+                "cpu": "9800X3D", "gpu": "RTX 4070 Ti", "ram": "32 GB RAM",
+            },
+        ), patch.object(gui, "get_metrics", return_value={}):
+            panel = gui.ControlPanel()
+        self.addCleanup(panel.close)
+        return panel
+
+    def worker_patches(self, *, cs2=False, faceit=False, msfs=False, game=None, weather=None):
+        state = SimpleNamespace(snapshot=lambda: game or GameSnapshot())
+        return [
+            patch.object(gui, "GSIServer", FakeGSI),
+            patch.object(gui, "CS2GameState", return_value=state),
+            patch.object(gui, "cs2_is_running", return_value=cs2),
+            patch.object(gui, "faceit_ac_is_running", return_value=faceit),
+            patch.object(gui, "msfs_session_seconds", return_value=60.0 if msfs else None),
+            patch.object(gui, "get_metrics", return_value={}),
+            patch.object(gui, "MediaSessionMonitor", side_effect=lambda: FakeMonitor(MediaSnapshot())),
+            patch.object(gui, "AudioSpectrumMonitor", side_effect=lambda: FakeMonitor(AudioSpectrumSnapshot())),
+            patch.object(gui, "BatteryDeviceMonitor", side_effect=lambda **_k: FakeMonitor(BatterySnapshot())),
+            patch.object(gui, "MSFSTelemetryMonitor", side_effect=lambda: FakeMonitor(FlightTelemetry())),
+            patch.object(
+                gui, "WeatherMonitor",
+                side_effect=weather or (lambda *_a: FakeMonitor(WeatherSnapshot())),
+            ),
+            patch.object(gui.FACEIT_PING_MONITOR, "read", return_value=[]),
+            patch.object(gui.STEAM_PING_MONITOR, "read", return_value=[]),
+        ]
+
+    def run_worker(self, panel, *, cycles=3, hooks=None, design_renders=None, classic_renders=None,
+                   **worker_kwargs):
+        """Run ``_screen_worker`` synchronously; return the created screens."""
+        panel.stop_event = CycleEvent(cycles, hooks)
+        panel.screen_connected = TrackingEvent()
+        screens: list[RecordingScreen] = []
+
+        def factory(*args):
+            screen = RecordingScreen(*args)
+            screens.append(screen)
+            return screen
+
+        new_render = _varying_frames()
+        classic_render = _varying_frames()
+
+        def record_new(context):
+            if design_renders is not None:
+                design_renders.append(context)
+            return new_render()
+
+        def record_classic(*args, **kwargs):
+            if classic_renders is not None:
+                classic_renders.append(kwargs)
+            return classic_render()
+
+        patches = self.worker_patches(**worker_kwargs) + [
+            patch.object(gui, "ScreenSession", side_effect=factory),
+            patch.object(gui, "render_new_screen", side_effect=record_new),
+            patch.object(gui, "render_screen", side_effect=record_classic),
+        ]
+        for item in patches:
+            item.start()
+        try:
+            panel._screen_worker()
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        return screens
+
+
+class SettingsRoundTripScenarios(Fix111Base):
+    def test_every_gui_setting_survives_widget_file_load_and_worker(self) -> None:
+        custom = {"Gece": dict(gui.PALETTES["Kuzey"])}
+        panel = self.make_panel({"custom_palettes": custom})
+        panel.brightness_slider.setValue(73)
+        panel.auto_brightness_check.setChecked(False)
+        panel.rotation_combo.setCurrentIndex(panel.rotation_combo.findData("180"))
+        panel.design_combo.setCurrentIndex(panel.design_combo.findData("classic"))
+        panel.msfs_layout_combo.setCurrentIndex(panel.msfs_layout_combo.findData("classic"))
+        panel.autostart_check.setChecked(True)
+        panel.language_combo.setCurrentIndex(panel.language_combo.findData("en"))
+        for field, city in zip(panel.weather_city_inputs, ("Ankara", "Izmir", "Berlin")):
+            field.setText(city)
+        panel.hardware_inputs["cpu"].setText("My CPU")
+        palette_index = panel.palette_combo.findData("Gece")
+        self.assertGreaterEqual(palette_index, 0)
+        panel.palette_combo.setCurrentIndex(palette_index)
+        self.assertTrue(panel.save_settings(quiet=True))
+
+        saved = json.loads(gui.SETTINGS_PATH.read_text(encoding="utf-8"))
+        loaded = gui.load_settings()
+        for data in (saved, loaded):
+            self.assertEqual(data["brightness"], 73)
+            self.assertFalse(data["auto_brightness"])
+            self.assertEqual(data["rotation"], "180")
+            self.assertEqual(data["design"], "classic")
+            self.assertEqual(data["msfs_layout"], "classic")
+            self.assertTrue(data["autostart"])
+            self.assertEqual(data["language"], "en")
+            self.assertEqual(list(data["weather_cities"])[:3], ["Ankara", "Izmir", "Berlin"])
+            self.assertEqual(data["palette"], "Gece")
+            self.assertIn("Gece", data["custom_palettes"])
+            self.assertEqual(data["hardware_labels"]["cpu"], "My CPU")
+
+        # A fresh panel built from the saved file shows the same values ...
+        with patch.object(gui, "get_auto_hardware_labels", return_value={
+            "cpu": "", "gpu": "", "ram": "",
+        }), patch.object(gui, "get_metrics", return_value={}):
+            reloaded = gui.ControlPanel()
+        self.addCleanup(reloaded.close)
+        self.assertEqual(reloaded.rotation_combo.currentData(), "180")
+        self.assertEqual(reloaded.design_combo.currentData(), "classic")
+        self.assertEqual(reloaded.msfs_layout_combo.currentData(), "classic")
+        self.assertEqual(reloaded.brightness_slider.value(), 73)
+        self.assertTrue(reloaded.autostart_check.isChecked())
+        self.assertEqual(reloaded.language, "en")
+        self.assertEqual(reloaded._selected_palette_name(), "Gece")
+
+        # ... and the worker passes them on to the display and renderers.
+        renders: list[dict] = []
+        cities: list = []
+
+        def weather(names):
+            cities.append(list(names))
+            return FakeMonitor(WeatherSnapshot())
+
+        screens = self.run_worker(reloaded, classic_renders=renders, weather=weather)
+        self.assertEqual(screens[0].args, ("AUTO", 73, "180"))
+        self.assertTrue(renders)
+        self.assertEqual(renders[0]["msfs_layout"], "classic")
+        self.assertEqual(renders[0]["language"], "en")
+        self.assertEqual(cities[0][:3], ["Ankara", "Izmir", "Berlin"])
+
+    def test_auto_brightness_reaches_the_display(self) -> None:
+        panel = self.make_panel({"auto_brightness": True, "brightness": 20})
+        with patch.object(gui, "effective_brightness", return_value=90):
+            screens = self.run_worker(panel)
+        self.assertEqual(screens[0].args[1], 90)
+
+    def test_invalid_saved_rotation_and_design_fall_back_safely(self) -> None:
+        gui.SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        gui.SETTINGS_PATH.write_text(json.dumps({"rotation": "90", "design": "fancy"}), encoding="utf-8")
+        loaded = gui.load_settings()
+        self.assertEqual(loaded["rotation"], "normal")
+        self.assertEqual(loaded["design"], "new")
+
+
+class OrientationScenarios(Fix111Base):
+    def session(self, rotation: str) -> screen_app.ScreenSession:
+        with patch.object(screen_app, "_robust_display_class", return_value=FakeLcd):
+            return screen_app.ScreenSession("COM7", 50, rotation)
+
+    def landscape(self):
+        from library.lcd.lcd_comm import Orientation
+        return Orientation.LANDSCAPE
+
+    def assert_panel_matches(self, lcd_image: Image.Image, frame: Image.Image, rotation: str) -> None:
+        expected = frame.transpose(Image.Transpose.ROTATE_180) if rotation == "180" else frame
+        self.assertIsNone(ImageChops.difference(lcd_image, expected).getbbox())
+
+    def test_every_orientation_on_connect_reconnect_and_change(self) -> None:
+        frame = _marker_frame()
+        for rotation in screen_app.SUPPORTED_ROTATIONS:
+            with self.subTest(rotation=rotation):
+                FakeLcd.instances = []
+                with patch.object(screen_app, "_robust_display_class", return_value=FakeLcd):
+                    session = screen_app.ScreenSession("COM7", 50, rotation)
+                    lcd = FakeLcd.instances[0]
+                    # Hardware is always driven in landscape; rotation is in pixels.
+                    self.assertEqual(lcd.orientations(), [self.landscape()])
+                    order = [call[0] for call in lcd.calls]
+                    self.assertLess(order.index("on"), order.index("orientation"))
+                    session.show(frame)
+                    self.assert_panel_matches(lcd.images[-1][0], frame, rotation)
+                    self.assertEqual(lcd.images[-1][1:], (0, 0))
+
+                    # Simulated USB failure: rebuilt session keeps orientation.
+                    FakeLcd.fail_next_image = True
+                    session.show(frame)
+                    self.assertEqual(len(FakeLcd.instances), 2)
+                    rebuilt = FakeLcd.instances[1]
+                    self.assertEqual(rebuilt.orientations(), [self.landscape()])
+                    self.assert_panel_matches(rebuilt.images[-1][0], frame, rotation)
+
+                    # Change while running.
+                    other = "normal" if rotation == "180" else "180"
+                    self.assertTrue(session.configure(50, other))
+                    self.assertEqual(rebuilt.orientations()[-1], self.landscape())
+                    session.show(frame)
+                    self.assert_panel_matches(rebuilt.images[-1][0], frame, other)
+                    self.assertFalse(session.configure(60, other))
+                    session.close()
+
+    def test_partial_regions_use_rotated_panel_coordinates(self) -> None:
+        frame = _marker_frame()
+        regions = [(0, 0, 10, 10), (470, 0, 480, 10), (120, 40, 240, 80)]
+        expected_positions = {
+            "normal": [(0, 0), (470, 0), (120, 40)],
+            "180": [(470, 310), (0, 310), (240, 240)],
+        }
+        for rotation, positions in expected_positions.items():
+            with self.subTest(rotation=rotation):
+                FakeLcd.instances = []
+                session = self.session(rotation)
+                session.show_regions(frame, regions)
+                lcd = FakeLcd.instances[0]
+                self.assertEqual([(x, y) for _image, x, y in lcd.images], positions)
+                panel = frame.transpose(Image.Transpose.ROTATE_180) if rotation == "180" else frame
+                for (image, x, y) in lcd.images:
+                    crop = panel.crop((x, y, x + image.width, y + image.height))
+                    self.assertIsNone(ImageChops.difference(image, crop).getbbox())
+                # The red top-left marker is sent wherever the panel shows it.
+                self.assertEqual(lcd.images[0][0].getpixel((5, 5)), (255, 0, 0))
+
+    def test_partial_updates_rebuild_the_full_rotated_frame(self) -> None:
+        import screens_new
+        frame = screens_new.render_new_screen(screens_new.NewScreenContext(
+            {"cpu_load": 10.0}, (), (), language="tr",
+        ))
+        for rotation in screen_app.SUPPORTED_ROTATIONS:
+            FakeLcd.instances = []
+            session = self.session(rotation)
+            session.show_regions(frame, list(gui.NEW_DESIGN_TILES))
+            canvas = Image.new("RGB", (480, 320))
+            for image, x, y in FakeLcd.instances[0].images:
+                canvas.paste(image, (x, y))
+            self.assert_panel_matches(canvas, frame, rotation)
+
+    def test_frames_of_both_designs_are_panel_sized_for_every_orientation(self) -> None:
+        import screens_new
+        metrics = {
+            "cpu_load": 24.0, "cpu_temp": 46.0, "cpu_freq": 4.6,
+            "gpu_load": 18.0, "gpu_temp": 42.0, "gpu_memory": 920.0,
+            "ram_load": 52.0, "ram_used": 16.5,
+        }
+        classic = screen_app.render_screen(metrics, GameSnapshot(), False, dict(gui.PALETTES["Kuzey"]))
+        new = screens_new.render_new_screen(screens_new.NewScreenContext({}, (), ()))
+        for frame in (classic, new):
+            for rotation in screen_app.SUPPORTED_ROTATIONS:
+                self.assertEqual(frame.size, (480, 320))
+                self.assertEqual(screen_app.orient_frame(frame, rotation).size, (480, 320))
+
+    def test_worker_applies_rotation_on_start_and_when_changed_while_running(self) -> None:
+        for design in ("new", "classic"):
+            with self.subTest(design=design):
+                panel = self.make_panel({"design": design, "rotation": "180"})
+
+                def flip() -> None:
+                    panel.settings = dict(panel.settings, rotation="normal")
+
+                screens = self.run_worker(panel, cycles=4, hooks={2: flip})
+                self.assertEqual(len(screens), 1)
+                screen = screens[0]
+                self.assertEqual(screen.args[2], "180")
+                configure = [call for call in screen.calls if call[0] == "configure"]
+                self.assertEqual(configure[0][2], "normal")
+                after = screen.calls[screen.calls.index(configure[0]) + 1]
+                self.assertEqual(after[0], "show", "rotation change must resend a full frame")
+
+    def test_gui_preview_follows_rotation(self) -> None:
+        panel = self.make_panel({"rotation": "180"})
+        self.assertEqual(panel._rotation(), "180")
+        panel.rotation_combo.setCurrentIndex(panel.rotation_combo.findData("normal"))
+        self.assertEqual(panel._snapshot_settings()["rotation"], "normal")
+
+
+class DesignSwitchScenarios(Fix111Base):
+    def test_classic_design_never_uses_the_new_renderer(self) -> None:
+        cases = {
+            "desktop": {}, "cs2": {"cs2": True, "game": GameSnapshot(connected=True, in_match=True)},
+            "faceit": {"faceit": True}, "msfs": {"msfs": True},
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(mode=name):
+                panel = self.make_panel({"design": "classic"})
+                new_calls: list = []
+                classic_calls: list = []
+                self.run_worker(panel, design_renders=new_calls, classic_renders=classic_calls, **kwargs)
+                self.assertEqual(new_calls, [])
+                self.assertTrue(classic_calls)
+
+    def test_new_design_selects_the_mode_for_every_context(self) -> None:
+        cases = {
+            "desktop": ({}, "desktop"),
+            "cs2-buy": ({"cs2": True, "game": GameSnapshot(connected=True, in_match=True,
+                                                          round_phase="freezetime")}, "cs2"),
+            "cs2-death": ({"cs2": True, "game": GameSnapshot(connected=True, in_match=True,
+                                                            round_phase="live", alive=False)}, "cs2"),
+            "cs2-live": ({"cs2": True, "game": GameSnapshot(connected=True, in_match=True,
+                                                           round_phase="live", alive=True)}, "cs2"),
+            "faceit": ({"faceit": True, "cs2": True}, "faceit"),
+            "msfs": ({"msfs": True}, "msfs"),
+        }
+        expected_screen = {"cs2-buy": "buy", "cs2-death": "death", "cs2-live": "live"}
+        for name, (kwargs, mode) in cases.items():
+            with self.subTest(case=name):
+                panel = self.make_panel({"design": "new"})
+                new_calls: list = []
+                classic_calls: list = []
+                self.run_worker(panel, design_renders=new_calls, classic_renders=classic_calls, **kwargs)
+                self.assertEqual(classic_calls, [])
+                self.assertTrue(new_calls)
+                self.assertEqual(new_calls[-1].mode, mode)
+                if name in expected_screen:
+                    self.assertEqual(new_calls[-1].cs_screen, expected_screen[name])
+                if mode == "faceit":
+                    self.assertIsNone(new_calls[-1].game)
+                if mode == "msfs":
+                    self.assertIsNotNone(new_calls[-1].flight_state)
+
+    def test_switching_design_while_running_resets_frame_caches(self) -> None:
+        for start, target in (("new", "classic"), ("classic", "new")):
+            with self.subTest(start=start):
+                panel = self.make_panel({"design": start})
+
+                def switch() -> None:
+                    panel.settings = dict(panel.settings, design=target)
+
+                new_calls: list = []
+                classic_calls: list = []
+                screens = self.run_worker(
+                    panel, cycles=4, hooks={2: switch},
+                    design_renders=new_calls, classic_renders=classic_calls,
+                )
+                shows = [call for call in screens[0].calls if call[0] == "show"]
+                # first frame + full frame after the switch + blank stop frame
+                self.assertGreaterEqual(len(shows), 3)
+                self.assertTrue(new_calls)
+                self.assertTrue(classic_calls)
+
+    def test_start_button_saves_and_uses_the_selected_design(self) -> None:
+        panel = self.make_panel({"design": "new"})
+        panel.design_combo.setCurrentIndex(panel.design_combo.findData("classic"))
+        started: list = []
+        with patch.object(panel, "_install_gsi"), patch.object(
+            gui.threading.Thread, "start", lambda thread: started.append(thread),
+        ):
+            panel.start_screen()
+        self.assertEqual(panel.settings["design"], "classic")
+        self.assertEqual(gui.load_settings()["design"], "classic")
+        self.assertEqual(len(started), 1)
+        panel.worker = None
+        new_calls: list = []
+        classic_calls: list = []
+        self.run_worker(panel, design_renders=new_calls, classic_renders=classic_calls)
+        self.assertEqual(new_calls, [])
+        self.assertTrue(classic_calls)
+
+    def test_design_and_msfs_combos_are_distinct_and_independent(self) -> None:
+        panel = self.make_panel()
+        panel.msfs_layout_combo.setCurrentIndex(panel.msfs_layout_combo.findData("classic"))
+        self.assertEqual(panel._snapshot_settings()["design"], "new")
+        panel.design_combo.setCurrentIndex(panel.design_combo.findData("classic"))
+        snapshot = panel._snapshot_settings()
+        self.assertEqual((snapshot["design"], snapshot["msfs_layout"]), ("classic", "classic"))
+
+
+class ScreenCardLayoutScenarios(Fix111Base):
+    def card_widgets(self, panel):
+        from PySide6.QtWidgets import QLabel
+        box = panel.design_combo.parentWidget()
+        labels = [w for w in box.findChildren(QLabel) if w.parentWidget() is box and w.isVisible()]
+        controls = [
+            panel.auto_brightness_check, panel.brightness_slider, panel.rotation_combo,
+            panel.autostart_check, panel.msfs_layout_combo, panel.design_combo,
+        ]
+        return box, labels + controls
+
+    def test_screen_card_rows_do_not_overlap(self) -> None:
+        for language in ("tr", "en"):
+            for size_name in ("default", "minimum"):
+                with self.subTest(language=language, size=size_name):
+                    panel = self.make_panel(language=language)
+                    panel.show()
+                    if size_name == "minimum":
+                        panel.resize(panel.minimumSize())
+                    else:
+                        panel.resize(*gui.WINDOW_DEFAULT_SIZE)
+                    self.app.processEvents()
+                    box, widgets = self.card_widgets(panel)
+                    box_rect = box.rect().translated(box.mapTo(panel, box.rect().topLeft()))
+                    rects = []
+                    for widget in widgets:
+                        self.assertTrue(widget.isVisible(), widget)
+                        top_left = widget.mapTo(panel, widget.rect().topLeft())
+                        rect = widget.rect().translated(top_left)
+                        self.assertGreater(rect.height(), 0)
+                        self.assertTrue(box_rect.contains(rect), (type(widget).__name__, rect, box_rect))
+                        rects.append((widget, rect))
+                    for index, (first, a) in enumerate(rects):
+                        for second, b in rects[index + 1:]:
+                            self.assertFalse(
+                                a.intersects(b),
+                                f"{type(first).__name__}:{getattr(first, 'text', lambda: '')()} overlaps "
+                                f"{type(second).__name__}:{getattr(second, 'text', lambda: '')()}",
+                            )
+                    self.assertGreaterEqual(
+                        panel.quick_card.height(), panel.quick_card.minimumSizeHint().height(),
+                    )
+                    for combo in (panel.rotation_combo, panel.design_combo, panel.msfs_layout_combo):
+                        # Offscreen font metrics are inflated; only check the
+                        # guaranteed minimum width and the shared column.
+                        self.assertGreaterEqual(combo.width(), 150)
+                        self.assertEqual(combo.x(), panel.rotation_combo.x())
+                    panel.hide()
+
+
+class WorkerLifecycleScenarios(Fix111Base):
+    def test_start_stop_cycles_leak_nothing_and_apply_settings(self) -> None:
+        panel = self.make_panel()
+        baseline = {thread.ident for thread in threading.enumerate()}
+        sessions: list[RecordingScreen] = []
+
+        def factory(*args):
+            screen = RecordingScreen(*args)
+            sessions.append(screen)
+            return screen
+
+        patches = self.worker_patches() + [
+            patch.object(gui, "ScreenSession", side_effect=factory),
+            patch.object(gui, "render_new_screen", side_effect=_varying_frames()),
+            patch.object(gui, "render_screen", side_effect=_varying_frames()),
+            patch.object(panel, "_install_gsi"),
+        ]
+        for item in patches:
+            item.start()
+        try:
+            for cycle, (rotation, design) in enumerate((
+                ("normal", "new"), ("180", "classic"), ("normal", "classic"), ("180", "new"),
+            )):
+                panel.rotation_combo.setCurrentIndex(panel.rotation_combo.findData(rotation))
+                panel.design_combo.setCurrentIndex(panel.design_combo.findData(design))
+                panel.start_screen()
+                worker = panel.worker
+                self.assertTrue(worker.is_alive())
+                deadline = time.monotonic() + 5
+                while len(sessions) <= cycle and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(sessions[cycle].args[2], rotation)
+                self.assertEqual(panel.settings["design"], design)
+                panel.stop_screen()
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                self.app.processEvents()
+                self.assertTrue(sessions[cycle].closed)
+                self.assertIn(("power_off",), sessions[cycle].calls)
+                self.assertTrue(panel.start_button.isEnabled())
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        time.sleep(0.2)
+        leaked = [
+            thread.name for thread in threading.enumerate()
+            if thread.ident not in baseline and thread.is_alive()
+            and not thread.name.startswith(("autostart", "Dummy"))
+        ]
+        self.assertEqual(leaked, [])
+
+
+class ExitScenarios(Fix111Base):
+    def test_exit_without_worker_quits_the_application(self) -> None:
+        panel = self.make_panel()
+        fake_app = Mock()
+        with patch.object(gui.QApplication, "instance", return_value=fake_app):
+            panel._exit_application()
+        fake_app.quit.assert_called_once()
+        self.assertTrue(panel._exit_requested)
+
+    def test_exit_with_running_worker_stops_it_then_quits(self) -> None:
+        panel = self.make_panel()
+        panel.worker = Mock(is_alive=Mock(return_value=True))
+        panel.stop_event = threading.Event()
+        fake_app = Mock()
+        with patch.object(gui.QTimer, "singleShot") as single_shot:
+            panel._exit_application()
+        self.assertTrue(panel.stop_event.is_set())
+        single_shot.assert_called_once()
+        delay, force_exit = single_shot.call_args.args
+        self.assertEqual(delay, gui.EXIT_FALLBACK_MS)
+        # Worker reports stopped -> application quits.
+        panel.worker = Mock(is_alive=Mock(return_value=False))
+        with patch.object(gui.QApplication, "instance", return_value=fake_app):
+            panel._screen_stopped()
+        fake_app.quit.assert_called_once()
+        # A blocked worker triggers the hard fallback that kills helpers.
+        panel.worker = Mock(is_alive=Mock(return_value=True))
+        with patch.object(gui, "shutdown_child_processes") as shutdown, patch.object(
+            gui.os, "_exit",
+        ) as hard_exit, patch.object(gui, "_cleanup_instance_state"):
+            force_exit()
+        shutdown.assert_called_once()
+        hard_exit.assert_called_once_with(0)
+
+    def test_shutdown_terminates_sensor_host_and_bridge(self) -> None:
+        process = Mock()
+        process.poll.return_value = None
+        with patch.object(gui, "_SENSOR_HOST_PROCESS", process), patch.object(
+            gui.SENSOR_MONITOR, "close",
+        ) as bridge_close:
+            gui.shutdown_child_processes()
+            self.assertIsNone(gui._SENSOR_HOST_PROCESS)
+        process.terminate.assert_called_once()
+        process.wait.assert_called()
+        bridge_close.assert_called_once()
+
+    def test_sensor_host_is_killed_when_terminate_times_out(self) -> None:
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [gui.subprocess.TimeoutExpired("host", 2.0), 0]
+        with patch.object(gui, "_SENSOR_HOST_PROCESS", process):
+            gui.stop_sensor_host()
+        process.kill.assert_called_once()
+
+    def test_main_shuts_down_children_when_event_loop_ends(self) -> None:
+        fake_app = Mock()
+        fake_app.exec.return_value = 0
+        fake_panel = Mock(tray_icon=None, settings={"autostart": False})
+        with patch.object(gui, "prepare_runtime_working_directory"), \
+                patch.object(gui, "_acquire_single_instance", return_value=True), \
+                patch.object(gui, "QApplication", return_value=fake_app), \
+                patch.object(gui, "ControlPanel", return_value=fake_panel), \
+                patch.object(gui, "present_initial_window"), \
+                patch.object(gui, "reconcile_windows_autostart"), \
+                patch.object(gui, "ensure_sensor_host"), \
+                patch.object(gui.QTimer, "singleShot"), \
+                patch.object(gui, "_cleanup_instance_state") as cleanup, \
+                patch.object(gui, "shutdown_child_processes") as shutdown, \
+                patch.object(gui, "_RECOVERED_STALE_INSTANCE", False), \
+                patch.object(sys, "argv", ["Sabasakal-Mini-Screen.exe"]):
+            self.assertEqual(gui.main(), 0)
+        cleanup.assert_called_once()
+        shutdown.assert_called_once()
+        fake_app.aboutToQuit.connect.assert_called()
 
 
 

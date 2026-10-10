@@ -1,6 +1,12 @@
 # Sabasakal Mini Screen 3.5″
 
-Version 1.1.0
+Version 1.1.1
+
+1.1.1 fixes: the "Display" card no longer draws its selectors on top of each
+other, the 180° orientation now really rotates the LCD (applied in software,
+for both designs, also after a USB reconnect), and switching between the
+Yeni/Klasik designs takes effect immediately. The test suite is fully
+hermetic (temporary profile, no hardware, no scheduled tasks).
 
 A modern Windows dashboard for 480×320 USB mini displays. It combines live PC
 telemetry, game-aware panels, media animation, weather and wireless-device

@@ -3213,10 +3213,42 @@ def render_screen(
     return image
 
 
+SUPPORTED_ROTATIONS = ("normal", "180")
+
+
+def normalise_rotation(rotation: object) -> str:
+    return "180" if str(rotation) == "180" else "normal"
+
+
 def _orientation_value(orientation_module: object, rotation: str):
-    if rotation == "180":
-        return orientation_module.REVERSE_LANDSCAPE
+    """Hardware orientation command sent to the panel.
+
+    The Rev-A 3.5" firmware does not reliably honour REVERSE_LANDSCAPE (the
+    command is accepted but the picture is not flipped on many units), so the
+    panel is always driven in plain LANDSCAPE and 180 degrees is applied to
+    the pixels in software by :class:`ScreenSession`. ``rotation`` is kept in
+    the signature for API compatibility.
+    """
+    del rotation
     return orientation_module.LANDSCAPE
+
+
+def rotate_region(
+    region: tuple[int, int, int, int], size: tuple[int, int], rotation: str,
+) -> tuple[int, int, int, int]:
+    """Map a logical (unrotated) frame region to panel coordinates."""
+    if normalise_rotation(rotation) != "180":
+        return region
+    width, height = size
+    left, top, right, bottom = region
+    return (width - right, height - bottom, width - left, height - top)
+
+
+def orient_frame(image: Image.Image, rotation: str) -> Image.Image:
+    """Return the frame exactly as it must appear in panel memory."""
+    if normalise_rotation(rotation) == "180":
+        return image.transpose(Image.Transpose.ROTATE_180)
+    return image
 
 
 SERIAL_WRITE_TIMEOUT_SECONDS = 6.0
@@ -3303,7 +3335,7 @@ class ScreenSession:
         self.orientation_module = Orientation
         self.port = port
         self.brightness = brightness
-        self.rotation = rotation
+        self.rotation = normalise_rotation(rotation)
         self.display = None
         self.reconnects = 0
         self._open()
@@ -3382,10 +3414,13 @@ class ScreenSession:
             serial_connection.flush()
 
     def _display_full(self, image: Image.Image) -> None:
-        self.display.DisplayPILImage(image.convert("RGB"))
+        self.display.DisplayPILImage(orient_frame(image.convert("RGB"), self.rotation))
         self._flush()
 
-    def configure(self, brightness: int, rotation: str) -> None:
+    def configure(self, brightness: int, rotation: str) -> bool:
+        """Apply brightness/orientation; True when the panel needs a full frame."""
+        rotation = normalise_rotation(rotation)
+        rotation_changed = rotation != self.rotation
         self.brightness = brightness
         self.rotation = rotation
 
@@ -3394,14 +3429,18 @@ class ScreenSession:
             self.display.SetBrightness(brightness)
 
         self._with_recovery(apply, None)
+        return rotation_changed
 
     def show(self, image: Image.Image) -> None:
         self._with_recovery(lambda: self._display_full(image), image)
 
     def show_regions(self, image: Image.Image, regions: list[tuple[int, int, int, int]]) -> None:
         def send() -> None:
-            for left, top, right, bottom in regions:
-                crop = image.crop((left, top, right, bottom)).convert("RGB")
+            rotation = self.rotation
+            panel_image = orient_frame(image.convert("RGB"), rotation)
+            for region in regions:
+                left, top, right, bottom = rotate_region(region, image.size, rotation)
+                crop = panel_image.crop((left, top, right, bottom))
                 self.display.DisplayPILImage(crop, x=left, y=top)
             self._flush()
 

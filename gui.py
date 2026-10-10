@@ -33,7 +33,7 @@ from app import (
     COLORS, CS2GameState, FACEIT_PING_MONITOR, GSIServer, GameSnapshot,
     HEIGHT,
     MAX_HARDWARE_LABEL_LENGTH, MEDIA_VIS_REGION, MEDIA_VIS_REGION_WITH_BATTERY,
-    RelayPing, SENSOR_CACHE_PATH, ScreenSession,
+    RelayPing, SENSOR_CACHE_PATH, SENSOR_MONITOR, ScreenSession,
     STEAM_PING_MONITOR, cs2_is_running, faceit_ac_is_running,
     get_auto_hardware_labels, get_metrics, install_gsi_config, normalise_hardware_label,
     msfs_session_seconds, render_media_visual_patch, render_screen,
@@ -58,7 +58,7 @@ from i18n import SUPPORTED_LANGUAGES, normalize_language, translate
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -380,6 +380,10 @@ WINDOW_TITLE = f"{APP_DISPLAY_NAME} · Ayarlar"
 INSTANCE_HEARTBEAT_INTERVAL_MS = 1000
 INSTANCE_STALE_SECONDS = 30.0
 EXIT_FALLBACK_MS = 5000
+QUICK_CARD_HEIGHT = 288
+SETTINGS_CARD_HEIGHT = 706 + (QUICK_CARD_HEIGHT - 252)
+WINDOW_DEFAULT_SIZE = (1200, 890 + (QUICK_CARD_HEIGHT - 252))
+WINDOW_MINIMUM_SIZE = (1160, 860 + (QUICK_CARD_HEIGHT - 252))
 WORKER_RESTART_MAX_DELAY_MS = 60000
 DISPLAY_STALL_SECONDS = 8.0
 
@@ -526,6 +530,18 @@ def stop_sensor_host() -> None:
             process.wait(timeout=1.0)
         except (OSError, subprocess.TimeoutExpired):
             pass
+
+
+def shutdown_child_processes() -> None:
+    """Terminate every helper process this instance may own (tray Exit)."""
+    try:
+        stop_sensor_host()
+    except Exception as exc:  # pragma: no cover - defensive
+        _runtime_log(f"sensor host stop failed: {type(exc).__name__}: {exc}")
+    try:
+        SENSOR_MONITOR.close()
+    except Exception as exc:  # pragma: no cover - defensive
+        _runtime_log(f"sensor bridge stop failed: {type(exc).__name__}: {exc}")
 
 
 def nudge_sensor_host_if_stale(
@@ -1166,8 +1182,8 @@ class ControlPanel(QWidget):
         self.setWindowTitle(self._window_title())
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
-        self.resize(1200, 890)
-        self.setMinimumSize(1160, 860)
+        self.resize(*WINDOW_DEFAULT_SIZE)
+        self.setMinimumSize(*WINDOW_MINIMUM_SIZE)
         self.setStyleSheet(self._style_sheet())
         self._build_ui()
         self._setup_tray_icon()
@@ -1370,7 +1386,9 @@ class ControlPanel(QWidget):
         content.addWidget(left_stack, 0, Qt.AlignmentFlag.AlignTop)
 
         self.quick_card = QFrame(objectName="card")
-        self.quick_card.setFixedHeight(252)
+        # Height of the three selector rows + autostart; must never be
+        # smaller than the layout's minimum or rows start to overlap.
+        self.quick_card.setFixedHeight(QUICK_CARD_HEIGHT)
         self.quick_card_effect = QGraphicsOpacityEffect(self.quick_card)
         self.quick_card_effect.setOpacity(1.0)
         self.quick_card.setGraphicsEffect(self.quick_card_effect)
@@ -1420,39 +1438,15 @@ class ControlPanel(QWidget):
         screen_form.addWidget(self.brightness_slider)
         self.edit_controls.extend((self.auto_brightness_check, self.brightness_slider))
         self._sync_brightness_controls()
-        rotation_line = QHBoxLayout()
-        rotation_line.setSpacing(8)
-        rotation_line.addWidget(self._label("Ekran yönü", "device"))
+        # One grid row per selector: label column + combo column. Every row
+        # has its own fixed slot, so no control can be drawn over another.
         self.rotation_combo = QComboBox()
         self.rotation_combo.addItem("0°", "normal")
         self.rotation_combo.addItem("180°", "180")
         selected_rotation = "180" if self.settings.get("rotation") == "180" else "normal"
         self.rotation_combo.setCurrentIndex(self.rotation_combo.findData(selected_rotation))
-        self.rotation_combo.setFixedHeight(34)
         self.rotation_combo.currentIndexChanged.connect(self._refresh_preview)
         self.edit_controls.append(self.rotation_combo)
-        rotation_line.addWidget(self.rotation_combo, 1)
-        screen_form.addLayout(rotation_line)
-        self.autostart_check = QCheckBox("Windows açıldığında çalıştır")
-        self.autostart_check.setToolTip("Windows açıldığında uygulamayı ve mini ekranı otomatik başlatır.")
-        self.autostart_check.setChecked(bool(self.settings["autostart"]))
-        screen_form.addWidget(self.autostart_check)
-        self.edit_controls.append(self.autostart_check)
-        self.msfs_layout_combo = QComboBox()
-        for label, value in MSFS_LAYOUTS.items():
-            self.msfs_layout_combo.addItem(self._tr(label), value)
-        current_layout = self.settings.get("msfs_layout", "cockpit")
-        self.msfs_layout_combo.setCurrentIndex(self.msfs_layout_combo.findData(current_layout))
-        self.msfs_layout_combo.currentIndexChanged.connect(self._msfs_layout_changed)
-        self.msfs_layout_combo.setToolTip("MSFS 2024 alt bölümünde kullanılacak görünüm.")
-        self.msfs_layout_combo.setFixedHeight(34)
-        self.msfs_layout_combo.setMinimumWidth(190)
-        self.msfs_layout_combo.setStyleSheet("padding: 4px 10px;")
-        msfs_line = QHBoxLayout()
-        msfs_line.addWidget(self._label("MSFS", "device"))
-        msfs_line.addWidget(self.msfs_layout_combo, 1)
-        screen_form.addLayout(msfs_line)
-        self.edit_controls.append(self.msfs_layout_combo)
 
         self.design_combo = QComboBox()
         for label, value in DESIGNS.items():
@@ -1464,14 +1458,38 @@ class ControlPanel(QWidget):
         self.design_combo.setToolTip(
             "Yeni: oyuna ve uçuş evresine göre değişen sade ekranlar. Klasik: önceki görünüm."
         )
-        self.design_combo.setFixedHeight(34)
-        self.design_combo.setMinimumWidth(190)
-        self.design_combo.setStyleSheet("padding: 4px 10px;")
-        design_line = QHBoxLayout()
-        design_line.addWidget(self._label("Tasarım", "device"))
-        design_line.addWidget(self.design_combo, 1)
-        screen_form.addLayout(design_line)
         self.edit_controls.append(self.design_combo)
+
+        self.msfs_layout_combo = QComboBox()
+        for label, value in MSFS_LAYOUTS.items():
+            self.msfs_layout_combo.addItem(self._tr(label), value)
+        current_layout = self.settings.get("msfs_layout", "cockpit")
+        self.msfs_layout_combo.setCurrentIndex(self.msfs_layout_combo.findData(current_layout))
+        self.msfs_layout_combo.currentIndexChanged.connect(self._msfs_layout_changed)
+        self.msfs_layout_combo.setToolTip("MSFS 2024 alt bölümünde kullanılacak görünüm.")
+        self.edit_controls.append(self.msfs_layout_combo)
+
+        selector_grid = QGridLayout()
+        selector_grid.setHorizontalSpacing(10)
+        selector_grid.setVerticalSpacing(5)
+        selector_grid.setColumnStretch(1, 1)
+        for row, (caption, combo) in enumerate((
+            ("Ekran yönü", self.rotation_combo),
+            ("Tasarım", self.design_combo),
+            ("MSFS", self.msfs_layout_combo),
+        )):
+            combo.setFixedHeight(34)
+            combo.setMinimumWidth(150)
+            combo.setStyleSheet("padding: 4px 10px;")
+            selector_grid.addWidget(self._label(caption, "device"), row, 0)
+            selector_grid.addWidget(combo, row, 1)
+        screen_form.addLayout(selector_grid)
+
+        self.autostart_check = QCheckBox("Windows açıldığında çalıştır")
+        self.autostart_check.setToolTip("Windows açıldığında uygulamayı ve mini ekranı otomatik başlatır.")
+        self.autostart_check.setChecked(bool(self.settings["autostart"]))
+        screen_form.addWidget(self.autostart_check)
+        self.edit_controls.append(self.autostart_check)
         quick_columns.addWidget(screen_box, 1)
 
         hardware_box = QFrame(objectName="subCard")
@@ -1591,7 +1609,7 @@ class ControlPanel(QWidget):
         left_layout.addStretch()
 
         settings_card = QFrame(objectName="card")
-        settings_card.setFixedSize(410, 706)
+        settings_card.setFixedSize(410, SETTINGS_CARD_HEIGHT)
         settings_layout = QVBoxLayout(settings_card)
         settings_layout.setContentsMargins(18, 16, 18, 16)
         settings_layout.setSpacing(10)
@@ -1876,7 +1894,7 @@ class ControlPanel(QWidget):
             if worker is not None and worker.is_alive():
                 _runtime_log("exit fallback: worker did not stop within 5 s; forcing exit")
                 _cleanup_instance_state()
-                stop_sensor_host()
+                shutdown_child_processes()
                 os._exit(0)
 
         QTimer.singleShot(EXIT_FALLBACK_MS, force_exit)
@@ -2513,6 +2531,7 @@ class ControlPanel(QWidget):
         alert_tracker = AlertTracker()
         phase_tracker = FlightPhaseTracker()
         new_design_active = False
+        applied_design: str | None = None
 
         def build_media_base(
             render_snapshot, render_panel_active, render_colors, render_pings,
@@ -2612,7 +2631,15 @@ class ControlPanel(QWidget):
                         last_sensor_watchdog = cycle_started
                     display_settings = (effective_brightness(current), current["rotation"])
                     if display_settings != applied_display_settings:
-                        screen.configure(*display_settings)
+                        rotation_changed = screen.configure(*display_settings)
+                        if (
+                            applied_display_settings is not None
+                            and applied_display_settings[1] != display_settings[1]
+                        ) or rotation_changed is True:
+                            # Every pixel moves when the orientation flips:
+                            # drop the diff state and resend a full frame.
+                            last_view_mode = None
+                            sent_frame = None
                         applied_display_settings = display_settings
                     context_refresh_interval = (
                         LIVE_GAME_WORKER_INTERVAL if snapshot.in_match else 0.45
@@ -2747,7 +2774,22 @@ class ControlPanel(QWidget):
                         _runtime_log(f"battery devices changed; visible={device_summary}")
 
                     labels = resolve_hardware_labels(current.get("hardware_labels"))
-                    new_design_active = current.get("design", "new") == "new"
+                    design = "classic" if current.get("design") == "classic" else "new"
+                    if design != applied_design:
+                        # A different renderer owns every pixel: forget the
+                        # frame/diff caches and start with a full frame.
+                        if applied_design is not None:
+                            _runtime_log(f"design switched; design={design}")
+                        else:
+                            _runtime_log(f"design active; design={design}")
+                        applied_design = design
+                        last_view_mode = None
+                        sent_frame = None
+                        media_base_frame = None
+                        if media_render_future is not None:
+                            media_render_future.cancel()
+                            media_render_future = None
+                    new_design_active = design == "new"
                     if new_design_active:
                         if cached_metrics is None or cycle_started - last_metrics_refresh >= 0.5:
                             cached_metrics = get_metrics()
@@ -3354,7 +3396,7 @@ def main() -> int:
         return app.exec()
     finally:
         _cleanup_instance_state()
-        stop_sensor_host()
+        shutdown_child_processes()
 
 
 if __name__ == "__main__":
