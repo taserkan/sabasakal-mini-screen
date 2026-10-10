@@ -531,6 +531,7 @@ class FlightPhaseState:
     route_remaining_nm: float | None = None
     fuel_at_destination_lbs: float | None = None
     fuel_flow_pph: float | None = None
+    landing_count: int = 0
 
 
 class FlightPhaseTracker:
@@ -686,6 +687,7 @@ class FlightPhaseTracker:
             route_remaining_nm=remaining,
             fuel_at_destination_lbs=fuel_at_destination,
             fuel_flow_pph=flow,
+            landing_count=len(self._history),
         )
 
 

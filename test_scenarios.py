@@ -1845,7 +1845,7 @@ class PerformanceCounterScenarios(unittest.TestCase):
                 "timestamp": time.time(), "cpu_temp": 51.25, "cpu_freq": 4.35,
             }), encoding="utf-8")
             self.assertEqual(screen_app.EmbeddedSensorMonitor._read_elevated_cache(path), {
-                "cpu_temp": 51.25, "cpu_freq": 4.35,
+                "cpu_temp": 51.25, "cpu_freq": 4.35, "cpu_power": None,
             })
 
     def test_stale_cache_never_spawns_legacy_pythonnet_helper(self) -> None:
@@ -1853,7 +1853,9 @@ class PerformanceCounterScenarios(unittest.TestCase):
         with patch.object(monitor, "_read_elevated_cache", return_value=None), patch.object(
             monitor, "start",
         ) as start:
-            self.assertEqual(monitor.read(), {"cpu_temp": None, "cpu_freq": None})
+            self.assertEqual(
+                monitor.read(), {"cpu_temp": None, "cpu_freq": None, "cpu_power": None},
+            )
         start.assert_not_called()
 
 
@@ -2401,10 +2403,12 @@ class UiAndConnectionScenarios(unittest.TestCase):
             set(panel.preview_buttons),
             {"daily", "cs2_ct", "cs2_t", "deathmatch", "msfs", "weather", "wireless"},
         )
-        for mode in panel.preview_buttons:
-            panel._set_preview_mode(mode)
-            self.assertEqual(panel.preview_mode, mode)
-            self.assertIsNotNone(panel._preview_image)
+        for design in ("new", "classic"):
+            panel.design_combo.setCurrentIndex(panel.design_combo.findData(design))
+            for mode in panel.preview_buttons:
+                panel._set_preview_mode(mode)
+                self.assertEqual(panel.preview_mode, mode)
+                self.assertIsNotNone(panel._preview_image)
         self.assertIn("Kablosuz", panel.preview_context_label.text())
         panel.close()
 
@@ -2751,6 +2755,238 @@ class UiAndConnectionScenarios(unittest.TestCase):
         self.assertIsNone(screen.shown_images[-1].getbbox())
         self.assertTrue(screen.closed)
         panel.close()
+
+
+class RedesignAndFixScenarios(unittest.TestCase):
+    """New design, FACEIT kill switch and robustness fixes."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_threshold_colors_follow_the_specification(self) -> None:
+        import screens_new as sn
+        cases = (
+            ("cpu", "temp", 59.9, sn.GREEN), ("cpu", "temp", 60, sn.ORANGE),
+            ("cpu", "temp", 74.9, sn.ORANGE), ("cpu", "temp", 75, sn.RED),
+            ("cpu", "load", 59, sn.GREEN), ("cpu", "load", 75, sn.RED),
+            ("gpu", "temp", 54, sn.GREEN), ("gpu", "temp", 55, sn.ORANGE),
+            ("gpu", "temp", 65, sn.RED), ("gpu", "load", 79, sn.ORANGE),
+            ("gpu", "load", 80, sn.RED),
+        )
+        for component, kind, value, expected in cases:
+            self.assertEqual(sn.threshold_color(component, kind, value), expected,
+                             (component, kind, value))
+
+    def test_loss_award_and_buy_suggestion(self) -> None:
+        import screens_new as sn
+        self.assertEqual(sn.loss_award(0), 1400)
+        self.assertEqual(sn.loss_award(2), 2400)
+        self.assertEqual(sn.loss_award(9), 3400)
+        self.assertEqual(sn.loss_award(1, "T", bomb_planted=True), 2500)
+        self.assertEqual(sn.buy_suggestion(4150, "CT", 2400, 14), "full")
+        self.assertEqual(sn.buy_suggestion(2000, "CT", 2400, 5), "eco")
+        self.assertEqual(sn.buy_suggestion(1200, "T", 1900, 5), "force")
+        self.assertEqual(sn.buy_suggestion(2000, "CT", 2400, 12), "force")
+
+    def test_cs_screen_selection_uses_official_round_phase(self) -> None:
+        import screens_new as sn
+        snap = screen_app.GameSnapshot
+        self.assertEqual(sn.cs_screen_for(snap(round_phase="freezetime")), "buy")
+        self.assertEqual(sn.cs_screen_for(snap(round_phase="live", alive=False)), "death")
+        self.assertEqual(sn.cs_screen_for(snap(round_phase="over", alive=True)), "death")
+        self.assertEqual(sn.cs_screen_for(snap(round_phase="live", alive=True)), "live")
+
+    def test_gsi_exposes_loss_streak_and_round_stats(self) -> None:
+        state = screen_app.CS2GameState()
+        state.update({
+            "provider": {"steamid": "me"},
+            "map": {"name": "de_mirage", "phase": "live", "mode": "competitive", "round": 13,
+                    "team_ct": {"score": 6, "consecutive_round_losses": 2},
+                    "team_t": {"score": 7, "consecutive_round_losses": 0}},
+            "round": {"phase": "freezetime"},
+            "player": {"steamid": "me", "team": "CT", "activity": "playing",
+                       "state": {"health": 100, "money": 4150, "round_kills": 0,
+                                 "round_killhs": 0, "round_totaldmg": 0},
+                       "match_stats": {"kills": 14, "deaths": 9, "assists": 3, "mvps": 2,
+                                       "score": 33}},
+            "previously": {"player": {"state": {"money": 1}}},
+        })
+        snap = state.snapshot()
+        self.assertEqual((snap.round_number, snap.score_ct, snap.score_t), (14, 6, 7))
+        self.assertEqual(snap.loss_streak, 2)
+        self.assertEqual(snap.round_phase, "freezetime")
+        self.assertEqual((snap.match_kills, snap.match_deaths, snap.match_assists), (14, 9, 3))
+        self.assertNotIn("previously", state._data)
+        state.update({"map": {"name": "de_inferno", "phase": "warmup"}})
+        self.assertNotIn("round", state._data)
+
+    def test_no_bomb_timer_feature_remains(self) -> None:
+        source = "\n".join(
+            (Path(__file__).parent / name).read_text(encoding="utf-8").lower()
+            for name in ("app.py", "gui.py", "screens_new.py")
+        )
+        for marker in ("bomb_seconds", "draw_bomb_panel", "bomb_timer", "defuse_duration"):
+            self.assertNotIn(marker, source, marker)
+        self.assertNotIn('"bomb" "1"', screen_app.gsi_config_text())
+
+    def test_faceit_disables_gsi_listener_in_the_worker(self) -> None:
+        panel = UiAndConnectionScenarios.make_panel(self)
+        panel.stop_event = FastEvent()
+        panel.screen_connected = TrackingEvent()
+        started: list[object] = []
+
+        class CountingGSI(FakeGSI):
+            def start(self) -> None:
+                started.append(self)
+
+        patches = list(UiAndConnectionScenarios.worker_patches(self))
+        patches[0] = patch.object(gui, "GSIServer", CountingGSI)
+        patches[2] = patch.object(gui, "faceit_ac_is_running", return_value=True)
+        screen = FakeScreen(panel.stop_event)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+                patches[6], patches[7], patches[8], patches[9], \
+                patch.object(gui, "ScreenSession", return_value=screen):
+            panel._screen_worker()
+        self.assertEqual(started, [])
+        self.assertGreaterEqual(screen.show_count, 1)
+        panel.close()
+
+    def test_every_new_screen_renders_in_both_languages(self) -> None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "render_previews", Path(__file__).parent / "tools" / "render_previews.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        import screens_new as sn
+        for language in ("tr", "en"):
+            for name, context in module.contexts().items():
+                context.language = language
+                frame = sn.render_new_screen(context)
+                self.assertEqual(frame.size, (480, 320), name)
+
+    def test_screen_session_rebuilds_after_write_failure(self) -> None:
+        calls: list[str] = []
+
+        class FakeDisplay:
+            instances = 0
+
+            def __init__(self, com_port: str) -> None:
+                FakeDisplay.instances += 1
+                self.number = FakeDisplay.instances
+                self.lcd_serial = SimpleNamespace(write_timeout=None, flush=lambda: None)
+
+            def InitializeComm(self): calls.append(f"init{self.number}")
+            def ScreenOn(self): calls.append("on")
+            def SetOrientation(self, _o): calls.append("orientation")
+            def SetBrightness(self, level): calls.append(f"brightness{level}")
+            def closeSerial(self): calls.append("close")
+
+            def DisplayPILImage(self, _image, x=0, y=0):
+                if self.number == 1:
+                    raise OSError("write timeout")
+                calls.append("frame")
+
+        with patch.object(screen_app, "_robust_display_class", return_value=FakeDisplay):
+            session = screen_app.ScreenSession("COM9", 40)
+            session.show_regions(Image.new("RGB", (480, 320)), [(0, 0, 10, 10)])
+        self.assertEqual(FakeDisplay.instances, 2)
+        self.assertIn("init2", calls)
+        self.assertEqual(calls.count("brightness40"), 2)
+        self.assertEqual(calls[-1], "frame")
+        self.assertEqual(session.display.lcd_serial.write_timeout,
+                         screen_app.SERIAL_WRITE_TIMEOUT_SECONDS)
+
+    def test_gsi_rejects_browser_origin_and_unknown_token(self) -> None:
+        import http.client
+        state = screen_app.CS2GameState()
+        with patch.object(screen_app, "GSI_PORT", 38797):
+            server = screen_app.GSIServer(state)
+        server.start()
+        try:
+            def post(body, headers=None):
+                connection = http.client.HTTPConnection("127.0.0.1", 38797, timeout=3)
+                connection.request("POST", "/", json.dumps(body), headers or {})
+                return connection.getresponse().status
+
+            token = screen_app.gsi_token()
+            self.assertEqual(post({"auth": {"token": token}}, {"Origin": "https://x"}), 403)
+            post({"auth": {"token": "cs2-screen-local-v1"}, "map": {"phase": "live"}})
+            self.assertEqual(state._data, {})
+            post({"auth": {"token": token}, "map": {"phase": "live"}})
+            self.assertEqual(state._data.get("map"), {"phase": "live"})
+        finally:
+            server.close()
+
+    def test_lghub_reader_survives_timeout_mid_frame_and_answers_ping(self) -> None:
+        import socket
+        import struct
+        import battery_runtime
+        left, right = socket.socketpair()
+        try:
+            left.settimeout(0.2)
+            message = b'{"msgId":"1"}'
+            frame = struct.pack("!BB", 0x81, len(message)) + message
+            right.sendall(struct.pack("!BB", 0x89, 1) + b"x" + frame[:4])
+            with self.assertRaises(socket.timeout):
+                battery_runtime._receive_websocket_message(left)
+            self.assertEqual(right.recv(16)[0], 0x8A)
+            right.sendall(frame[4:])
+            self.assertEqual(battery_runtime._receive_websocket_message(left), message.decode())
+        finally:
+            left.close()
+            right.close()
+
+    def test_flight_phase_tracker_scores_landings(self) -> None:
+        from msfs_runtime import FlightPhaseTracker, FlightTelemetry
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory) / "landings.json"
+            tracker = FlightPhaseTracker(history)
+            self.assertEqual(tracker.update(FlightTelemetry(
+                on_ground=False, altitude_agl_ft=1500, vertical_speed_fpm=-700, gear_down=True,
+            ), 0.0).phase, "approach")
+            tracker.update(FlightTelemetry(on_ground=False, altitude_agl_ft=5,
+                                           vertical_speed_fpm=-140, g_force=1.0), 10.0)
+            state = tracker.update(FlightTelemetry(on_ground=True, vertical_speed_fpm=0,
+                                                   g_force=1.21), 10.1)
+            self.assertEqual(state.phase, "landing")
+            self.assertEqual(state.landing.vertical_speed_fpm, -140)
+            self.assertEqual(state.landing.rating, "soft")
+            tracker.update(FlightTelemetry(on_ground=True), 17.0)
+            self.assertTrue(history.is_file())
+            self.assertEqual(FlightPhaseTracker(history).history[0].vertical_speed_fpm, -140)
+            self.assertEqual(tracker.update(FlightTelemetry(on_ground=True), 80.0).phase, "ground")
+
+    def test_simconnect_dll_only_from_trusted_install_locations(self) -> None:
+        import msfs_runtime
+        program_files = os.environ.get("ProgramFiles", r"C:\\Program Files")
+        self.assertTrue(msfs_runtime.is_trusted_simconnect_location(
+            Path(program_files) / "WindowsApps" / "Microsoft.Limitless" / "FlightSimulator2024.exe"
+        ))
+        self.assertFalse(msfs_runtime.is_trusted_simconnect_location(
+            Path(tempfile.gettempdir()) / "FlightSimulator2024.exe"
+        ))
+
+    def test_design_setting_is_persisted_and_sanitised(self) -> None:
+        self.assertEqual(gui.DEFAULT_SETTINGS["design"], "new")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            with patch.object(gui, "SETTINGS_PATH", path), patch.object(gui, "APP_DATA", Path(directory)):
+                path.write_text(json.dumps({"design": "classic"}), encoding="utf-8")
+                self.assertEqual(gui.load_settings()["design"], "classic")
+                path.write_text(json.dumps({"design": "weird"}), encoding="utf-8")
+                self.assertEqual(gui.load_settings()["design"], "new")
+
+    def test_language_change_keeps_live_status_text(self) -> None:
+        panel = UiAndConnectionScenarios.make_panel(self)
+        panel._set_status("Mini ekran bağlı · canlı", "#FFFFFF")
+        panel.language_combo.setCurrentIndex(panel.language_combo.findData("en"))
+        self.assertEqual(panel.status_label.text(), "Mini ekran bağlı · canlı")
+        self.assertEqual(panel.design_combo.toolTip()[:4], "New:")
+        panel.close()
+
+
 
 
 if __name__ == "__main__":

@@ -44,7 +44,10 @@ from battery_runtime import BatteryDevice, BatteryDeviceMonitor
 from media_runtime import (
     AudioSpectrumMonitor, AudioSpectrumSnapshot, MediaSessionMonitor, MediaSnapshot,
 )
-from msfs_runtime import FlightTelemetry, MSFSTelemetryMonitor
+from msfs_runtime import (
+    FlightPhaseState, FlightPhaseTracker, FlightTelemetry, LandingRecord, MSFSTelemetryMonitor,
+)
+from screens_new import AlertTracker, NewScreenContext, cs_screen_for, render_new_screen
 from weather_runtime import (
     DEFAULT_WEATHER_CITIES, WeatherMonitor, WeatherReading, format_city_name,
     normalise_city_names,
@@ -195,12 +198,24 @@ MSFS_LAYOUTS = {
     "Klasik": "classic",
     "Kokpit şeridi": "cockpit",
 }
+DESIGNS = {
+    "Yeni": "new",
+    "Klasik": "classic",
+}
+# Partition used to send only the changed pixels of a new-design frame.
+NEW_DESIGN_TILES = tuple(
+    (left, top, left + 120, top + 40)
+    for top in range(0, 320, 40) for left in range(0, 480, 120)
+)
+NEW_DESIGN_WORKER_INTERVAL = 0.5
+NEW_DESIGN_MSFS_INTERVAL = 0.25
 DEFAULT_SETTINGS = {
     "palette": "Kuzey", "colors": PALETTES["Kuzey"], "brightness": 55,
     "auto_brightness": False, "rotation": "normal", "autostart": False,
     "language": "tr",
     "port": "AUTO", "interval": 0.5,
     "msfs_layout": "cockpit",
+    "design": "new",
     "weather_cities": list(DEFAULT_WEATHER_CITIES),
     "custom_palettes": {}, "hardware_labels": {"cpu": "", "gpu": "", "ram": ""},
 }
@@ -869,6 +884,8 @@ def load_settings() -> dict:
             settings["port"] = port.strip()
         if saved.get("msfs_layout") in MSFS_LAYOUTS.values():
             settings["msfs_layout"] = saved["msfs_layout"]
+        if saved.get("design") in DESIGNS.values():
+            settings["design"] = saved["design"]
         settings["weather_cities"] = list(normalise_city_names(saved.get("weather_cities")))
         labels = saved.get("hardware_labels")
         if isinstance(labels, dict):
@@ -1435,6 +1452,25 @@ class ControlPanel(QWidget):
         msfs_line.addWidget(self.msfs_layout_combo, 1)
         screen_form.addLayout(msfs_line)
         self.edit_controls.append(self.msfs_layout_combo)
+
+        self.design_combo = QComboBox()
+        for label, value in DESIGNS.items():
+            self.design_combo.addItem(self._tr(label), value)
+        self.design_combo.setCurrentIndex(
+            max(0, self.design_combo.findData(self.settings.get("design", "new")))
+        )
+        self.design_combo.currentIndexChanged.connect(self._refresh_preview)
+        self.design_combo.setToolTip(
+            "Yeni: oyuna ve uçuş evresine göre değişen sade ekranlar. Klasik: önceki görünüm."
+        )
+        self.design_combo.setFixedHeight(34)
+        self.design_combo.setMinimumWidth(190)
+        self.design_combo.setStyleSheet("padding: 4px 10px;")
+        design_line = QHBoxLayout()
+        design_line.addWidget(self._label("Tasarım", "device"))
+        design_line.addWidget(self.design_combo, 1)
+        screen_form.addLayout(design_line)
+        self.edit_controls.append(self.design_combo)
         quick_columns.addWidget(screen_box, 1)
 
         hardware_box = QFrame(objectName="subCard")
@@ -1716,6 +1752,13 @@ class ControlPanel(QWidget):
             self.msfs_layout_combo.addItem(self._tr(label), value)
         self.msfs_layout_combo.setCurrentIndex(self.msfs_layout_combo.findData(selected_layout))
         self.msfs_layout_combo.blockSignals(False)
+        selected_design = str(self.design_combo.currentData() or "new")
+        self.design_combo.blockSignals(True)
+        self.design_combo.clear()
+        for label, value in DESIGNS.items():
+            self.design_combo.addItem(self._tr(label), value)
+        self.design_combo.setCurrentIndex(max(0, self.design_combo.findData(selected_design)))
+        self.design_combo.blockSignals(False)
 
     def _apply_language(self, refresh_preview: bool = True) -> None:
         self.setWindowTitle(self._window_title())
@@ -1883,6 +1926,7 @@ class ControlPanel(QWidget):
             "autostart": self.autostart_check.isChecked(), "port": self.settings.get("port", "AUTO"),
             "interval": float(self.settings.get("interval", 0.5)),
             "msfs_layout": str(self.msfs_layout_combo.currentData() or "cockpit"),
+            "design": str(self.design_combo.currentData() or "new"),
             "weather_cities": list(self._weather_city_names()),
             "hardware_labels": {
                 key: normalise_hardware_label(field.text())
@@ -1998,6 +2042,7 @@ class ControlPanel(QWidget):
         self.rotation_combo.setCurrentIndex(self.rotation_combo.findData("normal"))
         self.autostart_check.setChecked(False)
         self.msfs_layout_combo.setCurrentIndex(self.msfs_layout_combo.findData("cockpit"))
+        self.design_combo.setCurrentIndex(self.design_combo.findData("new"))
         for field, city in zip(self.weather_city_inputs, DEFAULT_WEATHER_CITIES):
             field.setText(city)
         for field in self.hardware_inputs.values():
@@ -2128,6 +2173,20 @@ class ControlPanel(QWidget):
                 "weather": "Boşta kullanım · seçili şehirlerin hava durumu",
                 "wireless": "Kablosuz cihazlar · pil durumları",
             }
+            if str(self.design_combo.currentData() or "new") == "new":
+                new_labels = {
+                    "daily": "Yeni tasarım · masaüstü", "weather": "Yeni tasarım · masaüstü",
+                    "wireless": "Yeni tasarım · masaüstü",
+                    "cs2_ct": "Yeni tasarım · CS2 satın alma",
+                    "cs2_t": "Yeni tasarım · CS2 round sonu",
+                    "deathmatch": "Yeni tasarım · FACEIT (sadece sistem)",
+                    "msfs": "Yeni tasarım · MSFS seyir",
+                }
+                self.preview_context_label.setText(
+                    self._tr(new_labels.get(self.preview_mode, "Ekran önizlemesi"))
+                )
+                self._show_preview(pil_to_qimage(self._new_design_preview(metrics, labels)))
+                return
             self.preview_context_label.setText(
                 self._tr(context_labels.get(self.preview_mode, "Ekran önizlemesi"))
             )
@@ -2213,6 +2272,51 @@ class ControlPanel(QWidget):
             self._set_status(
                 self._tr("Önizleme hazırlanamadı: {error}", error=exc), "#E87878"
             )
+
+    def _new_design_preview(self, metrics: dict, labels: dict):
+        batteries = (
+            BatteryDevice("preview-mouse", "PRO X SUPERLIGHT 2", 82, "mouse"),
+            BatteryDevice("preview-keyboard", self._tr("Kablosuz Klavye"), 64, "keyboard"),
+            BatteryDevice("preview-headset", "PRO X WIRELESS", 18, "headset"),
+        )
+        preview_metrics = {**metrics, "cpu_power": 71.0, "gpu_power": 212.0}
+        common = dict(
+            metrics=preview_metrics, batteries=batteries, language=self.language,
+            hardware_labels={"cpu": labels.get("cpu", ""), "gpu": labels.get("gpu", "")},
+        )
+        round_data = dict(
+            connected=True, in_match=True, team="CT", money=4150, round_number=14,
+            score_ct=6, score_t=7, loss_streak=2, match_kills=14, match_deaths=9,
+            match_assists=3, match_mvps=2, match_score=33,
+        )
+        mode = self.preview_mode
+        if mode == "cs2_ct":
+            context = NewScreenContext(**common, mode="cs2", cs_screen="buy", fps=287,
+                                       game=GameSnapshot(round_phase="freezetime", **round_data))
+        elif mode == "cs2_t":
+            context = NewScreenContext(**common, mode="cs2", cs_screen="death", fps=287,
+                                       game=GameSnapshot(round_phase="over", alive=False,
+                                                         round_kills=2, round_headshots=1,
+                                                         round_damage=187, **round_data))
+        elif mode == "deathmatch":
+            context = NewScreenContext(**common, mode="faceit", fps=287)
+        elif mode == "msfs":
+            context = NewScreenContext(
+                **common, mode="msfs",
+                flight=FlightTelemetry(
+                    connected=True, updated_at=1.0, on_ground=False, altitude_ft=36000.0,
+                    ground_speed_kt=438.0, vertical_speed_fpm=0.0, headwind_kt=42.0,
+                    next_wp_id="TOMBI", next_wp_distance_nm=84.0, destination_ete_s=5100.0,
+                    fuel_lbs=18000.0,
+                ),
+                flight_state=FlightPhaseState(
+                    phase="cruise", route_total_nm=1450.0, route_remaining_nm=612.0,
+                    fuel_at_destination_lbs=6830.0, fuel_flow_pph=5400.0,
+                ),
+            )
+        else:
+            context = NewScreenContext(**common, weather=self._preview_weather_readings())
+        return render_new_screen(context)
 
     def _install_gsi(self, _checked: bool = False, quiet: bool = False) -> bool:
         try:
@@ -2405,6 +2509,9 @@ class ControlPanel(QWidget):
         media_base_frame = None
         media_render_future: Future | None = None
         media_render_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media-base-render")
+        alert_tracker = AlertTracker()
+        phase_tracker = FlightPhaseTracker()
+        new_design_active = False
 
         def build_media_base(
             render_snapshot, render_panel_active, render_colors, render_pings,
@@ -2639,250 +2746,301 @@ class ControlPanel(QWidget):
                         _runtime_log(f"battery devices changed; visible={device_summary}")
 
                     labels = resolve_hardware_labels(current.get("hardware_labels"))
-                    continuing_media = view_mode == "media" and last_view_mode == "media"
-                    metadata_changed = (
-                        continuing_media and (
-                            media_signature != last_media_signature
-                            or battery_signature != last_battery_signature
-                        )
-                    )
-                    if continuing_media and not metadata_changed:
-                        if media_render_future is not None and media_render_future.done():
-                            try:
-                                cached_metrics, media_base_frame = media_render_future.result()
-                            except Exception as exc:
-                                _runtime_log(
-                                    f"background media render failed: {type(exc).__name__}: {exc}"
-                                )
-                            media_render_future = None
-                            last_metrics_refresh = cycle_started
-                        if media_base_frame is None:
-                            cached_metrics = get_metrics()
-                            media_base_frame = render_screen(
-                                cached_metrics, snapshot, panel_active, current["colors"],
-                                matchmaking_pings, matchmaking_source, labels,
-                                animation_time=cycle_started, media_snapshot=media_snapshot,
-                                audio_spectrum=audio_spectrum,
-                                battery_devices=battery_snapshot.devices,
-                                language=current.get("language", "tr"),
-                            )
-                            last_metrics_refresh = cycle_started
-                        if (
-                            media_render_future is None
-                            and cycle_started - last_metrics_refresh >= 0.5
-                        ):
-                            media_render_future = media_render_pool.submit(
-                                build_media_base,
-                                snapshot, panel_active, dict(current["colors"]),
-                                list(matchmaking_pings), matchmaking_source, dict(labels),
-                                media_snapshot, audio_spectrum, battery_snapshot.devices,
-                                current.get("language", "tr"),
-                            )
-                        frame = media_base_frame
-                    else:
-                        if metadata_changed and media_render_future is not None:
-                            media_render_future.cancel()
-                            media_render_future = None
+                    new_design_active = current.get("design", "new") == "new"
+                    if new_design_active:
                         if cached_metrics is None or cycle_started - last_metrics_refresh >= 0.5:
                             cached_metrics = get_metrics()
                             last_metrics_refresh = cycle_started
-                        frame = render_screen(
-                            cached_metrics, snapshot, panel_active, current["colors"],
-                            matchmaking_pings, matchmaking_source, labels,
-                            animation_time=cycle_started,
-                            media_snapshot=media_snapshot,
-                            audio_spectrum=audio_spectrum,
-                            battery_devices=battery_snapshot.devices,
-                            msfs_active=msfs_active,
-                            flight_telemetry=flight_telemetry,
-                            msfs_layout=current.get("msfs_layout", "cockpit"),
-                            weather_readings=weather_snapshot.readings,
-                            language=current.get("language", "tr"),
+                        language = current.get("language", "tr")
+                        if faceit_active:
+                            design_mode = "faceit"
+                        elif game_active and snapshot.in_match:
+                            design_mode = "cs2"
+                        elif msfs_active:
+                            design_mode = "msfs"
+                        else:
+                            design_mode = "desktop"
+                        flight_state = (
+                            phase_tracker.update(flight_telemetry) if msfs_active else None
                         )
-                        if view_mode == "media":
-                            media_base_frame = frame
-                    media_patch = (
-                        render_media_visual_patch(
-                            audio_spectrum, current["colors"],
-                            with_battery=bool(battery_snapshot.devices),
+                        alerts = (
+                            alert_tracker.update(cached_metrics, None, language)
+                            if design_mode == "cs2" else ()
                         )
-                        if view_mode == "media" else None
-                    )
-                    if last_view_mode is None:
-                        screen.show(frame)
-                        self._screen_progress_at = time.monotonic()
-                        sent_frame = frame.copy()
-                        self.screen_connected.set()
-                        last_full_gauge_refresh = time.monotonic()
-                        last_fast_gauge_refresh = last_full_gauge_refresh
-                        last_msfs_telemetry_refresh = last_full_gauge_refresh - 0.25
-                        sent_flight_signature = flight_signature
-                        _runtime_log("first full frame sent")
-                    else:
-                        now = time.monotonic()
-                        regions = []
-                        media_gauge_cycle = False
-                        if view_mode == "media":
-                            if now - last_fast_gauge_refresh >= 0.5:
-                                # The metric source refreshes every 0.5 s.
-                                # Send all changed CPU/GPU/RAM value tiles in
-                                # that same frame instead of stealing three
-                                # consecutive spectrum frames.
-                                last_fast_gauge_refresh = now
-                                changed_value_regions = [
-                                    region for region in FAST_VALUE_BOXES
-                                    if _region_has_changed(frame, sent_frame, region)
-                                ]
-                                if changed_value_regions:
-                                    regions.extend(changed_value_regions)
-                                    media_gauge_cycle = True
-                            elif now - last_media_ring_refresh >= 0.30:
-                                ring_regions = MEDIA_RING_REGION_GROUPS[media_ring_index]
-                                media_ring_index = (
-                                    media_ring_index + 1
-                                ) % len(MEDIA_RING_REGION_GROUPS)
-                                last_media_ring_refresh = now
-                                changed_ring_regions = [
-                                    region for region in ring_regions
-                                    if _region_has_changed(frame, sent_frame, region)
-                                ]
-                                if changed_ring_regions:
-                                    regions.extend(changed_ring_regions)
-                                    media_gauge_cycle = True
-                            elif now - last_media_gauge_slice >= 0.20:
-                                gauge_region = MEDIA_GAUGE_REGIONS[media_gauge_index]
-                                media_gauge_index = (media_gauge_index + 1) % len(MEDIA_GAUGE_REGIONS)
-                                last_media_gauge_slice = now
-                                if _region_has_changed(frame, sent_frame, gauge_region):
-                                    regions.append(gauge_region)
-                                    media_gauge_cycle = True
-                        elif now - last_fast_gauge_refresh >= 0.5:
-                            # Rev-A LCDs visibly scan a full 480x160 bitmap.
-                            # Logical tiles are tightened to their exact dirty
-                            # pixels immediately before the serial transfer.
-                            regions.extend(TOP_DIRTY_TILES)
-                            last_fast_gauge_refresh = now
-                            last_full_gauge_refresh = now
-
-                        bottom_changed = view_mode != last_view_mode
-                        if view_mode == "game" and match_signature != last_match_signature:
-                            bottom_changed = True
-                        if view_mode == "media" and media_signature != last_media_signature:
-                            bottom_changed = True
-                        msfs_telemetry_refresh_due = (
-                            view_mode == "msfs"
-                            and flight_signature != sent_flight_signature
-                            and now - last_msfs_telemetry_refresh
-                            >= MSFS_TELEMETRY_REFRESH_INTERVAL
-                        )
-                        battery_changed = battery_signature != last_battery_signature
-                        weather_changed = weather_signature != last_weather_signature
-                        battery_layout_changed = (
-                            battery_changed
-                            and battery_layout_signature != last_battery_layout_signature
-                        )
-                        if battery_layout_changed:
-                            bottom_changed = True
-                        if view_mode == "idle" and weather_changed:
-                            bottom_changed = True
-                        if bottom_changed:
-                            regions.clear()
-                            regions.append(
-                                MSFS_PANEL_REGION_WITH_BATTERY
-                                if view_mode == "msfs" and battery_snapshot.devices
-                                and not battery_layout_changed
-                                else BOTTOM_REGION
-                            )
-                            if view_mode == "msfs":
-                                last_msfs_telemetry_refresh = now
-                                sent_flight_signature = flight_signature
-                            media_gauge_cycle = True
-                        elif battery_changed:
-                            regions.clear()
-                            regions.append(BATTERY_PANEL_REGION)
-                            media_gauge_cycle = True
-                        elif msfs_telemetry_refresh_due:
-                            regions.extend(
-                                MSFS_LIVE_REGIONS_WITH_BATTERY
-                                if battery_snapshot.devices
-                                else MSFS_LIVE_REGIONS
-                            )
-                            last_msfs_telemetry_refresh = now
-                            sent_flight_signature = flight_signature
-                        elif view_mode == "media":
-                            # Never trade a sound frame for a sensor update.
-                            # Small gauge regions may share this transfer, but
-                            # the spectrum itself is present on every cycle.
-                            regions.insert(0, media_visual_region)
-
-                        if regions and battery_layout_changed:
-                            # A device being added or removed moves both the
-                            # spectrum and battery rows. Use one clean full
-                            # frame so no stale row can survive a partial LCD
-                            # update, especially in 180-degree orientation.
+                        frame = render_new_screen(NewScreenContext(
+                            metrics=cached_metrics,
+                            batteries=battery_snapshot.devices,
+                            weather=weather_snapshot.readings,
+                            language=language,
+                            mode=design_mode,
+                            game=snapshot if design_mode == "cs2" else None,
+                            cs_screen=cs_screen_for(snapshot),
+                            alerts=alerts,
+                            flight=flight_telemetry,
+                            flight_state=flight_state,
+                            hardware_labels=labels,
+                        ))
+                        media_patch = None
+                        if last_view_mode is None or sent_frame is None:
                             screen.show(frame)
                             sent_frame = frame.copy()
-                        elif regions:
-                            transfer_frame = sent_frame.copy() if sent_frame is not None else frame.copy()
-                            for region in regions:
-                                if region == FAST_GAUGE_REGION and sent_frame is not None:
-                                    for box in FAST_VALUE_BOXES:
-                                        transfer_frame.paste(frame.crop(box), box)
-                                elif region == media_visual_region and media_patch is not None:
-                                    transfer_frame.paste(media_patch, (region[0], region[1]))
-                                else:
-                                    transfer_frame.paste(frame.crop(region), region)
-                            requested_regions = list(regions)
+                            self.screen_connected.set()
+                            _runtime_log("first full frame sent (new design)")
+                        else:
+                            # Send only the pixels that changed; skip the
+                            # transfer entirely when nothing did.
                             send_regions = _tight_changed_regions(
-                                transfer_frame, sent_frame, requested_regions,
+                                frame, sent_frame, NEW_DESIGN_TILES,
                             )
                             if send_regions:
-                                screen.show_regions(transfer_frame, send_regions)
-                            if (
-                                send_regions
-                                and view_mode == "media"
-                                and media_visual_region in regions
-                                and not media_perf_logged
-                            ):
-                                completed_at = time.monotonic()
-                                if media_perf_started == 0.0:
-                                    media_perf_started = completed_at
-                                if media_perf_last_frame:
-                                    media_perf_max_gap = max(
-                                        media_perf_max_gap,
-                                        completed_at - media_perf_last_frame,
-                                    )
-                                media_perf_last_frame = completed_at
-                                media_perf_frames += 1
-                                if any(
-                                    region in FAST_VALUE_BOXES
-                                    or region in MEDIA_GAUGE_REGIONS
-                                    or any(
-                                        region in group
-                                        for group in MEDIA_RING_REGION_GROUPS
-                                    )
-                                    for region in requested_regions
-                                ):
-                                    media_perf_hardware_frames += 1
-                                sample_seconds = completed_at - media_perf_started
-                                if sample_seconds >= 10.0:
-                                    measured_fps = (
-                                        (media_perf_frames - 1) / sample_seconds
-                                        if media_perf_frames > 1 else 0.0
-                                    )
-                                    _runtime_log(
-                                        "media sync measured; "
-                                        f"fps={measured_fps:.1f}; "
-                                        f"max_gap_ms={media_perf_max_gap * 1000.0:.0f}; "
-                                        f"audio_frames={media_perf_frames}; "
-                                        f"hardware_coframes={media_perf_hardware_frames}"
-                                    )
-                                    media_perf_logged = True
-                            if sent_frame is None:
-                                sent_frame = transfer_frame.copy()
-                            else:
+                                screen.show_regions(frame, send_regions)
                                 for region in send_regions:
-                                    sent_frame.paste(transfer_frame.crop(region), region)
+                                    sent_frame.paste(frame.crop(region), region)
+                    else:
+                        continuing_media = view_mode == "media" and last_view_mode == "media"
+                        metadata_changed = (
+                            continuing_media and (
+                                media_signature != last_media_signature
+                                or battery_signature != last_battery_signature
+                            )
+                        )
+                        if continuing_media and not metadata_changed:
+                            if media_render_future is not None and media_render_future.done():
+                                try:
+                                    cached_metrics, media_base_frame = media_render_future.result()
+                                except Exception as exc:
+                                    _runtime_log(
+                                        f"background media render failed: {type(exc).__name__}: {exc}"
+                                    )
+                                media_render_future = None
+                                last_metrics_refresh = cycle_started
+                            if media_base_frame is None:
+                                cached_metrics = get_metrics()
+                                media_base_frame = render_screen(
+                                    cached_metrics, snapshot, panel_active, current["colors"],
+                                    matchmaking_pings, matchmaking_source, labels,
+                                    animation_time=cycle_started, media_snapshot=media_snapshot,
+                                    audio_spectrum=audio_spectrum,
+                                    battery_devices=battery_snapshot.devices,
+                                    language=current.get("language", "tr"),
+                                )
+                                last_metrics_refresh = cycle_started
+                            if (
+                                media_render_future is None
+                                and cycle_started - last_metrics_refresh >= 0.5
+                            ):
+                                media_render_future = media_render_pool.submit(
+                                    build_media_base,
+                                    snapshot, panel_active, dict(current["colors"]),
+                                    list(matchmaking_pings), matchmaking_source, dict(labels),
+                                    media_snapshot, audio_spectrum, battery_snapshot.devices,
+                                    current.get("language", "tr"),
+                                )
+                            frame = media_base_frame
+                        else:
+                            if metadata_changed and media_render_future is not None:
+                                media_render_future.cancel()
+                                media_render_future = None
+                            if cached_metrics is None or cycle_started - last_metrics_refresh >= 0.5:
+                                cached_metrics = get_metrics()
+                                last_metrics_refresh = cycle_started
+                            frame = render_screen(
+                                cached_metrics, snapshot, panel_active, current["colors"],
+                                matchmaking_pings, matchmaking_source, labels,
+                                animation_time=cycle_started,
+                                media_snapshot=media_snapshot,
+                                audio_spectrum=audio_spectrum,
+                                battery_devices=battery_snapshot.devices,
+                                msfs_active=msfs_active,
+                                flight_telemetry=flight_telemetry,
+                                msfs_layout=current.get("msfs_layout", "cockpit"),
+                                weather_readings=weather_snapshot.readings,
+                                language=current.get("language", "tr"),
+                            )
+                            if view_mode == "media":
+                                media_base_frame = frame
+                        media_patch = (
+                            render_media_visual_patch(
+                                audio_spectrum, current["colors"],
+                                with_battery=bool(battery_snapshot.devices),
+                            )
+                            if view_mode == "media" else None
+                        )
+                        if last_view_mode is None:
+                            screen.show(frame)
+                            self._screen_progress_at = time.monotonic()
+                            sent_frame = frame.copy()
+                            self.screen_connected.set()
+                            last_full_gauge_refresh = time.monotonic()
+                            last_fast_gauge_refresh = last_full_gauge_refresh
+                            last_msfs_telemetry_refresh = last_full_gauge_refresh - 0.25
+                            sent_flight_signature = flight_signature
+                            _runtime_log("first full frame sent")
+                        else:
+                            now = time.monotonic()
+                            regions = []
+                            media_gauge_cycle = False
+                            if view_mode == "media":
+                                if now - last_fast_gauge_refresh >= 0.5:
+                                    # The metric source refreshes every 0.5 s.
+                                    # Send all changed CPU/GPU/RAM value tiles in
+                                    # that same frame instead of stealing three
+                                    # consecutive spectrum frames.
+                                    last_fast_gauge_refresh = now
+                                    changed_value_regions = [
+                                        region for region in FAST_VALUE_BOXES
+                                        if _region_has_changed(frame, sent_frame, region)
+                                    ]
+                                    if changed_value_regions:
+                                        regions.extend(changed_value_regions)
+                                        media_gauge_cycle = True
+                                elif now - last_media_ring_refresh >= 0.30:
+                                    ring_regions = MEDIA_RING_REGION_GROUPS[media_ring_index]
+                                    media_ring_index = (
+                                        media_ring_index + 1
+                                    ) % len(MEDIA_RING_REGION_GROUPS)
+                                    last_media_ring_refresh = now
+                                    changed_ring_regions = [
+                                        region for region in ring_regions
+                                        if _region_has_changed(frame, sent_frame, region)
+                                    ]
+                                    if changed_ring_regions:
+                                        regions.extend(changed_ring_regions)
+                                        media_gauge_cycle = True
+                                elif now - last_media_gauge_slice >= 0.20:
+                                    gauge_region = MEDIA_GAUGE_REGIONS[media_gauge_index]
+                                    media_gauge_index = (media_gauge_index + 1) % len(MEDIA_GAUGE_REGIONS)
+                                    last_media_gauge_slice = now
+                                    if _region_has_changed(frame, sent_frame, gauge_region):
+                                        regions.append(gauge_region)
+                                        media_gauge_cycle = True
+                            elif now - last_fast_gauge_refresh >= 0.5:
+                                # Rev-A LCDs visibly scan a full 480x160 bitmap.
+                                # Logical tiles are tightened to their exact dirty
+                                # pixels immediately before the serial transfer.
+                                regions.extend(TOP_DIRTY_TILES)
+                                last_fast_gauge_refresh = now
+                                last_full_gauge_refresh = now
+
+                            bottom_changed = view_mode != last_view_mode
+                            if view_mode == "game" and match_signature != last_match_signature:
+                                bottom_changed = True
+                            if view_mode == "media" and media_signature != last_media_signature:
+                                bottom_changed = True
+                            msfs_telemetry_refresh_due = (
+                                view_mode == "msfs"
+                                and flight_signature != sent_flight_signature
+                                and now - last_msfs_telemetry_refresh
+                                >= MSFS_TELEMETRY_REFRESH_INTERVAL
+                            )
+                            battery_changed = battery_signature != last_battery_signature
+                            weather_changed = weather_signature != last_weather_signature
+                            battery_layout_changed = (
+                                battery_changed
+                                and battery_layout_signature != last_battery_layout_signature
+                            )
+                            if battery_layout_changed:
+                                bottom_changed = True
+                            if view_mode == "idle" and weather_changed:
+                                bottom_changed = True
+                            if bottom_changed:
+                                regions.clear()
+                                regions.append(
+                                    MSFS_PANEL_REGION_WITH_BATTERY
+                                    if view_mode == "msfs" and battery_snapshot.devices
+                                    and not battery_layout_changed
+                                    else BOTTOM_REGION
+                                )
+                                if view_mode == "msfs":
+                                    last_msfs_telemetry_refresh = now
+                                    sent_flight_signature = flight_signature
+                                media_gauge_cycle = True
+                            elif battery_changed:
+                                regions.clear()
+                                regions.append(BATTERY_PANEL_REGION)
+                                media_gauge_cycle = True
+                            elif msfs_telemetry_refresh_due:
+                                regions.extend(
+                                    MSFS_LIVE_REGIONS_WITH_BATTERY
+                                    if battery_snapshot.devices
+                                    else MSFS_LIVE_REGIONS
+                                )
+                                last_msfs_telemetry_refresh = now
+                                sent_flight_signature = flight_signature
+                            elif view_mode == "media":
+                                # Never trade a sound frame for a sensor update.
+                                # Small gauge regions may share this transfer, but
+                                # the spectrum itself is present on every cycle.
+                                regions.insert(0, media_visual_region)
+
+                            if regions and battery_layout_changed:
+                                # A device being added or removed moves both the
+                                # spectrum and battery rows. Use one clean full
+                                # frame so no stale row can survive a partial LCD
+                                # update, especially in 180-degree orientation.
+                                screen.show(frame)
+                                sent_frame = frame.copy()
+                            elif regions:
+                                transfer_frame = sent_frame.copy() if sent_frame is not None else frame.copy()
+                                for region in regions:
+                                    if region == FAST_GAUGE_REGION and sent_frame is not None:
+                                        for box in FAST_VALUE_BOXES:
+                                            transfer_frame.paste(frame.crop(box), box)
+                                    elif region == media_visual_region and media_patch is not None:
+                                        transfer_frame.paste(media_patch, (region[0], region[1]))
+                                    else:
+                                        transfer_frame.paste(frame.crop(region), region)
+                                requested_regions = list(regions)
+                                send_regions = _tight_changed_regions(
+                                    transfer_frame, sent_frame, requested_regions,
+                                )
+                                if send_regions:
+                                    screen.show_regions(transfer_frame, send_regions)
+                                if (
+                                    send_regions
+                                    and view_mode == "media"
+                                    and media_visual_region in regions
+                                    and not media_perf_logged
+                                ):
+                                    completed_at = time.monotonic()
+                                    if media_perf_started == 0.0:
+                                        media_perf_started = completed_at
+                                    if media_perf_last_frame:
+                                        media_perf_max_gap = max(
+                                            media_perf_max_gap,
+                                            completed_at - media_perf_last_frame,
+                                        )
+                                    media_perf_last_frame = completed_at
+                                    media_perf_frames += 1
+                                    if any(
+                                        region in FAST_VALUE_BOXES
+                                        or region in MEDIA_GAUGE_REGIONS
+                                        or any(
+                                            region in group
+                                            for group in MEDIA_RING_REGION_GROUPS
+                                        )
+                                        for region in requested_regions
+                                    ):
+                                        media_perf_hardware_frames += 1
+                                    sample_seconds = completed_at - media_perf_started
+                                    if sample_seconds >= 10.0:
+                                        measured_fps = (
+                                            (media_perf_frames - 1) / sample_seconds
+                                            if media_perf_frames > 1 else 0.0
+                                        )
+                                        _runtime_log(
+                                            "media sync measured; "
+                                            f"fps={measured_fps:.1f}; "
+                                            f"max_gap_ms={media_perf_max_gap * 1000.0:.0f}; "
+                                            f"audio_frames={media_perf_frames}; "
+                                            f"hardware_coframes={media_perf_hardware_frames}"
+                                        )
+                                        media_perf_logged = True
+                                if sent_frame is None:
+                                    sent_frame = transfer_frame.copy()
+                                else:
+                                    for region in send_regions:
+                                        sent_frame.paste(transfer_frame.crop(region), region)
                 except Exception as exc:
                     self.screen_connected.clear()
                     _runtime_log(f"display refresh failed: {type(exc).__name__}: {exc}")
@@ -2953,7 +3111,9 @@ class ControlPanel(QWidget):
                     last_status_message = translated_status
                 elapsed = time.monotonic() - cycle_started
                 target_interval = (
-                    LIVE_GAME_WORKER_INTERVAL if snapshot.in_match
+                    (NEW_DESIGN_MSFS_INTERVAL if msfs_active else NEW_DESIGN_WORKER_INTERVAL)
+                    if new_design_active
+                    else LIVE_GAME_WORKER_INTERVAL if snapshot.in_match
                     else 0.045 if media_mode else MSFS_WORKER_INTERVAL if msfs_active
                     else float(current["interval"])
                 )

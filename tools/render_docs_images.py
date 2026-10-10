@@ -68,10 +68,11 @@ def main() -> None:
         )),
         ("CS2 · CT", frame(GameSnapshot(
             connected=True, in_match=True, team="CT", money=4250,
-            has_defuse_kit=True,
+            next_win_money=7500, next_loss_money=6150, loss_bonus=1900,
         ), True, battery_devices=GAME_BATTERIES)),
         ("CS2 · T", frame(GameSnapshot(
-            connected=True, in_match=True, team="T", money=4250,
+            connected=True, in_match=True, team="T", money=2650,
+            next_win_money=5900, next_loss_money=4550, loss_bonus=1900,
         ), True, battery_devices=GAME_BATTERIES)),
         ("CS2 · Deathmatch", frame(GameSnapshot(
             connected=True, in_match=True, team="CT", game_mode="deathmatch",
