@@ -167,8 +167,18 @@ internal static class Program
             Path.Combine(appData, "instance.json");
 
         using Mutex singleInstance = new(true, "Local\\SabasakalSensorHost-v3", out bool created);
-        if (!created || !OwnerIsAlive(ownerPath))
+        if (!created)
             return 0;
+        // The UI may start the host a moment before its first heartbeat lands
+        // in instance.json (cold start). Exiting at once made the watchdog log
+        // "stale sensor cache; direct host restarted" on every launch.
+        Stopwatch ownerWait = Stopwatch.StartNew();
+        while (!OwnerIsAlive(ownerPath))
+        {
+            if (ownerWait.ElapsedMilliseconds > 10_000)
+                return 0;
+            Thread.Sleep(250);
+        }
 
         Computer computer = new()
         {

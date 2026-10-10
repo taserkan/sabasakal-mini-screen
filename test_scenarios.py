@@ -2239,6 +2239,8 @@ class UiAndConnectionScenarios(unittest.TestCase):
         self.assertNotIn("computer.Accept", writer)
         self.assertIn("WriteCache(", writer)
         self.assertIn("Task.Delay(1000)", writer)
+        # Cold start: wait for the owner's first heartbeat instead of exiting.
+        self.assertIn("ownerWait.ElapsedMilliseconds > 10_000", sampler)
 
     def test_new_sensor_host_gets_first_sample_grace_period(self) -> None:
         fake = SimpleNamespace(poll=lambda: None)
