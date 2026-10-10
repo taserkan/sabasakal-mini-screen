@@ -9,12 +9,15 @@ import os
 import re
 import secrets
 import socket
+import weakref
 import sqlite3
 import struct
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from app_log import log_exception
 
 from winrt.windows.devices.enumeration import DeviceInformation, DeviceInformationKind
 
@@ -113,41 +116,113 @@ def _recv_exact(stream: socket.socket, size: int) -> bytes:
 
 
 def _send_websocket_text(stream: socket.socket, text: str) -> None:
-    payload = text.encode("utf-8")
-    mask = secrets.token_bytes(4)
-    length = len(payload)
-    if length < 126:
-        header = struct.pack("!BB", 0x81, 0x80 | length)
-    elif length <= 0xFFFF:
-        header = struct.pack("!BBH", 0x81, 0x80 | 126, length)
-    else:
-        header = struct.pack("!BBQ", 0x81, 0x80 | 127, length)
-    masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
-    stream.sendall(header + mask + masked)
+    _send_websocket_frame(stream, 0x1, text.encode("utf-8"))
+
+
+WEBSOCKET_MAX_MESSAGE_BYTES = 4 * 1024 * 1024
+LGHUB_MAX_PENDING_LISTS = 8
+
+
+class _WebSocketReader:
+    """Frame parser with a persistent buffer.
+
+    A socket timeout in the middle of a frame used to discard the bytes that
+    were already read, after which every following frame was parsed from the
+    wrong offset. Bytes now stay buffered until a complete frame exists.
+    """
+
+    def __init__(self, stream: socket.socket) -> None:
+        self.stream = stream
+        self.buffer = bytearray()
+        self.fragments = bytearray()
+
+    def _fill(self) -> None:
+        chunk = self.stream.recv(65536)
+        if not chunk:
+            raise ConnectionError("G HUB closed the local connection")
+        self.buffer.extend(chunk)
+
+    def _parse_frame(self) -> tuple[bool, int, bytes] | None:
+        data = self.buffer
+        if len(data) < 2:
+            return None
+        first, second = data[0], data[1]
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        offset = 2
+        if length == 126:
+            if len(data) < 4:
+                return None
+            length = struct.unpack_from("!H", data, 2)[0]
+            offset = 4
+        elif length == 127:
+            if len(data) < 10:
+                return None
+            length = struct.unpack_from("!Q", data, 2)[0]
+            offset = 10
+        if length > WEBSOCKET_MAX_MESSAGE_BYTES:
+            raise ConnectionError(f"G HUB websocket frame too large ({length} bytes)")
+        mask = b""
+        if masked:
+            if len(data) < offset + 4:
+                return None
+            mask = bytes(data[offset:offset + 4])
+            offset += 4
+        if len(data) < offset + length:
+            return None
+        payload = bytes(data[offset:offset + length])
+        del data[:offset + length]
+        if masked:
+            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        return bool(first & 0x80), first & 0x0F, payload
+
+    def receive(self) -> str:
+        while True:
+            frame = self._parse_frame()
+            if frame is None:
+                self._fill()  # socket.timeout propagates; buffer is kept
+                continue
+            final, opcode, payload = frame
+            if opcode == 0x8:
+                raise ConnectionError("G HUB closed the local websocket")
+            if opcode == 0x9:  # ping -> pong with the same payload
+                _send_websocket_frame(self.stream, 0xA, payload[:125])
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x1, 0x2, 0x0):
+                if len(self.fragments) + len(payload) > WEBSOCKET_MAX_MESSAGE_BYTES:
+                    self.fragments.clear()
+                    raise ConnectionError("G HUB websocket message too large")
+                self.fragments.extend(payload)
+                if final:
+                    message = bytes(self.fragments)
+                    self.fragments.clear()
+                    return message.decode("utf-8")
+
+
+_READERS: "weakref.WeakKeyDictionary[socket.socket, _WebSocketReader]" = weakref.WeakKeyDictionary()
 
 
 def _receive_websocket_message(stream: socket.socket) -> str:
-    message = bytearray()
-    while True:
-        first, second = _recv_exact(stream, 2)
-        final = bool(first & 0x80)
-        opcode = first & 0x0F
-        masked = bool(second & 0x80)
-        length = second & 0x7F
-        if length == 126:
-            length = struct.unpack("!H", _recv_exact(stream, 2))[0]
-        elif length == 127:
-            length = struct.unpack("!Q", _recv_exact(stream, 8))[0]
-        mask = _recv_exact(stream, 4) if masked else b""
-        payload = _recv_exact(stream, length)
-        if masked:
-            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
-        if opcode == 0x8:
-            raise ConnectionError("G HUB closed the local websocket")
-        if opcode in (0x1, 0x0):
-            message.extend(payload)
-            if final:
-                return message.decode("utf-8")
+    reader = _READERS.get(stream)
+    if reader is None:
+        reader = _WebSocketReader(stream)
+        _READERS[stream] = reader
+    return reader.receive()
+
+
+def _send_websocket_frame(stream: socket.socket, opcode: int, payload: bytes) -> None:
+    mask = secrets.token_bytes(4)
+    length = len(payload)
+    if length < 126:
+        header = struct.pack("!BB", 0x80 | opcode, 0x80 | length)
+    elif length <= 0xFFFF:
+        header = struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, length)
+    else:
+        header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, length)
+    masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+    stream.sendall(header + mask + masked)
 
 
 def parse_lghub_connected_slugs(message: object) -> set[str]:
@@ -231,7 +306,7 @@ def scan_lghub_connected_slugs(
         }, separators=(",", ":")))
         for _ in range(6):
             message = json.loads(_receive_websocket_message(stream))
-            if message.get("msgId") == message_id:
+            if isinstance(message, dict) and message.get("msgId") == message_id:
                 return parse_lghub_connected_slugs(message)
         raise TimeoutError("G HUB did not return its connected device list")
 
@@ -268,6 +343,8 @@ def probe_lghub_input_batteries(
                 message = json.loads(_receive_websocket_message(stream))
             except socket.timeout:
                 break
+            if not isinstance(message, dict):
+                continue
             message_id = str(message.get("msgId", ""))
             slug = pending.pop(message_id, None)
             if slug is None:
@@ -423,6 +500,7 @@ class BatteryDeviceMonitor:
 
     def _listen_lghub(self) -> None:
         """Keep G HUB's model-independent connection state live via broadcasts."""
+        failures = 0
         while not self._stop.is_set():
             try:
                 with _connect_lghub_websocket(timeout=1.0) as stream:
@@ -437,6 +515,9 @@ class BatteryDeviceMonitor:
                         now = time.monotonic()
                         if now >= next_reconcile:
                             list_id = str(secrets.randbelow(2_000_000_000) + 1)
+                            if len(pending_lists) >= LGHUB_MAX_PENDING_LISTS:
+                                # Replies that never arrive must not grow the set forever.
+                                pending_lists.clear()
                             pending_lists.add(list_id)
                             _send_websocket_text(stream, json.dumps({
                                 "msgId": list_id, "verb": "GET",
@@ -447,16 +528,21 @@ class BatteryDeviceMonitor:
                             message = json.loads(_receive_websocket_message(stream))
                         except socket.timeout:
                             continue
+                        if not isinstance(message, dict):
+                            continue
+                        failures = 0
                         infos = parse_lghub_device_infos(message)
                         if message.get("msgId") in pending_lists:
                             pending_lists.discard(str(message.get("msgId")))
                             self._replace_lghub_infos(infos)
                         elif message.get("path") == "/devices/state/changed":
                             self._update_lghub_infos(infos)
-            except (
-                OSError, UnicodeError, json.JSONDecodeError,
-                ConnectionError, TimeoutError,
-            ):
+            except Exception as exc:
+                # G HUB not running is the normal case (ConnectionRefused);
+                # anything else is logged. Back off up to 30 s.
+                if not isinstance(exc, ConnectionRefusedError):
+                    log_exception("battery", "G HUB websocket failed", exc)
+                failures += 1
                 with self._lghub_lock:
                     was_ready = self._lghub_ready
                     self._lghub_ready = False
@@ -464,7 +550,7 @@ class BatteryDeviceMonitor:
                     self._lghub_event_until = {}
                 if was_ready:
                     self._refresh.set()
-                self._stop.wait(1.0)
+                self._stop.wait(min(30.0, 1.0 * (2 ** min(failures - 1, 5))))
 
     @staticmethod
     async def _scan_windows() -> list[BatteryDevice]:
