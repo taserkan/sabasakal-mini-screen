@@ -1438,13 +1438,13 @@ class PerformanceCounterScenarios(unittest.TestCase):
         self.assertLess(screen_app.FONTS["ram_sensor"].size, screen_app.FONTS["sensor"].size)
         self.assertGreaterEqual(screen_app.FONTS["weather_city"].size, 12)
 
-    def test_ram_usage_is_rounded_before_rendering(self) -> None:
+    def test_ram_usage_uses_one_decimal_like_task_manager(self) -> None:
         with patch.object(screen_app, "draw_open_ring") as ring:
             screen_app.render_screen(
                 self.sample_metrics() | {"ram_used": 27.4},
                 screen_app.GameSnapshot(), False,
             )
-        self.assertEqual(ring.call_args_list[2].args[7], "27 GB")
+        self.assertEqual(ring.call_args_list[2].args[7], "27.4 GB")
 
     def test_unchanged_value_tile_does_not_consume_a_spectrum_cycle(self) -> None:
         frame = Image.new("RGB", (480, 320), "black")
@@ -4455,6 +4455,310 @@ class RealUserInteractionScenarios(unittest.TestCase):
         self.choose(panel.design_combo, "classic")
         self.start(panel)
         self.assertEqual(len(gui.weather_cities_for_design(self.worker_settings[0])), 3)
+
+
+class TaskManagerParity113Tests(unittest.TestCase):
+    """v1.1.3: CPU/GPU/RAM numbers follow Windows Task Manager."""
+
+    def test_default_sampling_is_one_second_without_extra_averaging(self) -> None:
+        monitor = screen_app.WindowsTaskManagerMonitor()
+        self.assertEqual(monitor.sample_interval, 1.0)
+        self.assertEqual(monitor._cpu_window.maxlen, 1)
+        self.assertEqual(monitor._gpu_window.maxlen, 1)
+
+    def test_gpu_sums_processes_per_engine_type_then_takes_max(self) -> None:
+        luid = "luid_0x00000000_0x0000d1b5"
+        rows = [
+            (f"pid_100_{luid}_phys_0_eng_0_engtype_3D", 30.0),
+            (f"pid_200_{luid}_phys_0_eng_0_engtype_3D", 25.5),
+            (f"pid_300_{luid}_phys_0_eng_0_engtype_3D", 4.0),
+            (f"pid_100_{luid}_phys_0_eng_3_engtype_VideoDecode", 40.0),
+            (f"pid_100_{luid}_phys_0_eng_5_engtype_Copy", 12.0),
+            (f"pid_200_{luid}_phys_0_eng_6_engtype_Copy", 10.0),
+        ]
+        total = screen_app.WindowsTaskManagerMonitor._gpu_engine_total(rows, luid)
+        self.assertAlmostEqual(total, 59.5)
+
+    def test_gpu_video_engine_can_be_the_busiest(self) -> None:
+        rows = [
+            ("pid_1_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 3.0),
+            ("pid_2_luid_0x0_0x1_phys_0_eng_3_engtype_VideoDecode", 22.0),
+            ("pid_3_luid_0x0_0x1_phys_0_eng_3_engtype_VideoDecode", 18.0),
+        ]
+        self.assertEqual(screen_app.WindowsTaskManagerMonitor._gpu_engine_total(rows), 40.0)
+
+    def test_gpu_other_adapter_is_ignored_and_total_is_capped(self) -> None:
+        rows = [
+            ("pid_1_luid_0x0_0xaaaa_phys_0_eng_0_engtype_3D", 99.0),
+            ("pid_2_luid_0x0_0xbbbb_phys_0_eng_0_engtype_3D", 70.0),
+            ("pid_3_luid_0x0_0xbbbb_phys_0_eng_0_engtype_3D", 45.0),
+            ("pid_4_luid_0x0_0xbbbb_phys_0_eng_0_engtype_3D", float("nan")),
+        ]
+        self.assertEqual(
+            screen_app.WindowsTaskManagerMonitor._gpu_engine_total(rows, "luid_0x0_0xbbbb"), 100.0,
+        )
+
+    def test_ram_in_use_is_total_minus_available(self) -> None:
+        gib = 1024 ** 3
+        memory = SimpleNamespace(total=32 * gib, available=19.7 * gib, used=10 * gib, percent=31.0)
+        with patch.object(screen_app.psutil, "cpu_percent", return_value=1.0), patch.object(
+            screen_app, "sample_virtual_memory", return_value=memory,
+        ), patch.object(screen_app, "get_gpu_metrics", return_value=(1.0, 50.0, 0.0)), patch.object(
+            screen_app.TASK_MANAGER_MONITOR, "read", return_value=(5.0, 6.0, 4.0, None),
+        ), patch.object(
+            screen_app.SENSOR_MONITOR, "read", return_value={"cpu_temp": None, "cpu_freq": None},
+        ), patch.object(screen_app.NVIDIA_MONITOR, "read_power_watts", return_value=None):
+            metrics = screen_app.get_metrics()
+        self.assertAlmostEqual(metrics["ram_used"], 12.3)
+        self.assertAlmostEqual(metrics["ram_used_gb"], 12.3)
+        self.assertAlmostEqual(metrics["ram_load"], 12.3 / 32 * 100)
+        self.assertEqual(f"{metrics['ram_used']:.1f} GB", "12.3 GB")
+
+    def test_metric_sources_are_logged_once(self) -> None:
+        with patch.dict(screen_app._METRIC_SOURCES_LOGGED, {"done": False, "calls": 0}), \
+                patch.object(screen_app, "log_info") as log:
+            for _ in range(3):
+                screen_app._log_metric_sources_once("cpuX", "gpuX", "NVML", True)
+        log.assert_called_once()
+        self.assertIn("cpu=cpuX", log.call_args[0][1])
+
+
+class Cs2MenuMode113Tests(unittest.TestCase):
+    """v1.1.3: CS2 running never falls back to the desktop screen."""
+
+    def test_mode_selection(self) -> None:
+        import screens_new as sn
+        self.assertEqual(sn.new_design_mode(False, True, False), "cs2_menu")
+        self.assertEqual(sn.new_design_mode(False, True, True), "cs2")
+        self.assertEqual(sn.new_design_mode(True, True, True), "faceit")
+        self.assertEqual(sn.new_design_mode(True, False, False), "faceit")
+        self.assertEqual(sn.new_design_mode(False, False, False, True), "msfs")
+        self.assertEqual(sn.new_design_mode(False, False, False), "desktop")
+
+    def test_round_screens(self) -> None:
+        import screens_new as sn
+
+        def game(**kw):
+            return screen_app.GameSnapshot(connected=True, in_match=True, **kw)
+
+        self.assertEqual(sn.cs_screen_for(game(round_phase="freezetime", alive=True)), "buy")
+        self.assertEqual(sn.cs_screen_for(game(round_phase="live", alive=True)), "live")
+        self.assertEqual(sn.cs_screen_for(game(round_phase="live", alive=False)), "death")
+        self.assertEqual(sn.cs_screen_for(game(round_phase="over", alive=True)), "death")
+        self.assertEqual(sn.cs_screen_for(game(round_phase="", alive=True)), "live")
+
+    def test_menu_status_text(self) -> None:
+        import screens_new as sn
+        self.assertEqual(sn.cs2_menu_status(False, True), "restart")
+        self.assertEqual(sn.cs2_menu_status(False, False), "waiting")
+        self.assertEqual(sn.cs2_menu_status(True, False), "menu")
+
+    def test_menu_screen_renders_cs2_palette_with_pings(self) -> None:
+        import screens_new as sn
+        from i18n import translate
+        metrics = {"cpu_load": 40.0, "gpu_load": 55.0, "cpu_temp": 60.0, "gpu_temp": 65.0,
+                   "ram_load": 40.0}
+        for mode in ("cs2_menu", "cs2"):
+            ctx = sn.NewScreenContext(metrics, mode=mode, status="menu",
+                                      pings=(("FRA", 20.0), ("VIE", 90.0)))
+            frame = sn.render_new_screen(ctx)
+            self.assertEqual(frame.size, (480, 320))
+            self.assertEqual(frame.getpixel((240, 318)), sn._rgb(sn.MODE_CS2[0]))
+            self.assertEqual(frame.getpixel((2, 2)), sn._rgb(sn.MODE_CS2[1]))
+            self.assertIn("pings", sn.cs_menu_layout(ctx))
+        ctx = sn.NewScreenContext(metrics, mode="cs2_menu", status="restart", language="en")
+        sn.render_new_screen(ctx)
+        self.assertNotIn("pings", sn.cs_menu_layout(ctx))
+        self.assertEqual(translate("CS2'yi yeniden başlat · oyun verisi için", "en"),
+                         "Restart CS2 to enable game data")
+
+    def test_restart_needed_when_cfg_newer_than_cs2(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Path(directory) / screen_app.GSI_CONFIG_NAME
+            cfg.write_text("x", encoding="utf-8")
+            mtime = cfg.stat().st_mtime
+            with patch.dict(screen_app.GSI_AUTH_STATE, {"rejected_at": None}):
+                self.assertTrue(screen_app.gsi_restart_needed(mtime - 3 * 3600, cfg))
+                self.assertFalse(screen_app.gsi_restart_needed(mtime + 60, cfg))
+                self.assertFalse(screen_app.gsi_restart_needed(mtime - 3600, cfg, connected=True))
+                self.assertFalse(screen_app.gsi_restart_needed(0.0, cfg))
+            with patch.dict(screen_app.GSI_AUTH_STATE, {"rejected_at": 1000.0}):
+                self.assertTrue(screen_app.gsi_restart_needed(mtime + 60, cfg, now=1005.0))
+                self.assertFalse(screen_app.gsi_restart_needed(mtime + 60, cfg, now=1100.0))
+
+    def test_gsi_token_is_stable_across_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gsi-token.txt"
+            with patch.object(screen_app, "GSI_TOKEN_PATH", path), \
+                    patch.object(screen_app, "_GSI_TOKEN_CACHE", None):
+                first = screen_app.gsi_token()
+            with patch.object(screen_app, "GSI_TOKEN_PATH", path), \
+                    patch.object(screen_app, "_GSI_TOKEN_CACHE", None):
+                second = screen_app.gsi_token()
+            self.assertEqual(first, second)
+            self.assertEqual(path.read_text(encoding="ascii"), first)
+
+
+class GsiReplay113Tests(unittest.TestCase):
+    """Replay real CS2 POSTs with Valve's HTTP client headers."""
+
+    TOKEN = "R524F" + "x" * 38
+
+    def setUp(self) -> None:
+        import http.client
+        self.http_client = http.client
+        self.state = screen_app.CS2GameState()
+        self.server = screen_app.http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), screen_app._GSIHandler,
+        )
+        self.server.game_state = self.state
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        patcher = patch.object(screen_app, "_GSI_TOKEN_CACHE", self.TOKEN)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        state_patch = patch.dict(screen_app.GSI_AUTH_STATE, {"rejected_at": None})
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+    def post(self, payload: dict, chunked: bool = False, extra: dict | None = None) -> int:
+        body = json.dumps(payload, indent="\t").encode("utf-8")
+        connection = self.http_client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        headers = {"User-Agent": "Valve/Steam HTTP Client 1.0", "Content-Type": "application/json",
+                   "Accept": "text/html,*/*;q=0.9", "Accept-Charset": "ISO-8859-1,utf-8,*;q=0.7"}
+        headers.update(extra or {})
+        if chunked:
+            connection.putrequest("POST", "/")
+            for key, value in headers.items():
+                connection.putheader(key, value)
+            connection.putheader("Transfer-Encoding", "chunked")
+            connection.endheaders()
+            connection.send(b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body))
+        else:
+            connection.request("POST", "/", body=body, headers=headers)
+        status = connection.getresponse().status
+        connection.close()
+        return status
+
+    def menu_payload(self, token: str | None = None) -> dict:
+        return {
+            "provider": {"name": "Counter-Strike: Global Offensive", "appid": 730, "version": 14080,
+                         "steamid": "76561198000000001", "timestamp": 1760100000},
+            "player": {"steamid": "76561198000000001", "name": "erkan", "activity": "menu"},
+            "auth": {"token": token or self.TOKEN},
+        }
+
+    def match_payload(self, phase: str = "live", health: int = 100) -> dict:
+        payload = self.menu_payload()
+        payload["map"] = {"mode": "competitive", "name": "de_mirage", "phase": phase, "round": 3,
+                          "team_ct": {"score": 2, "consecutive_round_losses": 0},
+                          "team_t": {"score": 1, "consecutive_round_losses": 1}}
+        payload["round"] = {"phase": "freezetime" if phase == "freeze" else "live"}
+        payload["player"] = {
+            "steamid": "76561198000000001", "name": "erkan", "team": "CT", "activity": "playing",
+            "state": {"health": health, "armor": 100, "money": 3200, "round_kills": 0,
+                      "round_killhs": 0},
+            "match_stats": {"kills": 3, "assists": 1, "deaths": 2, "mvps": 0, "score": 8},
+        }
+        if phase == "freeze":
+            payload["map"]["phase"] = "live"
+        return payload
+
+    def test_menu_payload_is_accepted_and_selects_cs2_menu(self) -> None:
+        import screens_new as sn
+        self.assertEqual(self.post(self.menu_payload()), 200)
+        snapshot = self.state.snapshot()
+        self.assertTrue(snapshot.connected)
+        self.assertFalse(snapshot.in_match)
+        self.assertEqual(screen_app.GSI_AUTH_STATE["last_status"], "accepted")
+        self.assertEqual(sn.new_design_mode(False, True, snapshot.in_match), "cs2_menu")
+        self.assertEqual(sn.cs2_menu_status(snapshot.connected, False), "menu")
+        self.assertIn("last=accepted", screen_app.gsi_request_summary())
+
+    def test_match_payloads_select_round_screens(self) -> None:
+        import screens_new as sn
+        for phase, health, expected in (
+            ("warmup", 100, "live"), ("live", 100, "live"), ("freeze", 100, "buy"),
+            ("live", 0, "death"),
+        ):
+            self.assertEqual(self.post(self.match_payload(phase, health)), 200)
+            snapshot = self.state.snapshot()
+            self.assertTrue(snapshot.in_match, phase)
+            self.assertEqual(sn.new_design_mode(False, True, snapshot.in_match), "cs2")
+            self.assertEqual(sn.cs_screen_for(snapshot), expected, phase)
+
+    def test_chunked_body_is_accepted(self) -> None:
+        self.assertEqual(self.post(self.menu_payload(), chunked=True), 200)
+        self.assertTrue(self.state.snapshot().connected)
+
+    def test_old_token_is_rejected_and_triggers_restart_hint(self) -> None:
+        self.assertEqual(self.post(self.menu_payload(token="legacy-fixed-token-value")), 200)
+        self.assertFalse(self.state.snapshot().connected)
+        self.assertEqual(screen_app.GSI_AUTH_STATE["last_reason"], "token mismatch")
+        self.assertTrue(screen_app.gsi_restart_needed(cs2_started_at=0.0))
+
+    def test_browser_origin_is_rejected(self) -> None:
+        status = self.post(self.menu_payload(), extra={"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertFalse(self.state.snapshot().connected)
+
+
+class BatteryDiscoveryRetry113Tests(unittest.TestCase):
+    def test_aborted_winrt_scan_keeps_known_devices_and_backs_off(self) -> None:
+        import battery_runtime
+        monitor = battery_runtime.BatteryDeviceMonitor(interval=2.0)
+        known = battery_runtime.BatteryDevice("win:1", "Headset", 70, "headset", False)
+        monitor._windows_devices = [known]
+        calls = {"n": 0}
+        waits: list[float] = []
+
+        async def aborted():
+            calls["n"] += 1
+            raise OSError(-2147467260, "operation aborted")
+
+        def fake_wait(timeout=None):
+            waits.append(timeout)
+            if len(waits) >= 4:
+                monitor._stop.set()
+            return monitor._stop.is_set()
+
+        with patch.object(monitor, "_scan_windows", aborted), \
+                patch.object(monitor._stop, "wait", side_effect=fake_wait):
+            monitor._scan_windows_loop()
+        devices, error = monitor._current_windows_devices()
+        self.assertEqual(devices, [])  # dropped only after the 4th failure
+        self.assertIn("OSError", error)
+        self.assertLess(waits[0], waits[1])
+        self.assertLessEqual(max(waits), battery_runtime.WINDOWS_SCAN_MAX_BACKOFF)
+
+    def test_single_aborted_scan_does_not_hide_devices(self) -> None:
+        import battery_runtime
+        monitor = battery_runtime.BatteryDeviceMonitor(interval=2.0)
+        known = battery_runtime.BatteryDevice("win:1", "Headset", 70, "headset", False)
+        monitor._windows_devices = [known]
+
+        async def aborted():
+            raise OSError(-2147467260, "operation aborted")
+
+        def stop_wait(timeout=None):
+            monitor._stop.set()
+            return True
+
+        with patch.object(monitor, "_scan_windows", aborted), \
+                patch.object(monitor._stop, "wait", side_effect=stop_wait):
+            monitor._scan_windows_loop()
+        self.assertEqual(monitor._current_windows_devices()[0], [known])
+
+    def test_distinct_error_is_logged_at_most_every_five_minutes(self) -> None:
+        seen: dict[str, float] = {}
+        self.assertTrue(gui.should_log_distinct(seen, "E_ABORT", now=0.0))
+        self.assertFalse(gui.should_log_distinct(seen, "E_ABORT", now=120.0))
+        self.assertTrue(gui.should_log_distinct(seen, "other", now=120.0))
+        self.assertTrue(gui.should_log_distinct(seen, "E_ABORT", now=301.0))
 
 
 if __name__ == "__main__":

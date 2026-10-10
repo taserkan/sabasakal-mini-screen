@@ -81,6 +81,13 @@ def contexts() -> dict[str, NewScreenContext]:
             game=GameSnapshot(round_phase="live", alive=True, **ROUND),
         ),
         "cs2-faceit": NewScreenContext(GAMING, BATTERIES, now=NOW, fps=287, mode="faceit"),
+        "cs2-menu": NewScreenContext(
+            GAMING, BATTERIES, now=NOW, fps=287, mode="cs2_menu", status="menu",
+            pings=(("FRA", 24.0), ("VIE", 38.0), ("WAW", 61.0), ("STO", 112.0)),
+        ),
+        "cs2-menu-restart": NewScreenContext(
+            GAMING, BATTERIES, now=NOW, mode="cs2_menu", status="restart",
+        ),
         "msfs-ground": NewScreenContext(
             {**GAMING, "gpu_load": 64.0, "gpu_temp": 58.0}, BATTERIES, now=NOW, mode="msfs",
             flight=FlightTelemetry(on_ground=True, ground_speed_kt=18.0, altitude_agl_ft=0.0, **FLIGHT),

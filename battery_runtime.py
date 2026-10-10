@@ -496,6 +496,10 @@ def probe_lghub_input_batteries(
         return results
 
 
+WINDOWS_SCAN_KEEP_FAILURES = 3
+WINDOWS_SCAN_MAX_BACKOFF = 120.0
+
+
 class BatteryDeviceMonitor:
     """Poll Windows' standard battery property without blocking the screen loop."""
 
@@ -654,20 +658,29 @@ class BatteryDeviceMonitor:
 
     def _scan_windows_loop(self) -> None:
         """Isolate slow WinRT enumeration so it can never block G HUB events."""
+        failures = 0
         while not self._stop.is_set():
             started = time.monotonic()
             try:
                 devices = asyncio.run(self._scan_windows())
                 error = ""
+                failures = 0
             except Exception as exc:
-                devices = []
+                # WinRT/BLE enumeration is occasionally cancelled (E_ABORT,
+                # "operation aborted").  Keep the devices that were already
+                # known for a few attempts instead of blanking the screen.
+                failures += 1
+                with self._lock:
+                    known = list(self._windows_devices)
+                devices = known if failures <= WINDOWS_SCAN_KEEP_FAILURES else []
                 error = f"{type(exc).__name__}: {exc}"
             with self._lock:
                 self._windows_devices = devices
                 self._windows_error = error
             self._refresh.set()
             elapsed = time.monotonic() - started
-            self._stop.wait(max(0.5, self.interval - elapsed))
+            delay = self.interval * (2 ** min(failures, 4)) if failures else self.interval
+            self._stop.wait(max(0.5, min(WINDOWS_SCAN_MAX_BACKOFF, delay) - elapsed))
 
     def _listen_lghub(self) -> None:
         """Keep G HUB's model-independent connection state live via broadcasts."""

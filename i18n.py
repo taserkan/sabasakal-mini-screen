@@ -220,6 +220,11 @@ ENGLISH: dict[str, str] = {
     "karlı": "snowy", "fırtınalı": "stormy", "yağmurlu": "rainy",
     "yük": "load",
     "FACEIT · sadece sistem verisi": "FACEIT · system data only",
+    "CS2'yi yeniden başlat · oyun verisi için": "Restart CS2 to enable game data",
+    "CS2 · Oyun verisi bekleniyor": "CS2 · Waiting for game data",
+    "CS2 · Menü": "CS2 · Menu",
+    "CS2'yi yeniden başlatın: oyun verisi için yeni GSI ayarı yüklenmeli":
+        "Restart CS2: it must load the new GSI config to send game data",
     "SATIN ALMA": "BUY PHASE", "SATIN ALMA · Round {n}": "BUY PHASE · Round {n}",
     "Paran": "Your money", "Kayıp serisi": "Loss streak",
     "Sonraki round min.": "Next round min.",

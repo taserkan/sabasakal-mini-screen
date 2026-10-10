@@ -35,7 +35,9 @@ from app import (
     MAX_HARDWARE_LABEL_LENGTH, MEDIA_VIS_REGION, MEDIA_VIS_REGION_WITH_BATTERY,
     RelayPing, SENSOR_CACHE_PATH, SENSOR_MONITOR, ScreenSession,
     STEAM_PING_MONITOR, cs2_is_running, faceit_ac_is_running,
-    get_auto_hardware_labels, get_metrics, install_gsi_config, normalise_hardware_label,
+    get_auto_hardware_labels, get_metrics, gsi_request_summary, gsi_restart_needed,
+    install_gsi_config,
+    normalise_hardware_label,
     msfs_session_seconds, render_media_visual_patch, render_screen,
     resolve_hardware_labels,
     WIDTH,
@@ -47,7 +49,10 @@ from media_runtime import (
 from msfs_runtime import (
     FlightPhaseState, FlightPhaseTracker, FlightTelemetry, LandingRecord, MSFSTelemetryMonitor,
 )
-from screens_new import AlertTracker, NewScreenContext, cs_screen_for, render_new_screen
+from screens_new import (
+    AlertTracker, NewScreenContext, cs2_menu_status, cs_screen_for, new_design_mode,
+    render_new_screen,
+)
 from weather_runtime import (
     DEFAULT_WEATHER_CITIES, WeatherMonitor, WeatherReading, format_city_name,
     normalise_city_names,
@@ -399,6 +404,18 @@ WINDOW_DEFAULT_SIZE = (1200, 890 + (QUICK_CARD_HEIGHT - 252))
 WINDOW_MINIMUM_SIZE = (1160, 860 + (QUICK_CARD_HEIGHT - 252))
 WORKER_RESTART_MAX_DELAY_MS = 60000
 DISPLAY_STALL_SECONDS = 8.0
+
+
+def should_log_distinct(
+    seen: dict[str, float], message: str, window: float = 300.0, now: float | None = None,
+) -> bool:
+    """Allow each distinct message at most once per ``window`` seconds."""
+    now = time.monotonic() if now is None else now
+    last = seen.get(message)
+    if last is not None and now - last < window:
+        return False
+    seen[message] = now
+    return True
 
 
 def _runtime_log(message: str) -> None:
@@ -2556,6 +2573,7 @@ class ControlPanel(QWidget):
         last_audio_error = ""
         last_media_error = ""
         last_battery_error = ""
+        battery_error_log_times: dict[str, float] = {}
         last_msfs_error = ""
         last_weather_error = ""
         audio_ready_logged = False
@@ -2600,6 +2618,31 @@ class ControlPanel(QWidget):
             )
             return metrics, frame
         last_gsi_attempt = 0.0
+        gsi_restart_state = {"checked_at": -1e9, "needed": False}
+
+        def check_gsi_restart(game_running: bool, connected: bool) -> bool:
+            """Throttled check whether CS2 must be restarted to load our cfg."""
+            if not game_running or connected:
+                gsi_restart_state["needed"] = False
+                return False
+            now = time.monotonic()
+            if now - gsi_restart_state["checked_at"] >= 5.0:
+                gsi_restart_state["checked_at"] = now
+                try:
+                    needed = gsi_restart_needed()
+                except Exception:
+                    needed = False
+                if needed and not gsi_restart_state["needed"]:
+                    _runtime_log(
+                        "WARNING: CS2 is running with an outdated GSI cfg/token "
+                        "(cfg newer than cs2.exe or token rejected); restart CS2 to enable game data"
+                    )
+                    self.signals.status.emit(translate(
+                        "CS2'yi yeniden başlatın: oyun verisi için yeni GSI ayarı yüklenmeli",
+                        self.settings.get("language", "tr"),
+                    ))
+                gsi_restart_state["needed"] = needed
+            return bool(gsi_restart_state["needed"])
 
         def ensure_gsi(faceit_running: bool) -> None:
             """FACEIT kill switch: no GSI listener while FACEIT AC runs."""
@@ -2775,7 +2818,10 @@ class ControlPanel(QWidget):
                         _runtime_log(f"audio loopback unavailable: {audio_spectrum.error}")
                     if media_snapshot.error and media_snapshot.error != last_media_error:
                         _runtime_log(f"media session unavailable: {media_snapshot.error}")
-                    if battery_snapshot.error and battery_snapshot.error != last_battery_error:
+                    if (
+                        battery_snapshot.error and battery_snapshot.error != last_battery_error
+                        and should_log_distinct(battery_error_log_times, battery_snapshot.error)
+                    ):
                         _runtime_log(f"battery discovery unavailable: {battery_snapshot.error}")
                     if flight_telemetry.error and flight_telemetry.error != last_msfs_error:
                         _runtime_log(f"MSFS telemetry unavailable: {flight_telemetry.error}")
@@ -2807,6 +2853,12 @@ class ControlPanel(QWidget):
                             f"gsi_connected={snapshot.connected}; in_match={snapshot.in_match}; "
                             f"team={snapshot.team or '-'}; game_mode={snapshot.game_mode or '-'}; "
                             f"ping_source={matchmaking_source}; ping_count={len(matchmaking_pings)}"
+                        )
+                    if game_active and cycle_started - gsi_restart_state.get("logged_at", -1e9) >= 60.0:
+                        gsi_restart_state["logged_at"] = cycle_started
+                        _runtime_log(
+                            f"GSI status; {gsi_request_summary()}; "
+                            f"gsi_connected={snapshot.connected}; in_match={snapshot.in_match}"
                         )
                     media_signature = media_snapshot.signature if media_snapshot.visible else ("Sistem sesi", "", "", "playing")
                     battery_signature = battery_snapshot.signature
@@ -2847,14 +2899,15 @@ class ControlPanel(QWidget):
                             cached_metrics = get_metrics()
                             last_metrics_refresh = cycle_started
                         language = current.get("language", "tr")
-                        if faceit_active:
-                            design_mode = "faceit"
-                        elif game_active and snapshot.in_match:
-                            design_mode = "cs2"
-                        elif msfs_active:
-                            design_mode = "msfs"
-                        else:
-                            design_mode = "desktop"
+                        design_mode = new_design_mode(
+                            faceit_active, game_active, snapshot.in_match, msfs_active,
+                        )
+                        menu_status = ""
+                        if design_mode == "cs2_menu":
+                            menu_status = cs2_menu_status(
+                                snapshot.connected,
+                                check_gsi_restart(game_active, snapshot.connected),
+                            )
                         flight_state = (
                             phase_tracker.update(flight_telemetry) if msfs_active else None
                         )
@@ -2874,6 +2927,10 @@ class ControlPanel(QWidget):
                             flight=flight_telemetry,
                             flight_state=flight_state,
                             hardware_labels=labels,
+                            status=menu_status,
+                            pings=tuple(
+                                (item.code, item.latency_ms) for item in matchmaking_pings
+                            ) if design_mode == "cs2_menu" else (),
                         ))
                         media_patch = None
                         if last_view_mode is None or sent_frame is None:

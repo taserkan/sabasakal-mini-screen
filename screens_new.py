@@ -137,7 +137,7 @@ class NewScreenContext:
     now: dt.datetime | None = None
     language: str = "tr"
     fps: float | None = None
-    mode: str = "desktop"  # desktop | cs2 | faceit | msfs
+    mode: str = "desktop"  # desktop | cs2 | cs2_menu | faceit | msfs
     game: object | None = None  # app.GameSnapshot
     cs_screen: str = "live"  # buy | death | live
     alerts: tuple = ()
@@ -145,6 +145,8 @@ class NewScreenContext:
     flight: object | None = None  # msfs_runtime.FlightTelemetry
     flight_state: object | None = None  # msfs_runtime.FlightPhaseState
     hardware_labels: dict = field(default_factory=dict)
+    status: str = ""  # cs2_menu status line (already translated or Turkish source)
+    pings: tuple = ()  # ((region code, ms), ...) Valve matchmaking pings
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +842,86 @@ def render_cs_live(ctx: NewScreenContext) -> Image.Image:
     return image
 
 
+CS2_MENU_STATUS = {
+    "restart": "CS2'yi yeniden başlat · oyun verisi için",
+    "waiting": "CS2 · Oyun verisi bekleniyor",
+    "menu": "CS2 · Menü",
+}
+
+
+def cs2_menu_status(connected: bool, restart_needed: bool) -> str:
+    if restart_needed:
+        return "restart"
+    return "menu" if connected else "waiting"
+
+
+def cs_menu_layout(ctx: NewScreenContext) -> dict:
+    layout = {"status": (14, 62, WIDTH - 14, 82)}
+    pings = tuple(ctx.pings)[:4]
+    bottom = HEIGHT - 14
+    if pings:
+        layout["pings"] = (14, bottom - 34, WIDTH - 14, bottom)
+        bottom -= 44
+    (l1, r1), (l2, r2) = _columns(14, WIDTH - 14, 2, 10)
+    layout["cpu"] = (l1, 90, r1, bottom)
+    layout["gpu"] = (l2, 90, r2, bottom)
+    return layout
+
+
+def render_cs_menu(ctx: NewScreenContext) -> Image.Image:
+    """CS2 running without live match data (menu, loading, no GSI yet)."""
+    background, strip_bg, accent = MODE_CS2
+    image = Image.new("RGB", (WIDTH, HEIGHT), background)
+    draw_strip(image, ctx, strip_bg, accent)
+    draw = ImageDraw.Draw(image)
+    layout = cs_menu_layout(ctx)
+    key = ctx.status or "waiting"
+    status = _t(ctx, CS2_MENU_STATUS.get(key, key))
+    color = "#FFB870" if key == "restart" else accent
+    now = ctx.now or dt.datetime.now()
+    clock = now.strftime("%H:%M")
+    clock_width = draw.textlength(clock, font=font(14))
+    text(draw, (14, 64), fit(draw, status, 15, WIDTH - 42 - clock_width), 15, color)
+    text(draw, (WIDTH - 14, 64), clock, 14, WHITE, anchor="ra")
+    track = panel_color(panel_color(background), 0.12)
+    _system_panel(image, draw, layout["cpu"], background, "cpu", ctx,
+                  96, track, _cpu_details(ctx)[:1], 32, True)
+    _system_panel(image, draw, layout["gpu"], background, "gpu", ctx,
+                  96, track, _gpu_details(ctx)[:1], 32, True)
+    if "pings" in layout:
+        box = layout["pings"]
+        rounded(draw, box, 8, panel_color(background))
+        pings = tuple(ctx.pings)[:4]
+        slots = _columns(box[0] + 10, box[2] - 10, len(pings), 8)
+        cy = (box[1] + box[3]) / 2
+        for (left, right), (code, ms) in zip(slots, pings):
+            value = f"{int(ms)} ms"
+            color_ms = GREEN if ms < 60 else ORANGE if ms < 100 else RED
+            label = f"{str(code).upper()[:4]} "
+            width = draw.textlength(label, font=font(14)) + draw.textlength(value, font=font(14))
+            x = (left + right - width) / 2
+            x += text(draw, (x, cy), label, 14, WHITE, anchor="lm")
+            text(draw, (x, cy), value, 14, color_ms, anchor="lm")
+    return image
+
+
+def new_design_mode(faceit_active: bool, game_active: bool, in_match: bool,
+                    msfs_active: bool = False) -> str:
+    """Screen family for the Claude design.
+
+    FACEIT always wins (system data only). CS2 running shows CS2 screens even
+    without GSI data: live match screens when in a match, otherwise the CS2
+    menu screen instead of the desktop.
+    """
+    if faceit_active:
+        return "faceit"
+    if game_active:
+        return "cs2" if in_match else "cs2_menu"
+    if msfs_active:
+        return "msfs"
+    return "desktop"
+
+
 # ---------------------------------------------------------------------------
 # MSFS phase screens
 # ---------------------------------------------------------------------------
@@ -1153,6 +1235,8 @@ def render_new_screen(ctx: NewScreenContext) -> Image.Image:
         return {
             "buy": render_cs_buy, "death": render_cs_death,
         }.get(ctx.cs_screen, render_cs_live)(ctx)
+    if ctx.mode in ("cs2", "cs2_menu"):
+        return render_cs_menu(ctx)
     if ctx.mode == "msfs":
         phase = getattr(ctx.flight_state, "phase", "ground") or "ground"
         return MSFS_RENDERERS.get(phase, render_msfs_ground)(ctx)
@@ -1161,5 +1245,5 @@ def render_new_screen(ctx: NewScreenContext) -> Image.Image:
 
 __all__ = [
     "AlertTracker", "BatteryInfo", "NewScreenContext", "buy_suggestion", "cs_screen_for",
-    "loss_award", "render_new_screen", "threshold_color",
+    "loss_award", "new_design_mode", "render_new_screen", "threshold_color",
 ]

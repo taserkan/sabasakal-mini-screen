@@ -65,6 +65,8 @@ SENSOR_ROOT = ROOT / "vendor"
 GSI_PORT = 38791
 GSI_TOKEN_PATH = APP_DATA / "gsi-token.txt"
 _GSI_TOKEN_CACHE: str | None = None
+# Outcome of the latest GSI POSTs (diagnostics + restart hint).
+GSI_AUTH_STATE: dict[str, object] = {"rejected_at": None}
 
 
 def gsi_token() -> str:
@@ -780,32 +782,84 @@ def _extended_round_fields(map_data: dict, round_data: dict, player: dict, team:
     }
 
 
+def _note_gsi_request(status: str, reason: str) -> None:
+    """Remember the outcome of the latest GSI POST (for the diagnostic log)."""
+    now = time.time()
+    GSI_AUTH_STATE["last_at"] = now
+    GSI_AUTH_STATE["last_status"] = status
+    GSI_AUTH_STATE["last_reason"] = reason
+    key = "accepted" if status == "accepted" else "rejected"
+    GSI_AUTH_STATE[key] = int(GSI_AUTH_STATE.get(key) or 0) + 1
+    if reason == "token mismatch":
+        # Usually CS2 still runs with an older cfg/token: it reads
+        # gamestate_integration_*.cfg only at launch.
+        GSI_AUTH_STATE["rejected_at"] = now
+
+
+def gsi_request_summary() -> str:
+    state = GSI_AUTH_STATE
+    if not state.get("last_at"):
+        return "no GSI request received yet"
+    age = max(0.0, time.time() - float(state["last_at"]))
+    return (
+        f"last={state.get('last_status')}; reason={state.get('last_reason')}; "
+        f"age={age:.1f}s; accepted={int(state.get('accepted') or 0)}; "
+        f"rejected={int(state.get('rejected') or 0)}"
+    )
+
+
 class _GSIHandler(http.server.BaseHTTPRequestHandler):
+    def _reply(self, code: int) -> None:
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _read_body(self) -> bytes | None:
+        if "chunked" in str(self.headers.get("Transfer-Encoding") or "").lower():
+            body = bytearray()
+            while True:
+                size_line = self.rfile.readline(64)
+                size = int(size_line.split(b";", 1)[0].strip() or b"0", 16)
+                if size == 0:
+                    self.rfile.readline(64)
+                    return bytes(body)
+                body += self.rfile.read(size)
+                self.rfile.readline(64)
+                if len(body) > GSI_MAX_PAYLOAD_BYTES:
+                    return None
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0 or length > GSI_MAX_PAYLOAD_BYTES:
+            return None
+        return self.rfile.read(length)
+
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler name
-        # CS2 never sends an Origin header; browsers always do for cross-site
-        # POSTs. Rejecting it blocks drive-by requests from web pages.
+        # CS2 ("Valve/Steam HTTP Client 1.0") never sends an Origin header;
+        # browsers always do for cross-site POSTs. Rejecting it blocks
+        # drive-by requests from web pages.
         if self.headers.get("Origin") is not None:
-            self.send_response(403)
-            self.end_headers()
+            _note_gsi_request("rejected", "origin header")
+            self._reply(403)
             return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > GSI_MAX_PAYLOAD_BYTES:
-                self.send_response(413)
-                self.end_headers()
+            raw = self._read_body()
+            if raw is None:
+                _note_gsi_request("rejected", "bad length")
+                self._reply(413)
                 return
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = json.loads(raw.decode("utf-8-sig"))
             if not isinstance(payload, dict):
                 raise ValueError("GSI payload must be an object")
             auth = payload.get("auth")
-            token = str((auth if isinstance(auth, dict) else {}).get("token") or "")
+            token = str((auth if isinstance(auth, dict) else {}).get("token") or "").strip()
             if hmac.compare_digest(token.encode(), gsi_token().encode()):
                 self.server.game_state.update(payload)  # type: ignore[attr-defined]
-            self.send_response(200)
-            self.end_headers()
-        except Exception:
-            self.send_response(400)
-            self.end_headers()
+                _note_gsi_request("accepted", "ok")
+            else:
+                _note_gsi_request("rejected", "token mismatch" if token else "no token")
+            self._reply(200)
+        except Exception as exc:
+            _note_gsi_request("rejected", f"bad payload ({type(exc).__name__})")
+            self._reply(400)
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -1291,14 +1345,55 @@ def gsi_config_text() -> str:
 '''
 
 
+GSI_CONFIG_NAME = "gamestate_integration_cs2_screen.cfg"
+# No legacy fixed token is accepted: it is public in the source code, so any
+# local process could inject fake game data with it.  A restart hint is shown
+# instead when CS2 still runs with an outdated cfg.
+GSI_REJECTED_HINT_SECONDS = 15.0
+
+
+def gsi_restart_needed(
+    cs2_started_at: float | None = None, cfg_path: Path | None = None,
+    now: float | None = None, connected: bool = False,
+) -> bool:
+    """True when the running CS2 cannot be sending our current GSI token.
+
+    CS2 loads GSI cfgs only at launch, so a cfg written after cs2.exe started
+    (or recently rejected posts) means the game must be restarted.
+    """
+    if connected:
+        return False
+    now = time.time() if now is None else now
+    rejected = GSI_AUTH_STATE.get("rejected_at")
+    if rejected is not None and now - float(rejected) < GSI_REJECTED_HINT_SECONDS:
+        return True
+    if cs2_started_at is None:
+        cs2_started_at = PROCESS_SCANNER.created_at("cs2.exe")
+    if not cs2_started_at:
+        return False
+    if cfg_path is None:
+        cfg_dir = find_cs2_cfg_dir()
+        cfg_path = cfg_dir / GSI_CONFIG_NAME if cfg_dir is not None else None
+    try:
+        return cfg_path is not None and cfg_path.stat().st_mtime > float(cs2_started_at) + 2.0
+    except OSError:
+        return False
+
+
 def install_gsi_config() -> Path:
     cfg_dir = find_cs2_cfg_dir()
     if cfg_dir is None:
         raise FileNotFoundError("CS2 kurulum klasörü bulunamadı.")
-    target = cfg_dir / "gamestate_integration_cs2_screen.cfg"
+    target = cfg_dir / GSI_CONFIG_NAME
     content = gsi_config_text()
     if not target.exists() or target.read_text(encoding="utf-8", errors="ignore") != content:
         target.write_text(content, encoding="utf-8")
+        if cs2_is_running():
+            log_info(
+                "gsi",
+                "WARNING: GSI cfg/token changed while cs2.exe is running; "
+                "restart CS2 to enable game data",
+            )
     # FACEIT kill switch: never touch CS2 launch options while FACEIT AC runs.
     if not faceit_ac_is_running():
         install_cs2_console_log_launch_option()
@@ -1552,7 +1647,10 @@ class WindowsTaskManagerMonitor:
         ("luid", _Luid), ("flags", wintypes.UINT),
     ]
 
-    def __init__(self, sample_interval: float = 0.25) -> None:
+    # Task Manager collects its counters once per second and shows the raw
+    # one-second rate; PDH already computes that rate between two collects,
+    # so a 1 s collect interval with no extra averaging matches it.
+    def __init__(self, sample_interval: float = 1.0) -> None:
         self.sample_interval = sample_interval
         self._lock = threading.Lock()
         self._started = False
@@ -1575,16 +1673,18 @@ class WindowsTaskManagerMonitor:
     def _gpu_engine_total(
         items: list[tuple[str, float]], target_luid: str | None = None,
     ) -> float | None:
-        """Return Task Manager's busiest physical engine utilization.
+        """Return Task Manager's overall GPU utilization for one adapter.
 
-        The GPU counter set exposes one row per process.  Task Manager first
-        totals rows belonging to the same physical engine, then displays the
-        busiest engine as the overall load.
+        The GPU Engine counter set exposes one row per process and engine
+        (``pid_X_luid_..._phys_N_eng_M_engtype_T``).  Task Manager sums the
+        per-process rows of each engine type (3D, Copy, VideoDecode, ...)
+        and shows the busiest engine type as the GPU's utilization.
         """
-        engines: dict[str, float] = {}
+        engines: dict[tuple[str, str], float] = {}
         for name, value in items:
             match = re.search(
-                r"(?P<adapter>luid_0x[0-9a-f]+_0x[0-9a-f]+_phys_\d+)_eng_\d+",
+                r"(?P<adapter>luid_0x[0-9a-f]+_0x[0-9a-f]+_phys_\d+)_eng_(?P<eng>\d+)"
+                r"(?:_engtype_(?P<type>[A-Za-z0-9 ]*))?",
                 name,
                 flags=re.IGNORECASE,
             )
@@ -1593,7 +1693,8 @@ class WindowsTaskManagerMonitor:
             adapter = match.group("adapter").lower()
             if target_luid and not adapter.startswith(f"{target_luid.lower()}_phys_"):
                 continue
-            key = match.group(0).lower()
+            engine_type = (match.group("type") or "").strip().lower() or f"eng_{match.group('eng')}"
+            key = (adapter, engine_type)
             engines[key] = engines.get(key, 0.0) + value
         if not engines:
             return None
@@ -2049,6 +2150,25 @@ def sample_virtual_memory(now: float | None = None):
         return _RAM_SAMPLE["value"]
 
 
+_METRIC_SOURCES_LOGGED = {"done": False, "calls": 0}
+
+
+def _log_metric_sources_once(cpu: str, gpu: str, gpu_temp: str, final: bool) -> None:
+    """Record once which counters feed CPU/GPU/RAM (after PDH warmed up)."""
+    state = _METRIC_SOURCES_LOGGED
+    if state["done"]:
+        return
+    state["calls"] += 1
+    if not final and state["calls"] < 20:
+        return
+    state["done"] = True
+    log_info(
+        "metrics",
+        f"metric sources; cpu={cpu}; gpu={gpu}; gpu_temp={gpu_temp}; "
+        "ram=total-available (Task Manager 'In use'); interval=1s",
+    )
+
+
 def get_metrics() -> dict[str, float | None]:
     fallback_cpu_load = psutil.cpu_percent(interval=None)
     memory = sample_virtual_memory()
@@ -2066,6 +2186,14 @@ def get_metrics() -> dict[str, float | None]:
             cpu_frequency = (float(frequency.current) / 1000.0) if frequency else None
         except Exception:
             cpu_frequency = None
+    _log_metric_sources_once(
+        r"PDH \Processor Information(_Total)\% Processor Utility" if task_cpu_load is not None
+        else "psutil.cpu_percent",
+        r"PDH \GPU Engine(*)\Utilization Percentage (max engine type)" if task_gpu_load is not None
+        else "NVML utilization",
+        "NVML" if gpu_temp > 0 else "none",
+        task_cpu_load is not None and task_gpu_load is not None,
+    )
     return {
         "cpu_load": cpu_load,
         "cpu_freq": cpu_frequency,
@@ -2079,7 +2207,7 @@ def get_metrics() -> dict[str, float | None]:
         # matches that formula on Windows instead of relying on platform-
         # specific psutil percentage semantics.
         "ram_load": ((memory.total - memory.available) / memory.total * 100.0) if memory.total else 0.0,
-        "ram_used": memory.used / (1024 ** 3),
+        "ram_used": (memory.total - memory.available) / (1024 ** 3),
         "ram_used_gb": (memory.total - memory.available) / (1024 ** 3),
         "ram_total_gb": memory.total / (1024 ** 3),
     }
@@ -3197,7 +3325,7 @@ def render_screen(
         metrics["ram_load"],
         ram_load_color,
         labels["ram"],
-        f"{int(round(float(metrics['ram_used'] or 0)))} GB",
+        f"{float(metrics['ram_used'] or 0):.1f} GB",
         _t("kullanımda"),
         colors,
         value_color=ram_load_alert,
