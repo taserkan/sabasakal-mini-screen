@@ -15,9 +15,13 @@ from winrt.windows.media.control import (
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
 )
 
+from app_log import log_exception
+
 
 MEDIA_BAND_COUNT = 16
 MEDIA_METADATA_STABILITY_SECONDS = 0.65
+MEDIA_PROPERTIES_TIMEOUT_SECONDS = 2.0
+DEVICE_CHECK_SECONDS = 5.0
 
 
 def sanitise_media_text(value: object) -> str:
@@ -122,6 +126,7 @@ class AudioSpectrumMonitor:
         self._thread: threading.Thread | None = None
         self._latest_pcm = b""
         self._sequence = 0
+        self._windows: dict[int, np.ndarray] = {}
         self._last_signal_at = 0.0
         self._snapshot = AudioSpectrumSnapshot(bars=(0.0,) * band_count)
 
@@ -161,6 +166,15 @@ class AudioSpectrumMonitor:
                 error=error,
             )
 
+    @staticmethod
+    def _default_loopback_name() -> str:
+        """Query a fresh PortAudio instance; the open one caches the device list."""
+        try:
+            with pyaudio.PyAudio() as probe:
+                return str(probe.get_default_wasapi_loopback().get("name") or "")
+        except Exception:
+            return ""
+
     def _analyze(self, pcm: bytes, channels: int, rate: int) -> tuple[np.ndarray, float]:
         raw = np.frombuffer(pcm, dtype=np.int16)
         if raw.size < channels:
@@ -170,7 +184,13 @@ class AudioSpectrumMonitor:
         rms = float(np.sqrt(np.mean(mono * mono))) if mono.size else 0.0
         if mono.size < 32 or rms < 0.0001:
             return np.zeros(self.band_count, dtype=np.float32), 0.0
-        spectrum = np.abs(np.fft.rfft(mono * np.hanning(mono.size)))
+        window = self._windows.get(mono.size)
+        if window is None:
+            window = np.hanning(mono.size).astype(np.float32)
+            if len(self._windows) > 8:
+                self._windows.clear()
+            self._windows[mono.size] = window
+        spectrum = np.abs(np.fft.rfft(mono * window))
         frequencies = np.fft.rfftfreq(mono.size, 1.0 / rate)
         upper = max(120.0, min(16000.0, rate / 2.0))
         edges = np.geomspace(55.0, upper, self.band_count + 1)
@@ -218,7 +238,16 @@ class AudioSpectrumMonitor:
                     )
                     latency_ms = float(stream.get_input_latency()) * 1000.0
                     seen_sequence = -1
+                    device_name = str(device.get("name") or "")
+                    next_device_check = time.monotonic() + DEVICE_CHECK_SECONDS
                     while stream.is_active() and not self._stop.wait(0.012):
+                        if time.monotonic() >= next_device_check:
+                            next_device_check = time.monotonic() + DEVICE_CHECK_SECONDS
+                            current_name = self._default_loopback_name()
+                            if current_name and current_name != device_name:
+                                # Default output switched (e.g. speakers ->
+                                # headset): reopen loopback on the new device.
+                                break
                         with self._lock:
                             sequence = self._sequence
                             pcm = self._latest_pcm
@@ -236,6 +265,7 @@ class AudioSpectrumMonitor:
                         )
                         self._publish(smoothed, level, latency_ms)
             except Exception as exc:
+                log_exception("audio", "WASAPI loopback failed", exc)
                 smoothed *= 0.65
                 self._publish(smoothed, 0.0, 0.0, f"{type(exc).__name__}: {exc}")
                 self._stop.wait(0.75)
@@ -353,7 +383,15 @@ class MediaSessionMonitor:
                 if session is None:
                     self._publish(MediaSnapshot(updated_at=time.monotonic()))
                 else:
-                    properties = await session.try_get_media_properties_async()
+                    try:
+                        # A hung media app can leave this WinRT call pending
+                        # forever; never let it freeze metadata updates.
+                        properties = await asyncio.wait_for(
+                            session.try_get_media_properties_async(),
+                            timeout=MEDIA_PROPERTIES_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        properties = None
                     source_id = str(session.source_app_user_model_id or "")
                     status = self._status_name(session.get_playback_info().playback_status)
                     self._publish(MediaSnapshot(
@@ -387,6 +425,7 @@ class MediaSessionMonitor:
             try:
                 asyncio.run(self._observe())
             except Exception as exc:
+                log_exception("media", "media session observer failed", exc)
                 self._publish(MediaSnapshot(
                     updated_at=time.monotonic(), error=f"{type(exc).__name__}: {exc}",
                 ))
