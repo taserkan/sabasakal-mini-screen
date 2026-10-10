@@ -87,6 +87,7 @@ class WeatherSnapshot:
     readings: tuple[WeatherReading, ...] = ()
     updated_at: float = 0.0
     error: str = ""
+    city_errors: tuple[str, ...] = ()
 
     @property
     def signature(self) -> tuple[tuple[str, int, int, bool], ...]:
@@ -121,10 +122,37 @@ def fetch_city_weather(
     )
 
 
+_GEOCODE_CACHE: dict[str, tuple[float, float]] = {}
+_GEOCODE_MISSES: dict[str, float] = {}
+_GEOCODE_LOCK = threading.Lock()
+GEOCODE_MISS_RETRY_SECONDS = 3600.0
+
+
 def resolve_city(city: str, timeout: float = 5.0) -> tuple[float, float]:
-    known = KNOWN_CITY_COORDINATES.get(city.casefold())
+    key = city.casefold()
+    known = KNOWN_CITY_COORDINATES.get(key)
     if known is not None:
         return known
+    with _GEOCODE_LOCK:
+        cached = _GEOCODE_CACHE.get(key)
+        missed_at = _GEOCODE_MISSES.get(key)
+    if cached is not None:
+        return cached
+    if missed_at is not None and time.monotonic() - missed_at < GEOCODE_MISS_RETRY_SECONDS:
+        raise ValueError(f"Şehir bulunamadı: {city}")
+    coordinates = _geocode(city, timeout)
+    with _GEOCODE_LOCK:
+        if coordinates is None:
+            _GEOCODE_MISSES[key] = time.monotonic()
+        else:
+            _GEOCODE_CACHE[key] = coordinates
+            _GEOCODE_MISSES.pop(key, None)
+    if coordinates is None:
+        raise ValueError(f"Şehir bulunamadı: {city}")
+    return coordinates
+
+
+def _geocode(city: str, timeout: float) -> tuple[float, float] | None:
     query = urllib.parse.urlencode({
         "name": city,
         "count": 1,
@@ -139,14 +167,15 @@ def resolve_city(city: str, timeout: float = 5.0) -> tuple[float, float]:
         payload = json.loads(response.read().decode("utf-8"))
     results = payload.get("results") or []
     if not results:
-        raise ValueError(f"Şehir bulunamadı: {city}")
+        return None
     return float(results[0]["latitude"]), float(results[0]["longitude"])
 
 
-def fetch_weather(
+def fetch_weather_detailed(
     cities: object = DEFAULT_WEATHER_CITIES,
     timeout: float = 5.0,
-) -> tuple[WeatherReading, ...]:
+) -> tuple[tuple[WeatherReading, ...], tuple[str, ...]]:
+    """Return readings plus one error string per city that failed."""
     readings: list[WeatherReading] = []
     errors: list[str] = []
     for city in normalise_city_names(cities):
@@ -154,10 +183,18 @@ def fetch_weather(
             latitude, longitude = resolve_city(city, timeout)
             readings.append(fetch_city_weather(city, latitude, longitude, timeout))
         except Exception as exc:
-            errors.append(f"{city}: {type(exc).__name__}")
+            errors.append(f"{city}: {type(exc).__name__}: {exc}")
+    return tuple(readings), tuple(errors)
+
+
+def fetch_weather(
+    cities: object = DEFAULT_WEATHER_CITIES,
+    timeout: float = 5.0,
+) -> tuple[WeatherReading, ...]:
+    readings, errors = fetch_weather_detailed(cities, timeout)
     if not readings:
         raise RuntimeError(", ".join(errors) or "Hava durumu alınamadı")
-    return tuple(readings)
+    return readings
 
 
 class WeatherMonitor:
@@ -214,11 +251,17 @@ class WeatherMonitor:
             try:
                 with self._lock:
                     cities = self._cities
-                readings = fetch_weather(cities)
+                readings, city_errors = fetch_weather_detailed(cities)
+                if not readings:
+                    raise RuntimeError(", ".join(city_errors) or "Hava durumu alınamadı")
                 with self._lock:
                     self._snapshot = WeatherSnapshot(
                         readings=readings,
                         updated_at=time.time(),
+                        # Partial success: keep the cities that worked and
+                        # report each failing city instead of hiding it.
+                        error="; ".join(city_errors),
+                        city_errors=city_errors,
                     )
                 succeeded = True
             except Exception as exc:
