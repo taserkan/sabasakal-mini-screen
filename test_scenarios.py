@@ -2056,9 +2056,18 @@ class FakeGSI:
 class FakeMonitor:
     def __init__(self, value) -> None:
         self.value = value
+        self.running = False
+        self.interval = 2.0
+        self.starts = 0
+        self.pauses = 0
 
     def start(self) -> None:
-        pass
+        self.running = True
+        self.starts += 1
+
+    def pause(self) -> None:
+        self.running = False
+        self.pauses += 1
 
     def stop(self) -> None:
         pass
@@ -4759,6 +4768,36 @@ class BatteryDiscoveryRetry113Tests(unittest.TestCase):
         self.assertFalse(gui.should_log_distinct(seen, "E_ABORT", now=120.0))
         self.assertTrue(gui.should_log_distinct(seen, "other", now=120.0))
         self.assertTrue(gui.should_log_distinct(seen, "E_ABORT", now=301.0))
+
+
+class PerformanceMode113Tests(unittest.TestCase):
+    def test_priority_is_below_normal_in_game_and_restored(self) -> None:
+        process = Mock()
+        self.assertTrue(gui.set_process_priority(True, process))
+        process.nice.assert_called_with(gui.psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        self.assertTrue(gui.set_process_priority(False, process))
+        process.nice.assert_called_with(gui.psutil.NORMAL_PRIORITY_CLASS)
+
+    def test_audio_pause_clears_spectrum_without_blocking(self) -> None:
+        monitor = AudioSpectrumMonitor()
+        monitor._snapshot = AudioSpectrumSnapshot(bars=(0.9,) * monitor.band_count, active=True)
+        started = time.monotonic()
+        monitor.pause()
+        self.assertLess(time.monotonic() - started, 0.1)
+        self.assertFalse(monitor.snapshot().active)
+        self.assertFalse(monitor.running)
+
+    def test_in_game_intervals(self) -> None:
+        self.assertGreaterEqual(gui.PERFORMANCE_BATTERY_INTERVAL, 5 * gui.NORMAL_BATTERY_INTERVAL)
+        self.assertEqual(screen_app.WindowsTaskManagerMonitor().sample_interval, 1.0)
+
+    def test_sensor_host_skips_superio_and_polls_slowly(self) -> None:
+        source = (Path(screen_app.__file__).parent / "sensor-helper" / "Program.cs").read_text(
+            encoding="utf-8")
+        self.assertIn("IsMotherboardEnabled = false", source)
+        self.assertIn("IsStorageEnabled = false", source)
+        self.assertIn("ProcessPriorityClass.BelowNormal", source)
+        self.assertIn("GameRunning() ? 2000 : 1000", source)
 
 
 if __name__ == "__main__":

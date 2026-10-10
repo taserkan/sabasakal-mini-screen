@@ -1437,7 +1437,7 @@ class EmbeddedSensorMonitor:
 
     @staticmethod
     def _read_elevated_cache(
-        path: Path = SENSOR_CACHE_PATH, max_age: float = 3.0,
+        path: Path = SENSOR_CACHE_PATH, max_age: float = 6.0,
     ) -> dict[str, float | None] | None:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))

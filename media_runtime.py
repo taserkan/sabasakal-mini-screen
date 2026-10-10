@@ -142,6 +142,21 @@ class AudioSpectrumMonitor:
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=2.0)
 
+    @property
+    def running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive() and not self._stop.is_set())
+
+    def pause(self) -> None:
+        """Stop capturing without blocking the caller (performance mode).
+
+        WASAPI loopback wakes every ~10 ms; nothing should run at that rate
+        while a game runs or no screen shows the spectrum.  ``start()``
+        resumes capture once the previous thread has wound down.
+        """
+        self._stop.set()
+        with self._lock:
+            self._snapshot = AudioSpectrumSnapshot(bars=(0.0,) * self.band_count)
+
     def snapshot(self) -> AudioSpectrumSnapshot:
         with self._lock:
             return self._snapshot

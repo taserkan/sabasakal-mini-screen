@@ -59,6 +59,27 @@ internal static class Program
         return values.Length == 0 ? null : values.Average();
     }
 
+    private static readonly string[] GameProcesses = { "cs2", "FlightSimulator2024" };
+    private static DateTime _gameCheckedAt = DateTime.MinValue;
+    private static bool _gameRunning;
+
+    private static bool GameRunning()
+    {
+        if ((DateTime.UtcNow - _gameCheckedAt).TotalSeconds < 10)
+            return _gameRunning;
+        _gameCheckedAt = DateTime.UtcNow;
+        bool running = false;
+        foreach (string name in GameProcesses)
+        {
+            Process[] found = Process.GetProcessesByName(name);
+            running |= found.Length > 0;
+            foreach (Process process in found)
+                process.Dispose();
+        }
+        _gameRunning = running;
+        return running;
+    }
+
     private static string? ArgumentValue(string[] args, string name)
     {
         int index = Array.FindIndex(args, value =>
@@ -154,7 +175,10 @@ internal static class Program
             IsCpuEnabled = true,
             IsGpuEnabled = false,
             IsMemoryEnabled = false,
-            IsMotherboardEnabled = true,
+            // CPU temperature/clock/power come from the CPU group only. The
+            // motherboard group polls SuperIO/EC chips over port I/O, which
+            // can add DPC latency spikes while a game runs, so it stays off.
+            IsMotherboardEnabled = false,
             IsStorageEnabled = false,
             IsNetworkEnabled = false,
             IsControllerEnabled = false,
@@ -164,6 +188,8 @@ internal static class Program
 
         try
         {
+            try { Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.BelowNormal; }
+            catch { /* keep default priority */ }
             computer.Open();
             UpdateVisitor visitor = new();
             int consecutiveWriteErrors = 0;
@@ -208,7 +234,8 @@ internal static class Program
                     if (consecutiveWriteErrors == 1 || consecutiveWriteErrors % 120 == 0)
                         AppendErrorLog(cachePath, writeError);
                 }
-                await Task.Delay(500);
+                // 1 s like Task Manager; 2 s while a game runs (performance mode).
+                await Task.Delay(GameRunning() ? 2000 : 1000);
             }
             return 0;
         }

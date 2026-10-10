@@ -265,6 +265,9 @@ VALUE_REGIONS = [
 ]
 BOTTOM_REGION = (14, 160, 467, 307)
 LIVE_GAME_WORKER_INTERVAL = 0.20
+# In-game performance mode (cs2.exe / FACEIT / MSFS running).
+NORMAL_BATTERY_INTERVAL = 2.0
+PERFORMANCE_BATTERY_INTERVAL = 10.0
 BATTERY_PANEL_REGION = (337, 202, 456, 295)
 MSFS_PANEL_REGION_WITH_BATTERY = (14, 160, 337, 307)
 MSFS_TELEMETRY_REGION = (20, 198, 460, 300)
@@ -404,6 +407,20 @@ WINDOW_DEFAULT_SIZE = (1200, 890 + (QUICK_CARD_HEIGHT - 252))
 WINDOW_MINIMUM_SIZE = (1160, 860 + (QUICK_CARD_HEIGHT - 252))
 WORKER_RESTART_MAX_DELAY_MS = 60000
 DISPLAY_STALL_SECONDS = 8.0
+
+
+def set_process_priority(below_normal: bool, process=None) -> bool:
+    """BELOW_NORMAL while a game runs so the game always wins the CPU."""
+    if os.name != "nt":
+        return False
+    try:
+        process = process or psutil.Process()
+        process.nice(
+            psutil.BELOW_NORMAL_PRIORITY_CLASS if below_normal else psutil.NORMAL_PRIORITY_CLASS
+        )
+        return True
+    except Exception:
+        return False
 
 
 def should_log_distinct(
@@ -2551,7 +2568,7 @@ class ControlPanel(QWidget):
         gsi_server = None
         media_monitor = MediaSessionMonitor()
         audio_monitor = AudioSpectrumMonitor()
-        battery_monitor = BatteryDeviceMonitor(interval=2.0, limit=3)
+        battery_monitor = BatteryDeviceMonitor(interval=NORMAL_BATTERY_INTERVAL, limit=3)
         msfs_monitor = MSFSTelemetryMonitor()
         weather_monitor = WeatherMonitor(weather_cities_for_design(self.settings))
         applied_display_settings = None
@@ -2618,6 +2635,23 @@ class ControlPanel(QWidget):
             )
             return metrics, frame
         last_gsi_attempt = 0.0
+        perf_state: dict = {"state": None}
+
+        def apply_performance_mode(enabled: bool, audio_wanted: bool) -> None:
+            """In-game performance mode: fewer wakeups while a game runs."""
+            battery_monitor.interval = (
+                PERFORMANCE_BATTERY_INTERVAL if enabled else NORMAL_BATTERY_INTERVAL
+            )
+            if audio_wanted:
+                audio_monitor.start()
+            else:
+                audio_monitor.pause()
+            set_process_priority(below_normal=enabled)
+            _runtime_log(
+                f"performance mode {'on' if enabled else 'off'}; "
+                f"audio_capture={'on' if audio_wanted else 'off'}; "
+                f"battery_interval={battery_monitor.interval:.0f}s"
+            )
         gsi_restart_state = {"checked_at": -1e9, "needed": False}
 
         def check_gsi_restart(game_running: bool, connected: bool) -> bool:
@@ -2672,7 +2706,6 @@ class ControlPanel(QWidget):
         try:
             ensure_gsi(faceit_ac_is_running())
             media_monitor.start()
-            audio_monitor.start()
             battery_monitor.start()
             msfs_monitor.start()
             weather_monitor.start()
@@ -2894,6 +2927,14 @@ class ControlPanel(QWidget):
                             media_render_future.cancel()
                             media_render_future = None
                     new_design_active = design == "new"
+                    performance_mode = game_active or faceit_active or msfs_active
+                    # The spectrum is only drawn by the classic media screen.
+                    audio_wanted = not performance_mode and not new_design_active
+                    if (performance_mode, audio_wanted) != perf_state["state"]:
+                        perf_state["state"] = (performance_mode, audio_wanted)
+                        apply_performance_mode(performance_mode, audio_wanted)
+                    elif audio_wanted and not audio_monitor.running:
+                        audio_monitor.start()
                     if new_design_active:
                         if cached_metrics is None or cycle_started - last_metrics_refresh >= 0.5:
                             cached_metrics = get_metrics()
