@@ -3826,6 +3826,233 @@ class ExitScenarios(Fix111Base):
         fake_app.aboutToQuit.connect.assert_called()
 
 
+class BatteryPresenceAndRamScenarios(unittest.TestCase):
+    """Only connected devices are drawn; RAM appears only where it fits."""
+
+    KINDS = ("mouse", "keyboard", "headset")
+
+    @staticmethod
+    def devices(kinds, percent=64):
+        names = {"mouse": "PRO X", "keyboard": "G915", "headset": "PRO X WIRELESS"}
+        return tuple(BatteryDevice(f"id-{kind}", names[kind], percent, kind) for kind in kinds)
+
+    def device_combinations(self):
+        import itertools
+        for count in range(4):
+            for kinds in itertools.combinations(self.KINDS, count):
+                yield kinds
+
+    @staticmethod
+    def metrics(extreme=False):
+        if extreme:
+            return {
+                "cpu_load": 100.0, "cpu_temp": 100.0, "gpu_load": 100.0, "gpu_temp": 100.0,
+                "ram_load": 100.0, "ram_used_gb": 127.9, "ram_total_gb": 128.0,
+                "cpu_freq": 5.9, "cpu_power": 250.0, "gpu_memory": 24000.0, "gpu_power": 450.0,
+            }
+        return {
+            "cpu_load": 38.0, "cpu_temp": 62.0, "gpu_load": 22.0, "gpu_temp": 48.0,
+            "ram_load": 52.0, "ram_used_gb": 16.6, "ram_total_gb": 32.0,
+        }
+
+    def assert_disjoint(self, boxes, label):
+        for index, (name_a, a) in enumerate(boxes):
+            self.assertGreaterEqual(a[0], 0, (label, name_a, a))
+            self.assertLessEqual(a[2], 480, (label, name_a, a))
+            self.assertGreaterEqual(a[1], 0, (label, name_a, a))
+            self.assertLessEqual(a[3], 320, (label, name_a, a))
+            for name_b, b in boxes[index + 1:]:
+                overlap = a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+                self.assertFalse(overlap, (label, name_a, a, name_b, b))
+
+    def test_present_batteries_drops_absent_and_unknown_devices(self) -> None:
+        import screens_new as sn
+        devices = (
+            BatteryDevice("h", "Headset", 18, "headset"),
+            SimpleNamespace(kind="keyboard", percent=None),
+            BatteryDevice("m", "Mouse", 82, "mouse"),
+            BatteryDevice("m2", "Mouse 2", 50, "mouse"),
+        )
+        items = sn.present_batteries(devices)
+        self.assertEqual([(item.kind, item.percent) for item in items], [("mouse", 82), ("headset", 18)])
+        self.assertEqual(sn.present_batteries(()), [])
+
+    def test_desktop_layout_for_every_device_combination(self) -> None:
+        import screens_new as sn
+        from weather_runtime import WeatherReading as Reading
+        for language in ("tr", "en"):
+            for extreme in (False, True):
+                for kinds in self.device_combinations():
+                    label = (language, extreme, kinds)
+                    ctx = sn.NewScreenContext(
+                        self.metrics(extreme), self.devices(kinds),
+                        (Reading("Kahramanmaraş", 18.0, 61),), language=language,
+                    )
+                    layout = sn.main_layout(ctx)
+                    self.assertEqual([info.kind for info, _ in layout["batteries"]], list(kinds), label)
+                    boxes = [(key, layout[key]) for key in ("clock", "ram", "weather", "cpu", "gpu")
+                             if key in layout]
+                    boxes += [(f"battery:{info.kind}", box) for info, box in layout["batteries"]]
+                    self.assert_disjoint(boxes, label)
+                    self.assertIn("ram", layout, label)
+                    ram_text = "".join(part for part, _ in layout["ram_parts"])
+                    self.assertNotIn("…", ram_text)
+                    self.assertIn("/", ram_text)
+                    if not kinds:
+                        self.assertEqual(layout["cpu"][3], 320 - 14, "CPU/GPU take the battery row")
+                    else:
+                        widths = {round(box[2] - box[0]) for _info, box in layout["batteries"]}
+                        self.assertLessEqual(max(widths) - min(widths), 1, "items share the row evenly")
+                        self.assertEqual(layout["batteries"][0][1][0], 14)
+                        self.assertEqual(layout["batteries"][-1][1][2], 480 - 14)
+                    frame = sn.render_new_screen(ctx)
+                    self.assertEqual(frame.size, (480, 320))
+
+    def test_strip_layout_for_every_device_combination(self) -> None:
+        import screens_new as sn
+        for language in ("tr", "en"):
+            for extreme in (False, True):
+                for kinds in self.device_combinations():
+                    for allow_ram in (True, False):
+                        label = (language, extreme, kinds, allow_ram)
+                        ctx = sn.NewScreenContext(
+                            self.metrics(extreme), self.devices(kinds), language=language,
+                            fps=999 if extreme else 287, mode="cs2",
+                        )
+                        image = Image.new("RGB", (480, 320))
+                        layout = sn.draw_strip(image, ctx, "#000000", "#FFFFFF", allow_ram=allow_ram)
+                        names = [name for name, _box in layout]
+                        self.assertEqual(
+                            sorted(name.split(":")[1] for name in names if name.startswith("battery:")),
+                            sorted(kinds), label,
+                        )
+                        self.assertEqual(names[:3], ["cpu", "gpu", "fps"])
+                        if not allow_ram:
+                            self.assertNotIn("ram", names)
+                        self.assert_disjoint(layout, label)
+                        boxes = dict(layout)
+                        if "ram" in boxes:
+                            batteries = [box for name, box in layout if name.startswith("battery:")]
+                            if batteries:
+                                self.assertLessEqual(boxes["ram"][2] + 12, min(b[0] for b in batteries))
+                # With normal values and up to two devices RAM always fits.
+                ctx = sn.NewScreenContext(self.metrics(), self.devices(("mouse", "headset")),
+                                          language=language, fps=287, mode="cs2")
+                layout = sn.draw_strip(Image.new("RGB", (480, 320)), ctx, "#000", "#FFF")
+                self.assertIn("ram", dict(layout))
+
+    def test_faceit_and_msfs_have_no_ram_and_reflow_batteries(self) -> None:
+        import screens_new as sn
+        for kinds in self.device_combinations():
+            ctx = sn.NewScreenContext(self.metrics(), self.devices(kinds), mode="faceit")
+            items = sn.faceit_battery_layout(ctx)
+            self.assertEqual([item[0].kind for item in items], list(kinds))
+            spans = [(item[1], item[1] + item[4] + item[6]) for item in items]
+            for left, right in spans:
+                self.assertGreaterEqual(left, 26 - 0.5)
+                self.assertLessEqual(right, 480 - 26 + 0.5)
+            for (_l1, r1), (l2, _r2) in zip(spans, spans[1:]):
+                self.assertLess(r1, l2)
+            frame = sn.render_new_screen(ctx)
+            self.assertEqual(frame.size, (480, 320))
+        # The MSFS strip never carries RAM.
+        from msfs_runtime import FlightPhaseState
+        ctx = sn.NewScreenContext(self.metrics(), (), mode="msfs", flight=FlightTelemetry(),
+                                  flight_state=FlightPhaseState(phase="cruise"))
+        image = Image.new("RGB", (480, 320))
+        with patch.object(sn, "draw_strip", wraps=sn.draw_strip) as strip:
+            sn.render_new_screen(ctx)
+        self.assertFalse(strip.call_args.kwargs.get("allow_ram", True))
+        del image
+
+    def test_absent_devices_draw_no_placeholder(self) -> None:
+        import screens_new as sn
+        drawn: list[str] = []
+        original = sn.text
+
+        def capture(draw, xy, value, *args, **kwargs):
+            drawn.append(value)
+            return original(draw, xy, value, *args, **kwargs)
+
+        for mode in ("desktop", "cs2", "faceit"):
+            drawn.clear()
+            ctx = sn.NewScreenContext(self.metrics(), self.devices(("mouse",)), mode=mode, fps=200,
+                                      game=GameSnapshot(connected=True, in_match=True), cs_screen="live")
+            with patch.object(sn, "text", side_effect=capture):
+                sn.render_new_screen(ctx)
+            joined = " ".join(drawn)
+            for absent in ("Klavye", "Klv", "Kulaklık", "Kulak"):
+                self.assertNotIn(absent, drawn, (mode, absent))
+            self.assertIn("64%", joined)
+
+    def test_classic_design_reflows_for_every_device_count(self) -> None:
+        metrics = {
+            "cpu_load": 24.0, "cpu_temp": 46.0, "cpu_freq": 4.6,
+            "gpu_load": 18.0, "gpu_temp": 42.0, "gpu_memory": 920.0,
+            "ram_load": 52.0, "ram_used": 16.5,
+        }
+        empty = screen_app.render_screen(metrics, GameSnapshot(), False, dict(screen_app.COLORS))
+        for kinds in self.device_combinations():
+            devices = self.devices(kinds)
+            frame = screen_app.render_screen(
+                metrics, GameSnapshot(), False, dict(screen_app.COLORS), battery_devices=devices,
+            )
+            self.assertEqual(frame.size, (480, 320))
+            changed = ImageChops.difference(frame, empty).getbbox()
+            if not kinds:
+                self.assertIsNone(changed, "no device -> no battery rail")
+            else:
+                self.assertIsNotNone(changed)
+
+    def test_ram_is_sampled_at_most_once_per_second(self) -> None:
+        sample = SimpleNamespace(total=32 * 1024 ** 3, available=16 * 1024 ** 3, used=15 * 1024 ** 3)
+        screen_app._RAM_SAMPLE.update(at=None, value=None)
+        with patch.object(screen_app.psutil, "virtual_memory", return_value=sample) as memory:
+            screen_app.sample_virtual_memory(now=100.0)
+            screen_app.sample_virtual_memory(now=100.4)
+            screen_app.sample_virtual_memory(now=100.99)
+            self.assertEqual(memory.call_count, 1)
+            screen_app.sample_virtual_memory(now=101.0)
+            self.assertEqual(memory.call_count, 2)
+        screen_app._RAM_SAMPLE.update(at=None, value=None)
+
+    def test_metrics_report_used_and_total_ram(self) -> None:
+        sample = SimpleNamespace(total=32 * 1024 ** 3, available=8 * 1024 ** 3, used=20 * 1024 ** 3)
+        with patch.object(screen_app, "sample_virtual_memory", return_value=sample), \
+                patch.object(screen_app.psutil, "cpu_percent", return_value=10.0), \
+                patch.object(screen_app, "get_gpu_metrics", return_value=(5.0, 40.0, 100.0)), \
+                patch.object(screen_app.TASK_MANAGER_MONITOR, "read", return_value=(None, None, 4.5, None)), \
+                patch.object(screen_app.SENSOR_MONITOR, "read", return_value={"cpu_temp": 50.0, "cpu_freq": 4.5}), \
+                patch.object(screen_app.NVIDIA_MONITOR, "read_power_watts", return_value=None):
+            metrics = screen_app.get_metrics()
+        self.assertAlmostEqual(metrics["ram_load"], 75.0)
+        self.assertAlmostEqual(metrics["ram_used_gb"], 24.0)
+        self.assertAlmostEqual(metrics["ram_total_gb"], 32.0)
+
+    def test_ram_threshold_colors(self) -> None:
+        import screens_new as sn
+        self.assertEqual(sn.threshold_color("ram", "load", 69.9), sn.GREEN)
+        self.assertEqual(sn.threshold_color("ram", "load", 70.0), sn.ORANGE)
+        self.assertEqual(sn.threshold_color("ram", "load", 84.9), sn.ORANGE)
+        self.assertEqual(sn.threshold_color("ram", "load", 85.0), sn.RED)
+
+    def test_battery_previews_render_for_every_count(self) -> None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "render_previews", Path(__file__).parent / "tools" / "render_previews.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        import screens_new as sn
+        contexts = module.battery_contexts()
+        for name in module.BATTERY_SCREENS:
+            for count in range(4):
+                context = contexts[f"{name}-bat{count}"]
+                self.assertEqual(len(sn.present_batteries(context.batteries)), count)
+                self.assertEqual(sn.render_new_screen(context).size, (480, 320))
+        self.assertEqual(len(list(module.classic_battery_frames())), 4)
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

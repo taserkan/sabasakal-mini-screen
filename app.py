@@ -2033,9 +2033,25 @@ def get_gpu_metrics() -> tuple[float, float, float]:
     return NVIDIA_MONITOR.read()
 
 
+RAM_SAMPLE_INTERVAL = 1.0
+_RAM_SAMPLE: dict[str, object] = {"at": None, "value": None}
+_RAM_SAMPLE_LOCK = threading.Lock()
+
+
+def sample_virtual_memory(now: float | None = None):
+    """psutil.virtual_memory(), sampled at most once per second."""
+    now = time.monotonic() if now is None else now
+    with _RAM_SAMPLE_LOCK:
+        taken = _RAM_SAMPLE["at"]
+        if taken is None or now - float(taken) >= RAM_SAMPLE_INTERVAL or _RAM_SAMPLE["value"] is None:
+            _RAM_SAMPLE["value"] = psutil.virtual_memory()
+            _RAM_SAMPLE["at"] = now
+        return _RAM_SAMPLE["value"]
+
+
 def get_metrics() -> dict[str, float | None]:
     fallback_cpu_load = psutil.cpu_percent(interval=None)
-    memory = psutil.virtual_memory()
+    memory = sample_virtual_memory()
     fallback_gpu_load, gpu_temp, fallback_gpu_memory = get_gpu_metrics()
     task_cpu_load, task_gpu_load, task_cpu_frequency, task_gpu_memory = TASK_MANAGER_MONITOR.read()
     cpu_load = task_cpu_load if task_cpu_load is not None else fallback_cpu_load
@@ -2064,6 +2080,8 @@ def get_metrics() -> dict[str, float | None]:
         # specific psutil percentage semantics.
         "ram_load": ((memory.total - memory.available) / memory.total * 100.0) if memory.total else 0.0,
         "ram_used": memory.used / (1024 ** 3),
+        "ram_used_gb": (memory.total - memory.available) / (1024 ** 3),
+        "ram_total_gb": memory.total / (1024 ** 3),
     }
 
 

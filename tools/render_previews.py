@@ -36,10 +36,12 @@ BATTERIES = (
 DESKTOP = {
     "cpu_load": 38.0, "cpu_temp": 62.0, "cpu_freq": 4.8, "cpu_power": 71.0,
     "gpu_load": 22.0, "gpu_temp": 48.0, "gpu_memory": 3174.0, "gpu_power": 64.0,
+    "ram_load": 52.0, "ram_used_gb": 16.6, "ram_total_gb": 32.0,
 }
 GAMING = {
     "cpu_load": 71.0, "cpu_temp": 66.0, "cpu_freq": 5.1, "cpu_power": 98.0,
     "gpu_load": 96.0, "gpu_temp": 78.0, "gpu_memory": 9830.0, "gpu_power": 265.0,
+    "ram_load": 74.0, "ram_used_gb": 23.7, "ram_total_gb": 32.0,
 }
 ROUND = dict(
     connected=True, in_match=True, team="CT", money=4150, map_name="de_mirage",
@@ -121,11 +123,46 @@ def contexts() -> dict[str, NewScreenContext]:
     }
 
 
+DEVICE_SETS = {
+    0: (),
+    1: BATTERIES[:1],
+    2: (BATTERIES[0], BATTERIES[2]),  # mouse + headset, no keyboard
+    3: BATTERIES,
+}
+BATTERY_SCREENS = ("main", "cs2-buy", "cs2-live-dark", "cs2-faceit", "msfs-cruise")
+
+
+def battery_contexts() -> dict[str, NewScreenContext]:
+    """Every screen that shows batteries, with 0/1/2/3 connected devices."""
+    result = {}
+    base = contexts()
+    for name in BATTERY_SCREENS:
+        for count, devices in DEVICE_SETS.items():
+            context = base[name] if count == 0 else contexts()[name]
+            context.batteries = devices
+            result[f"{name}-bat{count}"] = context
+    return result
+
+
+def classic_battery_frames(language: str = "tr"):
+    """Classic (Klasik) idle screen with 0/1/2/3 connected devices."""
+    from app import COLORS, render_screen  # noqa: E402
+    for count, devices in DEVICE_SETS.items():
+        yield f"classic-bat{count}", render_screen(
+            dict(DESKTOP, ram_used=16.6), GameSnapshot(), False, dict(COLORS),
+            battery_devices=devices, language=language,
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", nargs="?", type=Path, default=ROOT / "docs" / "images" / "new")
     parser.add_argument("--language", default="tr", choices=("tr", "en"))
     parser.add_argument("--rotation", default="normal", choices=("normal", "180"))
+    parser.add_argument(
+        "--batteries", action="store_true",
+        help="also write every battery screen with 0/1/2/3 connected devices",
+    )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     suffix = "" if args.language == "tr" else f"-{args.language}"
@@ -141,6 +178,16 @@ def main() -> int:
             rotated = args.output / f"{name}{suffix}-rot180.png"
             orient_frame(frame, "180").save(rotated)
             print(rotated)
+    if args.batteries:
+        for name, context in battery_contexts().items():
+            context.language = args.language
+            path = args.output / f"{name}{suffix}.png"
+            render_new_screen(context).save(path)
+            print(path)
+        for name, frame in classic_battery_frames(args.language):
+            path = args.output / f"{name}{suffix}.png"
+            frame.save(path)
+            print(path)
     return 0
 
 

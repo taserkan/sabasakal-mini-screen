@@ -215,7 +215,7 @@ ENGLISH: dict[str, str] = {
     "Yeni tasarım · MSFS seyir": "New design · MSFS cruise",
     "Hava durumu gösterilecek şehir.": "City to show the weather for.",
     # New design screens
-    "Fare": "Mouse", "Klv": "Kbd", "Kulak": "Head",
+    "Fare": "Mouse", "Klv": "Kbd", "Kulak": "Head", "Cihaz": "Device", "Chz": "Dev",
     "açık": "clear", "parçalı bulutlu": "partly cloudy", "sisli": "foggy",
     "karlı": "snowy", "fırtınalı": "stormy", "yağmurlu": "rainy",
     "yük": "load",

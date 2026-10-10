@@ -61,6 +61,7 @@ THRESHOLDS = {
     ("cpu", "load"): (60.0, 75.0),
     ("gpu", "temp"): (55.0, 65.0),
     ("gpu", "load"): (60.0, 80.0),
+    ("ram", "load"): (70.0, 85.0),
 }
 
 
@@ -283,26 +284,49 @@ def money(value: int | None, language: str = "tr") -> str:
     return "$" + _num(float(value), 0, language)
 
 
-def _batteries_by_kind(devices: Iterable) -> dict[str, BatteryInfo]:
-    found: dict[str, BatteryInfo] = {}
-    leftovers = []
+BATTERY_ORDER = {"mouse": 0, "keyboard": 1, "headset": 2}
+
+
+def present_batteries(devices: Iterable, limit: int = 3) -> list[BatteryInfo]:
+    """Only devices battery_runtime reports as connected and with a reading.
+
+    Absent devices are never drawn (no "—" placeholders); the caller reflows
+    the remaining items over the available space.
+    """
+    items: list[BatteryInfo] = []
+    seen: set[str] = set()
     for device in devices or ():
-        kind = getattr(device, "kind", "other")
         percent = getattr(device, "percent", None)
-        if kind in ("mouse", "keyboard", "headset") and kind not in found:
-            found[kind] = BatteryInfo(kind, percent)
-        else:
-            leftovers.append(BatteryInfo(kind, percent))
-    for slot in ("mouse", "keyboard", "headset"):
-        if slot not in found and leftovers:
-            found[slot] = leftovers.pop(0)
-    return found
+        if percent is None:
+            continue
+        kind = getattr(device, "kind", "other")
+        if kind not in BATTERY_ORDER:
+            kind = "other"
+        if kind != "other" and kind in seen:
+            continue
+        seen.add(kind)
+        items.append(BatteryInfo(kind, max(0, min(100, int(percent)))))
+    items.sort(key=lambda item: BATTERY_ORDER.get(item.kind, 3))
+    return items[: max(0, limit)]
+
+
+def ram_reading(metrics: dict) -> tuple[float | None, float | None, float | None]:
+    """(percent, used GB, total GB) of system RAM, or Nones when unknown."""
+    load = metrics.get("ram_load")
+    used = metrics.get("ram_used_gb", metrics.get("ram_used"))
+    total = metrics.get("ram_total_gb")
+    return (
+        None if load is None else float(load),
+        None if used is None else float(used),
+        None if total is None else float(total),
+    )
 
 
 BATTERY_LABELS = {
     "mouse": ("Fare", "Fare"),
     "keyboard": ("Klavye", "Klv"),
     "headset": ("Kulaklık", "Kulak"),
+    "other": ("Cihaz", "Chz"),
 }
 
 WEATHER_TEXT = {
@@ -329,14 +353,40 @@ def _weather_kind(code: int) -> str:
 # Shared blocks
 # ---------------------------------------------------------------------------
 
-def draw_strip(image: Image.Image, ctx: NewScreenContext, strip_bg: str, accent: str) -> None:
-    """56 px in-game status strip (Strip.dc.html)."""
+def draw_strip(image: Image.Image, ctx: NewScreenContext, strip_bg: str, accent: str,
+               allow_ram: bool = True) -> list[tuple[str, tuple[float, float, float, float]]]:
+    """56 px in-game status strip (Strip.dc.html).
+
+    Returns the drawn items as ``(name, (left, top, right, bottom))``. Battery
+    items exist only for connected devices. RAM is added only when it fits
+    completely between the FPS cell and the battery items.
+    """
     draw = ImageDraw.Draw(image)
     draw.rectangle((0, 0, WIDTH, STRIP_HEIGHT - 4), fill=strip_bg)
     draw.rectangle((0, STRIP_HEIGHT - 3, WIDTH, STRIP_HEIGHT - 1), fill=accent)
     m = ctx.metrics
+    layout: list[tuple[str, tuple[float, float, float, float]]] = []
     x = 12
     label_y, value_y = 20, 45
+    value_font = font(22, True)
+
+    def cell_width(label: str, parts) -> float:
+        width = 0.0
+        for index, (value, _color) in enumerate(parts):
+            if index:
+                width += draw.textlength(" ", font=value_font)
+            width += draw.textlength(value, font=value_font)
+        return max(width, _text_width(draw, label, font(12), 1.0))
+
+    def draw_cell(left: float, label: str, parts) -> float:
+        text(draw, (left, label_y), label, 12, WHITE, anchor="ls", spacing=1.0)
+        cursor = left
+        for index, (value, color) in enumerate(parts):
+            if index:
+                cursor += draw.textlength(" ", font=value_font)
+            cursor += text(draw, (cursor, value_y), value, 22, color, condensed=True, anchor="ls")
+        return left + cell_width(label, parts)
+
     cells = (
         ("CPU", (
             (_pct(m.get("cpu_load")), threshold_color("cpu", "load", m.get("cpu_load"))),
@@ -349,27 +399,41 @@ def draw_strip(image: Image.Image, ctx: NewScreenContext, strip_bg: str, accent:
         ("FPS", ((("—" if ctx.fps is None else str(int(round(ctx.fps)))), TEXT),)),
     )
     for label, parts in cells:
-        text(draw, (x, label_y), label, 12, WHITE, anchor="ls", spacing=1.0)
-        cursor = x
-        for index, (value, color) in enumerate(parts):
-            if index:
-                cursor += draw.textlength(" ", font=font(22, True))
-            cursor += text(draw, (cursor, value_y), value, 22, color, condensed=True, anchor="ls")
-        x = max(cursor, x + _text_width(draw, label, font(12), 1.0)) + 14
+        end = draw_cell(x, label, parts)
+        layout.append((label.lower(), (x, 6, end, value_y + 4)))
+        x = end + 14
 
-    batteries = _batteries_by_kind(ctx.batteries)
-    right = WIDTH - 12
+    # Battery items, right-aligned, measured before anything is drawn.
+    small = font(14)
     center_y = (STRIP_HEIGHT - 3) / 2
-    for kind in ("headset", "keyboard", "mouse"):
-        info = batteries.get(kind)
-        value = _pct(info.percent) if info else "—"
-        color = battery_color(info.percent) if info and info.percent is not None and info.percent <= 30 else TEXT
-        width = text(draw, (right, center_y), value, 14, color, anchor="rm")
-        label = _t(ctx, BATTERY_LABELS[kind][1]) + " "
-        width += text(draw, (right - width, center_y), label, 14, WHITE, anchor="rm")
-        right -= width + 12
-        if right < x + 10:
+    right = WIDTH - 12
+    planned = []
+    for info in reversed(present_batteries(ctx.batteries)):
+        label = _t(ctx, BATTERY_LABELS[info.kind][1]) + " "
+        value = _pct(info.percent)
+        width = draw.textlength(label, font=small) + draw.textlength(value, font=small)
+        if right - width < x:
             break
+        planned.append((info, label, value, right - width, right))
+        right -= width + 12
+    battery_left = planned[-1][3] if planned else WIDTH - 12
+
+    if allow_ram:
+        load, _used, _total = ram_reading(m)
+        if load is not None:
+            parts = ((_pct(load), threshold_color("ram", "load", load)),)
+            width = cell_width("RAM", parts)
+            if x + width <= battery_left - 12:
+                end = draw_cell(x, "RAM", parts)
+                layout.append(("ram", (x, 6, end, value_y + 4)))
+                x = end + 14
+
+    for info, label, value, left, item_right in planned:
+        color = battery_color(info.percent) if info.percent <= 30 else TEXT
+        value_width = text(draw, (item_right, center_y), value, 14, color, anchor="rm")
+        text(draw, (item_right - value_width, center_y), label, 14, WHITE, anchor="rm")
+        layout.append((f"battery:{info.kind}", (left, center_y - 9, item_right, center_y + 9)))
+    return layout
 
 
 def _header(draw, ctx, y: int, left: str, right: str, size: int = 14) -> None:
@@ -454,12 +518,27 @@ def _gpu_details(ctx, include_fps: bool = False) -> list[str]:
     return lines or ["—"]
 
 
-def render_main(ctx: NewScreenContext) -> Image.Image:
-    background = MODE_DESKTOP[0]
-    image = Image.new("RGB", (WIDTH, HEIGHT), background)
-    draw = ImageDraw.Draw(image)
+def main_layout(ctx: NewScreenContext, draw: ImageDraw.ImageDraw | None = None) -> dict:
+    """Boxes of every block of the desktop screen (used by the renderer and tests)."""
+    if draw is None:
+        draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     now = ctx.now or dt.datetime.now()
-    text(draw, (14, 44), now.strftime("%H:%M"), 30, TEXT, condensed=True, anchor="ls")
+    layout: dict = {}
+    clock = now.strftime("%H:%M")
+    clock_width = draw.textlength(clock, font=font(30, True))
+    layout["clock"] = (14, 14, 14 + clock_width, 46)
+    cursor = 14 + clock_width + 14
+    load, used, total = ram_reading(ctx.metrics)
+    if load is not None:
+        parts = [("RAM ", WHITE), (_pct(load), threshold_color("ram", "load", load))]
+        if used is not None and total:
+            parts.append((f" · {used:.1f}/{total:.0f} GB", WHITE))
+        elif used is not None:
+            parts.append((f" · {used:.1f} GB", WHITE))
+        width = sum(draw.textlength(value, font=font(14)) for value, _ in parts)
+        layout["ram"] = (cursor, 28, cursor + width, 44)
+        layout["ram_parts"] = parts
+        cursor += width + 14
     if ctx.weather:
         reading = ctx.weather[0]
         kind = _weather_kind(int(getattr(reading, "weather_code", 0)))
@@ -467,26 +546,83 @@ def render_main(ctx: NewScreenContext) -> Image.Image:
             f"{reading.city} {int(round(reading.temperature_c))}° · "
             f"{_t(ctx, WEATHER_TEXT[kind])}"
         )
-        text(draw, (WIDTH - 14, 42), fit(draw, weather, 14, 300), 14, WHITE, anchor="rs")
+        available = WIDTH - 14 - cursor
+        if available >= 60:
+            weather = fit(draw, weather, 14, min(300, available))
+            width = draw.textlength(weather, font=font(14))
+            layout["weather"] = (WIDTH - 14 - width, 28, WIDTH - 14, 44)
+            layout["weather_text"] = weather
+    batteries = present_batteries(ctx.batteries)
     battery_top = HEIGHT - 14 - 42
-    panels_top, panels_bottom = 60, battery_top - 10
+    panels_bottom = battery_top - 10 if batteries else HEIGHT - 14
     (l1, r1), (l2, r2) = _columns(14, WIDTH - 14, 2, 10)
-    _system_panel(image, draw, (l1, panels_top, r1, panels_bottom), background, "cpu", ctx,
+    layout["cpu"] = (l1, 60, r1, panels_bottom)
+    layout["gpu"] = (l2, 60, r2, panels_bottom)
+    layout["batteries"] = [
+        (info, (left, battery_top, right, HEIGHT - 14))
+        for (left, right), info in zip(_columns(14, WIDTH - 14, len(batteries), 10), batteries)
+    ] if batteries else []
+    return layout
+
+
+def render_main(ctx: NewScreenContext) -> Image.Image:
+    background = MODE_DESKTOP[0]
+    image = Image.new("RGB", (WIDTH, HEIGHT), background)
+    draw = ImageDraw.Draw(image)
+    now = ctx.now or dt.datetime.now()
+    layout = main_layout(ctx, draw)
+    text(draw, (14, 44), now.strftime("%H:%M"), 30, TEXT, condensed=True, anchor="ls")
+    if "ram" in layout:
+        x = layout["ram"][0]
+        for value, color in layout["ram_parts"]:
+            x += text(draw, (x, 42), value, 14, color, anchor="ls")
+    if "weather" in layout:
+        text(draw, (WIDTH - 14, 42), layout["weather_text"], 14, WHITE, anchor="rs")
+    _system_panel(image, draw, layout["cpu"], background, "cpu", ctx,
                   96, TRACK, _cpu_details(ctx), 30, False)
-    _system_panel(image, draw, (l2, panels_top, r2, panels_bottom), background, "gpu", ctx,
+    _system_panel(image, draw, layout["gpu"], background, "gpu", ctx,
                   96, TRACK, _gpu_details(ctx), 30, False)
-    batteries = _batteries_by_kind(ctx.batteries)
-    for (left, right), kind in zip(_columns(14, WIDTH - 14, 3, 10), ("mouse", "keyboard", "headset")):
-        box = (left, battery_top, right, HEIGHT - 14)
+    for info, box in layout["batteries"]:
+        left, battery_top, right, _bottom = box
+        percent = info.percent
         rounded(draw, box, 8, panel_color(background))
-        info = batteries.get(kind)
-        percent = info.percent if info else None
-        text(draw, (left + 10, battery_top + 8), _t(ctx, BATTERY_LABELS[kind][0]), 14, WHITE)
+        text(draw, (left + 10, battery_top + 8), _t(ctx, BATTERY_LABELS[info.kind][0]), 14, WHITE)
         text(draw, (right - 10, battery_top + 8), _pct(percent), 14,
-             battery_color(percent) if percent is not None and percent <= 30 else TEXT, anchor="ra")
+             battery_color(percent) if percent <= 30 else TEXT, anchor="ra")
         progress_bar(draw, (left + 10, battery_top + 28, right - 10, battery_top + 34),
-                     (percent or 0) / 100.0, battery_color(percent))
+                     percent / 100.0, battery_color(percent))
     return image
+
+
+def faceit_battery_layout(ctx: NewScreenContext, draw: ImageDraw.ImageDraw | None = None) -> list:
+    """Placement of the FACEIT battery items; empty when no device is present.
+
+    Each item is ``(info, x, center_y, label, label_width, value, value_width)``.
+    """
+    if draw is None:
+        draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    batteries = present_batteries(ctx.batteries)
+    if not batteries:
+        return []
+    battery_top = HEIGHT - 14 - 39
+    center_y = (battery_top + HEIGHT - 14) / 2
+    items: list = []
+    slots = _columns(26, WIDTH - 26, len(batteries), 10)
+    last = len(batteries) - 1
+    for index, ((left, right), info) in enumerate(zip(slots, batteries)):
+        label = _t(ctx, BATTERY_LABELS[info.kind][0]) + " "
+        value = _pct(info.percent)
+        label_width = draw.textlength(label, font=font(15))
+        value_width = draw.textlength(value, font=font(15))
+        total = label_width + value_width
+        if len(batteries) == 1 or 0 < index < last:
+            x = (left + right - total) / 2
+        elif index == 0:
+            x = left
+        else:
+            x = right - total
+        items.append((info, x, center_y, label, label_width, value, value_width))
+    return items
 
 
 def render_faceit(ctx: NewScreenContext) -> Image.Image:
@@ -496,30 +632,22 @@ def render_faceit(ctx: NewScreenContext) -> Image.Image:
     draw.rectangle((0, 0, WIDTH, 3), fill=accent)
     now = ctx.now or dt.datetime.now()
     _header(draw, ctx, 18, _t(ctx, "FACEIT · sadece sistem verisi"), now.strftime("%H:%M"))
+    items = faceit_battery_layout(ctx, draw)
     battery_top = HEIGHT - 14 - 39
-    panels_top, panels_bottom = 46, battery_top - 10
+    panels_top = 46
+    panels_bottom = battery_top - 10 if items else HEIGHT - 14
     (l1, r1), (l2, r2) = _columns(14, WIDTH - 14, 2, 10)
     track = panel_color(panel_color(background), 0.12)
     _system_panel(image, draw, (l1, panels_top, r1, panels_bottom), background, "cpu", ctx,
                   112, track, _cpu_details(ctx)[:1], 40, True)
     _system_panel(image, draw, (l2, panels_top, r2, panels_bottom), background, "gpu", ctx,
                   112, track, _gpu_details(ctx, include_fps=True)[:1], 40, True)
-    box = (14, battery_top, WIDTH - 14, HEIGHT - 14)
-    rounded(draw, box, 8, panel_color(background))
-    batteries = _batteries_by_kind(ctx.batteries)
-    slots = _columns(26, WIDTH - 26, 3, 10)
-    center_y = (box[1] + box[3]) / 2
-    for index, ((left, right), kind) in enumerate(zip(slots, ("mouse", "keyboard", "headset"))):
-        info = batteries.get(kind)
-        percent = info.percent if info else None
-        value_color = battery_color(percent) if percent is not None and percent <= 30 else TEXT
-        label = _t(ctx, BATTERY_LABELS[kind][0]) + " "
-        label_width = draw.textlength(label, font=font(15))
-        value_width = draw.textlength(_pct(percent), font=font(15))
-        total = label_width + value_width
-        x = left if index == 0 else right - total if index == 2 else (left + right - total) / 2
+    if items:
+        rounded(draw, (14, battery_top, WIDTH - 14, HEIGHT - 14), 8, panel_color(background))
+    for info, x, center_y, label, label_width, value, _value_width in items:
+        value_color = battery_color(info.percent) if info.percent <= 30 else TEXT
         text(draw, (x, center_y), label, 15, WHITE, anchor="lm")
-        text(draw, (x + label_width, center_y), _pct(percent), 15, value_color, anchor="lm")
+        text(draw, (x + label_width, center_y), value, 15, value_color, anchor="lm")
     return image
 
 
@@ -709,7 +837,8 @@ def _duration(ctx, seconds: float | None) -> str:
 def _msfs_base(ctx: NewScreenContext, phase: str) -> tuple[Image.Image, ImageDraw.ImageDraw, str]:
     background, strip_bg, accent = MODE_MSFS[phase]
     image = Image.new("RGB", (WIDTH, HEIGHT), background)
-    draw_strip(image, ctx, strip_bg, accent)
+    # The MSFS screens stay uncluttered: no RAM item in their strip.
+    draw_strip(image, ctx, strip_bg, accent, allow_ram=False)
     return image, ImageDraw.Draw(image), background
 
 
