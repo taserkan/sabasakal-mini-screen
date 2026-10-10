@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 import ctypes
+import dataclasses
 import datetime as dt
 import hashlib
 import json
@@ -50,8 +51,8 @@ from msfs_runtime import (
     FlightPhaseState, FlightPhaseTracker, FlightTelemetry, LandingRecord, MSFSTelemetryMonitor,
 )
 from screens_new import (
-    AlertTracker, NewScreenContext, cs2_menu_status, cs_screen_for, new_design_mode,
-    render_new_screen,
+    AlertTracker, NewScreenContext, ScreenStabilizer, cs2_menu_status, cs_screen_for,
+    new_design_mode, render_new_screen,
 )
 from weather_runtime import (
     DEFAULT_WEATHER_CITIES, WeatherMonitor, WeatherReading, format_city_name,
@@ -226,6 +227,29 @@ NEW_DESIGN_TILES = tuple(
     (left, top, left + 120, top + 40)
     for top in range(0, 320, 40) for left in range(0, 480, 120)
 )
+# Screen-change transition. The Rev-A panel has no double buffer and paints a
+# region top-to-bottom as its bytes arrive, so a mostly-changed frame sent as
+# row-major tiles looks like a slow tear. When at least WIPE_AREA_FRACTION of
+# the panel changes, the same pixels are sent as full-height column strips
+# left-to-right instead: each strip lands in ~1/8 of the transfer time, which
+# reads as a deliberate horizontal wipe. It costs no extra bandwidth (no
+# crossfade frames), so it finishes as fast as one full frame.
+WIPE_STRIP_WIDTH = 60
+WIPE_STRIPS = tuple((left, 0, left + WIPE_STRIP_WIDTH, 320) for left in range(0, 480, WIPE_STRIP_WIDTH))
+WIPE_AREA_FRACTION = 0.45
+
+
+def plan_new_design_update(
+    frame: Image.Image, sent: Image.Image,
+) -> tuple[str, list[tuple[int, int, int, int]]]:
+    """Return ("none"|"tiles"|"wipe", regions) for a Claude-design frame."""
+    regions = _tight_changed_regions(frame, sent, NEW_DESIGN_TILES)
+    if not regions:
+        return "none", []
+    area = sum((r[2] - r[0]) * (r[3] - r[1]) for r in regions)
+    if area >= WIPE_AREA_FRACTION * frame.width * frame.height:
+        return "wipe", _tight_changed_regions(frame, sent, WIPE_STRIPS)
+    return "tiles", regions
 NEW_DESIGN_WORKER_INTERVAL = 0.5
 NEW_DESIGN_MSFS_INTERVAL = 0.25
 DEFAULT_SETTINGS = {
@@ -591,8 +615,13 @@ def shutdown_child_processes() -> None:
         _runtime_log(f"sensor bridge stop failed: {type(exc).__name__}: {exc}")
 
 
+# The host writes the cache every second from a writer that no longer waits
+# for LibreHardwareMonitor; 12 s tolerates disk/AV hiccups under game load.
+SENSOR_CACHE_STALE_SECONDS = 12.0
+
+
 def nudge_sensor_host_if_stale(
-    path: Path = SENSOR_CACHE_PATH, max_age: float = 5.0,
+    path: Path = SENSOR_CACHE_PATH, max_age: float = SENSOR_CACHE_STALE_SECONDS,
 ) -> bool:
     """Restart the invisible child if its sensor cache stops advancing."""
     try:
@@ -2392,7 +2421,7 @@ class ControlPanel(QWidget):
         )
         mode = self.preview_mode
         if mode == "cs2_ct":
-            context = NewScreenContext(**common, mode="cs2", cs_screen="buy", fps=287,
+            context = NewScreenContext(**common, mode="cs2", cs_screen="live", fps=287,
                                        game=GameSnapshot(round_phase="freezetime", **round_data))
         elif mode == "cs2_t":
             context = NewScreenContext(**common, mode="cs2", cs_screen="death", fps=287,
@@ -2617,6 +2646,17 @@ class ControlPanel(QWidget):
         media_render_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media-base-render")
         alert_tracker = AlertTracker()
         phase_tracker = FlightPhaseTracker()
+        screen_stabilizer = ScreenStabilizer()
+        transfer_logs = {"count": 0, "at": -1e9}
+
+        def log_transfer(kind: str, seconds: float, regions: int) -> None:
+            now_t = time.monotonic()
+            if transfer_logs["count"] < 4 or now_t - transfer_logs["at"] >= 600.0:
+                transfer_logs["count"] += 1
+                transfer_logs["at"] = now_t
+                _runtime_log(
+                    f"frame transfer measured; kind={kind}; ms={seconds * 1000:.0f}; regions={regions}"
+                )
         new_design_active = False
         applied_design: str | None = None
 
@@ -2952,6 +2992,18 @@ class ControlPanel(QWidget):
                         flight_state = (
                             phase_tracker.update(flight_telemetry) if msfs_active else None
                         )
+                        requested_cs = cs_screen_for(snapshot) if design_mode == "cs2" else ""
+                        requested_phase = getattr(flight_state, "phase", "") if design_mode == "msfs" else ""
+                        design_mode, shown_cs, shown_phase = screen_stabilizer.update(
+                            (design_mode, requested_cs, requested_phase), cycle_started,
+                        )
+                        if design_mode == "cs2_menu" and not menu_status:
+                            menu_status = cs2_menu_status(
+                                snapshot.connected,
+                                check_gsi_restart(game_active, snapshot.connected),
+                            )
+                        if design_mode == "msfs" and flight_state is not None and shown_phase:
+                            flight_state = dataclasses.replace(flight_state, phase=shown_phase)
                         alerts = (
                             alert_tracker.update(cached_metrics, None, language)
                             if design_mode == "cs2" else ()
@@ -2963,7 +3015,7 @@ class ControlPanel(QWidget):
                             language=language,
                             mode=design_mode,
                             game=snapshot if design_mode == "cs2" else None,
-                            cs_screen=cs_screen_for(snapshot),
+                            cs_screen=shown_cs or "live",
                             alerts=alerts,
                             flight=flight_telemetry,
                             flight_state=flight_state,
@@ -2975,18 +3027,24 @@ class ControlPanel(QWidget):
                         ))
                         media_patch = None
                         if last_view_mode is None or sent_frame is None:
+                            transfer_started = time.monotonic()
                             screen.show(frame)
                             sent_frame = frame.copy()
                             self.screen_connected.set()
                             _runtime_log("first full frame sent (new design)")
+                            log_transfer("full", time.monotonic() - transfer_started, 1)
                         else:
-                            # Send only the pixels that changed; skip the
-                            # transfer entirely when nothing did.
-                            send_regions = _tight_changed_regions(
-                                frame, sent_frame, NEW_DESIGN_TILES,
-                            )
+                            # Send only the pixels that changed; a screen change
+                            # goes out as a left-to-right column wipe.
+                            update_kind, send_regions = plan_new_design_update(frame, sent_frame)
                             if send_regions:
+                                transfer_started = time.monotonic()
                                 screen.show_regions(frame, send_regions)
+                                if update_kind == "wipe":
+                                    log_transfer(
+                                        "wipe", time.monotonic() - transfer_started,
+                                        len(send_regions),
+                                    )
                                 for region in send_regions:
                                     sent_frame.paste(frame.crop(region), region)
                     else:

@@ -61,10 +61,6 @@ def contexts() -> dict[str, NewScreenContext]:
     weather = (WeatherReading("İstanbul", 18.0, 2),)
     return {
         "main": NewScreenContext(DESKTOP, BATTERIES, weather, NOW),
-        "cs2-buy": NewScreenContext(
-            GAMING, BATTERIES, now=NOW, fps=287, mode="cs2", cs_screen="buy",
-            game=GameSnapshot(round_phase="freezetime", alive=True, **ROUND),
-        ),
         "cs2-death": NewScreenContext(
             GAMING, BATTERIES, now=NOW, fps=287, mode="cs2", cs_screen="death",
             game=GameSnapshot(round_phase="live", alive=False, round_kills=2,
@@ -136,7 +132,7 @@ DEVICE_SETS = {
     2: (BATTERIES[0], BATTERIES[2]),  # mouse + headset, no keyboard
     3: BATTERIES,
 }
-BATTERY_SCREENS = ("main", "cs2-buy", "cs2-live-dark", "cs2-faceit", "msfs-cruise")
+BATTERY_SCREENS = ("main", "cs2-live-dark", "cs2-faceit", "msfs-cruise")
 
 
 def dpi_warning_context() -> NewScreenContext:

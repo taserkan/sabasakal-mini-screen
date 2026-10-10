@@ -139,7 +139,7 @@ class NewScreenContext:
     fps: float | None = None
     mode: str = "desktop"  # desktop | cs2 | cs2_menu | faceit | msfs
     game: object | None = None  # app.GameSnapshot
-    cs_screen: str = "live"  # buy | death | live
+    cs_screen: str = "live"  # death | live
     alerts: tuple = ()
     ping_ms: float | None = None
     flight: object | None = None  # msfs_runtime.FlightTelemetry
@@ -689,97 +689,10 @@ def render_faceit(ctx: NewScreenContext) -> Image.Image:
 # CS2 on Valve servers (official GSI only)
 # ---------------------------------------------------------------------------
 
-def loss_award(loss_streak: int | None, team: str = "", bomb_planted: bool = False) -> int | None:
-    """Money awarded if the team loses the *next* round (CS2 competitive).
-
-    map.team_X.consecutive_round_losses is the team's loss counter. Losing
-    the next round pays 1400 + 500 x counter, capped at 3400. A T-side bomb
-    plant adds 600.
-    """
-    if loss_streak is None:
-        return None
-    award = 1400 + 500 * max(0, min(4, int(loss_streak)))
-    if team == "T" and bomb_planted:
-        award += 600
-    return award
-
-
-FULL_BUY_COST = {"CT": 4100, "T": 3700}
-
-
-def buy_suggestion(money_now: int | None, team: str, award: int | None,
-                   round_number: int | None, half_length: int = 12) -> str:
-    """FULL BUY / ECO / FORCE from money, team and the guaranteed loss award."""
-    if money_now is None:
-        return ""
-    cost = FULL_BUY_COST.get(team, 3900)
-    if money_now >= cost:
-        return "full"
-    last_of_half = round_number is not None and round_number in (half_length, half_length * 2)
-    if last_of_half:
-        return "force"  # money resets after the half: nothing to save for
-    if award is not None and money_now + award >= cost:
-        return "eco"  # saving now guarantees a full buy next round
-    return "force"
-
-
-SUGGESTION_STYLE = {
-    "full": ("FULL BUY", GREEN, "#08240F"),
-    "eco": ("ECO", RED, "#2A0B0B"),
-    "force": ("FORCE", ORANGE, "#2A1604"),
-}
-
-
 def _score_text(game) -> tuple[str, str]:
     ct = "—" if game.score_ct is None else str(game.score_ct)
     t = "—" if game.score_t is None else str(game.score_t)
     return ct, t
-
-
-def render_cs_buy(ctx: NewScreenContext) -> Image.Image:
-    background, strip_bg, accent = MODE_CS2
-    image = Image.new("RGB", (WIDTH, HEIGHT), background)
-    draw_strip(image, ctx, strip_bg, accent)
-    draw = ImageDraw.Draw(image)
-    game = ctx.game
-    ct, t = _score_text(game)
-    round_label = (
-        _t(ctx, "SATIN ALMA · Round {n}", n=game.round_number)
-        if game.round_number else _t(ctx, "SATIN ALMA")
-    )
-    _header(draw, ctx, 68, round_label, f"CT {ct} – {t} T")
-    text(draw, (14, 96), _t(ctx, "Paran"), 14, WHITE)
-    text(draw, (14, 166), money(game.money, ctx.language), 58, TEXT, condensed=True, anchor="ls")
-    award = loss_award(game.loss_streak, game.team, game.bomb_planted)
-    if award is None:
-        award = game.loss_bonus
-    suggestion = buy_suggestion(game.money, game.team, award, game.round_number)
-    if suggestion:
-        label, fill, ink = SUGGESTION_STYLE[suggestion]
-        width = int(draw.textlength(label, font=font(34, True))) + 36
-        box = (WIDTH - 14 - width, 104, WIDTH - 14, 158)
-        rounded(draw, box, 10, fill)
-        text(draw, ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2 + 1), label, 34, ink,
-             condensed=True, anchor="mm")
-    next_min = None
-    if game.money is not None and award is not None:
-        next_min = min(16000, game.money + award)
-    cells = (
-        (_t(ctx, "Kayıp serisi"), "—" if game.loss_streak is None else str(game.loss_streak)),
-        (_t(ctx, "Kaybedersen"), "—" if award is None else "+" + money(award, ctx.language)),
-        (_t(ctx, "Sonraki round min."), money(next_min, ctx.language)),
-    )
-    top = 182
-    for (left, right), (label, value) in zip(_columns(14, WIDTH - 14, 3, 8), cells):
-        rounded(draw, (left, top, right, top + 58), 8, panel_color(background))
-        text(draw, (left + 8, top + 8), fit(draw, label, 13, right - left - 16), 13, WHITE)
-        text(draw, (left + 8, top + 50), value, 20, TEXT, anchor="ls")
-    if game.match_kills is not None:
-        summary = _t(ctx, "Maç K/D/A {k} / {d} / {a}", k=game.match_kills,
-                     d=game.match_deaths if game.match_deaths is not None else "—",
-                     a=game.match_assists if game.match_assists is not None else "—")
-        text(draw, (14, 266), summary, 14, WHITE)
-    return image
 
 
 def render_cs_death(ctx: NewScreenContext) -> Image.Image:
@@ -1172,15 +1085,53 @@ MSFS_RENDERERS = {
 # ---------------------------------------------------------------------------
 
 def cs_screen_for(game) -> str:
-    """Pick buy / death / live from official GSI round state."""
+    """Pick death / live from official GSI round state.
+
+    Freezetime (buy phase) uses the live-round screen so the display does not
+    jump between layouts at round start."""
     if game is None:
         return "live"
     phase = getattr(game, "round_phase", "")
-    if phase == "freezetime":
-        return "buy"
     if phase == "over" or getattr(game, "alive", None) is False:
         return "death"
     return "live"
+
+
+class ScreenStabilizer:
+    """Hysteresis for screen switches so the LCD never flaps between layouts.
+
+    A cross-family switch (desktop / CS2 / MSFS) repaints most of the panel
+    over serial, so a requested screen must be
+
+    * requested continuously for ``confirm`` seconds (debounces GSI phase
+      flicker such as live -> over -> live on a respawn), and
+    * the currently shown screen must have been up for ``min_dwell`` seconds.
+
+    FACEIT is a safety mode and is always applied immediately.
+    """
+
+    def __init__(self, min_dwell: float = 2.5, confirm: float = 0.6) -> None:
+        self.min_dwell = min_dwell
+        self.confirm = confirm
+        self.shown: tuple | None = None
+        self._shown_since = 0.0
+        self._pending: tuple | None = None
+        self._pending_since = 0.0
+
+    def update(self, requested: tuple, now: float | None = None) -> tuple:
+        now = time.monotonic() if now is None else now
+        if self.shown is None or requested == self.shown or requested[0] == "faceit":
+            if requested != self.shown:
+                self._shown_since = now
+            self.shown = requested
+            self._pending = None
+            return self.shown
+        if requested != self._pending:
+            self._pending, self._pending_since = requested, now
+        if (now - self._pending_since >= self.confirm
+                and now - self._shown_since >= self.min_dwell):
+            self.shown, self._shown_since, self._pending = requested, now, None
+        return self.shown
 
 
 class AlertTracker:
@@ -1233,7 +1184,7 @@ def render_new_screen(ctx: NewScreenContext) -> Image.Image:
         return render_faceit(ctx)
     if ctx.mode == "cs2" and ctx.game is not None:
         return {
-            "buy": render_cs_buy, "death": render_cs_death,
+            "death": render_cs_death,
         }.get(ctx.cs_screen, render_cs_live)(ctx)
     if ctx.mode in ("cs2", "cs2_menu"):
         return render_cs_menu(ctx)
@@ -1244,6 +1195,6 @@ def render_new_screen(ctx: NewScreenContext) -> Image.Image:
 
 
 __all__ = [
-    "AlertTracker", "BatteryInfo", "NewScreenContext", "buy_suggestion", "cs_screen_for",
-    "loss_award", "new_design_mode", "render_new_screen", "threshold_color",
+    "AlertTracker", "BatteryInfo", "NewScreenContext", "ScreenStabilizer", "cs_screen_for",
+    "new_design_mode", "render_new_screen", "threshold_color",
 ]

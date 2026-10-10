@@ -38,8 +38,9 @@ battery information in one compact, themeable interface.
 - CS2 pre-queue Valve/FACEIT ping view using non-invasive public/local data
 - Two screen designs selectable in the control panel: **Claude** (new, default)
   and **Codex** (classic)
-- CS2 competitive/Wingman economy and deathmatch statistics (the bomb timer was
-  removed in 1.1.0)
+- CS2 live-round, round-over and deathmatch statistics (Codex design also
+  shows the competitive/Wingman money panel; the Claude buy-phase screen was
+  removed in 1.1.4; the bomb timer was removed in 1.1.0)
 - FACEIT safety mode: while FACEIT Anti-Cheat runs, the Game State Integration
   listener is stopped and only system panels are shown
 - MSFS 2024 altitude, airspeed, vertical speed and heading panels
@@ -58,7 +59,7 @@ battery information in one compact, themeable interface.
 ### Claude design (new)
 
 ![CS2 live panel, new design](docs/images/new/cs2-live-dark-en.png)
-![CS2 buy panel, new design](docs/images/new/cs2-buy-en.png)
+![CS2 round-over panel, new design](docs/images/new/cs2-death-en.png)
 ![MSFS cruise panel, new design](docs/images/new/msfs-cruise-en.png)
 
 ### Codex design (classic): CT / T panels

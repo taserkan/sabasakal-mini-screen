@@ -225,9 +225,7 @@ ENGLISH: dict[str, str] = {
     "CS2 · Menü": "CS2 · Menu",
     "CS2'yi yeniden başlatın: oyun verisi için yeni GSI ayarı yüklenmeli":
         "Restart CS2: it must load the new GSI config to send game data",
-    "SATIN ALMA": "BUY PHASE", "SATIN ALMA · Round {n}": "BUY PHASE · Round {n}",
-    "Paran": "Your money", "Kayıp serisi": "Loss streak",
-    "Sonraki round min.": "Next round min.",
+    
     "Maç K/D/A {k} / {d} / {a}": "Match K/D/A {k} / {d} / {a}",
     "BU ROUND": "THIS ROUND", "Hasar": "Damage", "MAÇ K/D": "MATCH K/D",
     "Asist": "Assists", "Skor": "Score",

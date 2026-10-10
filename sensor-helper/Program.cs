@@ -192,36 +192,76 @@ internal static class Program
             catch { /* keep default priority */ }
             computer.Open();
             UpdateVisitor visitor = new();
+            // LibreHardwareMonitor's Update() can stall for seconds while a game
+            // saturates the CPU (BelowNormal priority, SMU/MSR contention). In
+            // v1.1.3 the cache write sat behind it, the file stopped advancing
+            // and the UI watchdog restarted the host ("stale sensor cache").
+            // Sampling now runs on its own thread; the writer below publishes
+            // the latest values on a fixed 1 s cadence regardless.
+            object gate = new();
+            float? cpuTemp = null, cpuClock = null, cpuPower = null;
+            long lastSampleTicks = Environment.TickCount64;
+            using CancellationTokenSource stop = new();
+            Thread sampler = new(() =>
+            {
+                while (!stop.IsCancellationRequested)
+                {
+                    try
+                    {
+                        computer.Accept(visitor);
+                        ISensor[] all = Sensors(computer).ToArray();
+                        ISensor[] cpu = all
+                            .Where(sensor => sensor.Hardware.HardwareType == HardwareType.Cpu)
+                            .ToArray();
+                        float? temp = FirstValue(
+                            cpu, SensorType.Temperature,
+                            "Tctl/Tdie", "CPU Package", "Core (Tctl/Tdie)",
+                            "CPU (Tctl/Tdie)", "CPU", "Core Average");
+                        temp ??= AverageValue(
+                            cpu, SensorType.Temperature,
+                            sensor => sensor.Name.Contains("Core", StringComparison.OrdinalIgnoreCase));
+                        float? clock = FirstValue(
+                            cpu, SensorType.Clock,
+                            "Cores (Average Effective)", "Cores (Average)", "Core #1");
+                        clock ??= AverageValue(
+                            cpu, SensorType.Clock,
+                            sensor => sensor.Name.StartsWith("CPU Core", StringComparison.OrdinalIgnoreCase));
+                        float? power = FirstValue(
+                            cpu, SensorType.Power, "Package", "CPU Package", "CPU Cores");
+                        lock (gate)
+                        {
+                            cpuTemp = temp; cpuClock = clock; cpuPower = power;
+                            lastSampleTicks = Environment.TickCount64;
+                        }
+                    }
+                    catch (Exception sampleError)
+                    {
+                        AppendErrorLog(cachePath, sampleError);
+                    }
+                    // 1 s like Task Manager; 2 s while a game runs (performance mode).
+                    stop.Token.WaitHandle.WaitOne(GameRunning() ? 2000 : 1000);
+                }
+            }) { IsBackground = true, Name = "LhmSampler" };
+            sampler.Start();
             int consecutiveWriteErrors = 0;
             while (OwnerIsAlive(ownerPath))
             {
-                computer.Accept(visitor);
-                ISensor[] all = Sensors(computer).ToArray();
-                ISensor[] cpu = all
-                    .Where(sensor => sensor.Hardware.HardwareType == HardwareType.Cpu)
-                    .ToArray();
-
-                float? cpuTemp = FirstValue(
-                    cpu, SensorType.Temperature,
-                    "Tctl/Tdie", "CPU Package", "Core (Tctl/Tdie)",
-                    "CPU (Tctl/Tdie)", "CPU", "Core Average");
-                cpuTemp ??= AverageValue(
-                    cpu, SensorType.Temperature,
-                    sensor => sensor.Name.Contains("Core", StringComparison.OrdinalIgnoreCase));
-
-                float? cpuClock = FirstValue(
-                    cpu, SensorType.Clock,
-                    "Cores (Average Effective)", "Cores (Average)", "Core #1");
-                cpuClock ??= AverageValue(
-                    cpu, SensorType.Clock,
-                    sensor => sensor.Name.StartsWith("CPU Core", StringComparison.OrdinalIgnoreCase));
-
-                float? cpuPower = FirstValue(
-                    cpu, SensorType.Power, "Package", "CPU Package", "CPU Cores");
-
+                float? temp, clock, power;
+                long sampleAge;
+                lock (gate)
+                {
+                    temp = cpuTemp; clock = cpuClock; power = cpuPower;
+                    sampleAge = Environment.TickCount64 - lastSampleTicks;
+                }
+                // A sampler wedged for a full minute is a real hang: exit so the
+                // UI starts a fresh host instead of showing frozen values.
+                if (sampleAge > 60_000)
+                    return 2;
+                if (sampleAge > 15_000)
+                    temp = clock = power = null;
                 try
                 {
-                    WriteCache(cachePath, cpuTemp, cpuClock, cpuPower);
+                    WriteCache(cachePath, temp, clock, power);
                     consecutiveWriteErrors = 0;
                 }
                 catch (Exception writeError) when (
@@ -229,14 +269,14 @@ internal static class Program
                 {
                     // A reader (antivirus, the UI, a backup tool) can hold the
                     // cache open without delete sharing for a moment. Keep the
-                    // sensor loop alive and retry on the next tick.
+                    // loop alive and retry on the next tick.
                     consecutiveWriteErrors++;
                     if (consecutiveWriteErrors == 1 || consecutiveWriteErrors % 120 == 0)
                         AppendErrorLog(cachePath, writeError);
                 }
-                // 1 s like Task Manager; 2 s while a game runs (performance mode).
-                await Task.Delay(GameRunning() ? 2000 : 1000);
+                await Task.Delay(1000);
             }
+            stop.Cancel();
             return 0;
         }
         catch (Exception exception)

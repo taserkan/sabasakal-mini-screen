@@ -2221,6 +2221,25 @@ class UiAndConnectionScenarios(unittest.TestCase):
             self.assertTrue(gui.nudge_sensor_host_if_stale(missing))
         ensure.assert_called_once_with(restart=True)
 
+    def test_perf_mode_cache_age_is_not_treated_as_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            gui, "ensure_sensor_host",
+        ) as ensure:
+            cache = Path(directory) / "cache.json"
+            cache.write_text("{}", encoding="utf-8")
+            old = time.time() - 8.0  # a 2 s perf-mode tick plus a slow LHM pass
+            os.utime(cache, (old, old))
+            self.assertFalse(gui.nudge_sensor_host_if_stale(cache))
+        ensure.assert_not_called()
+
+    def test_sensor_host_writer_does_not_wait_for_lhm_update(self) -> None:
+        source = (Path(__file__).parent / "sensor-helper" / "Program.cs").read_text(encoding="utf-8")
+        sampler, writer = source.split("sampler.Start();", 1)
+        self.assertIn("computer.Accept(visitor)", sampler)
+        self.assertNotIn("computer.Accept", writer)
+        self.assertIn("WriteCache(", writer)
+        self.assertIn("Task.Delay(1000)", writer)
+
     def test_new_sensor_host_gets_first_sample_grace_period(self) -> None:
         fake = SimpleNamespace(poll=lambda: None)
         previous = gui._SENSOR_HOST_PROCESS
@@ -2855,21 +2874,53 @@ class RedesignAndFixScenarios(unittest.TestCase):
             self.assertEqual(sn.threshold_color(component, kind, value), expected,
                              (component, kind, value))
 
-    def test_loss_award_and_buy_suggestion(self) -> None:
+    def test_screen_stabilizer_dwell_and_debounce(self) -> None:
         import screens_new as sn
-        self.assertEqual(sn.loss_award(0), 1400)
-        self.assertEqual(sn.loss_award(2), 2400)
-        self.assertEqual(sn.loss_award(9), 3400)
-        self.assertEqual(sn.loss_award(1, "T", bomb_planted=True), 2500)
-        self.assertEqual(sn.buy_suggestion(4150, "CT", 2400, 14), "full")
-        self.assertEqual(sn.buy_suggestion(2000, "CT", 2400, 5), "eco")
-        self.assertEqual(sn.buy_suggestion(1200, "T", 1900, 5), "force")
-        self.assertEqual(sn.buy_suggestion(2000, "CT", 2400, 12), "force")
+        st = sn.ScreenStabilizer(min_dwell=2.5, confirm=0.6)
+        live, death, menu = ("cs2", "live", ""), ("cs2", "death", ""), ("cs2_menu", "", "")
+        self.assertEqual(st.update(live, 0.0), live)  # first screen is immediate
+        self.assertEqual(st.update(death, 1.0), live)  # dwell not reached
+        self.assertEqual(st.update(death, 2.0), live)
+        self.assertEqual(st.update(death, 2.6), death)  # dwell + confirm satisfied
+        # A short GSI flicker never reaches the panel.
+        self.assertEqual(st.update(live, 6.0), death)
+        self.assertEqual(st.update(death, 6.3), death)
+        self.assertEqual(st.update(live, 6.4), death)
+        self.assertEqual(st.update(live, 6.9), death)  # pending restarted at 6.4
+        self.assertEqual(st.update(live, 7.1), live)
+        # Flapping between two requests resets confirmation each time.
+        for t in (10.0, 10.3, 10.6, 10.9, 11.2):
+            self.assertEqual(st.update(menu if int(t * 10) % 2 == 0 else live, t), live)
+        # FACEIT safety mode is applied at once.
+        self.assertEqual(st.update(("faceit", "", ""), 11.3), ("faceit", "", ""))
+
+    def test_large_screen_change_is_sent_as_column_wipe(self) -> None:
+        from PIL import Image
+        old = Image.new("RGB", (480, 320), "#0B0F14")
+        new = Image.new("RGB", (480, 320), "#1C1305")
+        kind, regions = gui.plan_new_design_update(new, old)
+        self.assertEqual(kind, "wipe")
+        self.assertEqual([r[0] for r in regions], sorted(r[0] for r in regions))
+        self.assertTrue(all(r[1] == 0 and r[3] == 320 for r in regions))
+        small = old.copy()
+        small.paste("#FFFFFF", (10, 10, 60, 30))
+        kind, regions = gui.plan_new_design_update(small, old)
+        self.assertEqual((kind, regions), ("tiles", [(10, 10, 60, 30)]))
+        self.assertEqual(gui.plan_new_design_update(old, old.copy()), ("none", []))
+
+    def test_buy_phase_economy_screen_is_removed(self) -> None:
+        import screens_new as sn
+        for name in ("loss_award", "buy_suggestion", "render_cs_buy", "SUGGESTION_STYLE"):
+            self.assertFalse(hasattr(sn, name), name)
+        ctx = sn.NewScreenContext({}, (), mode="cs2", cs_screen="buy",
+                                  game=screen_app.GameSnapshot(connected=True, in_match=True,
+                                                               round_phase="freezetime", money=4150))
+        self.assertEqual(sn.render_new_screen(ctx).size, (sn.WIDTH, sn.HEIGHT))
 
     def test_cs_screen_selection_uses_official_round_phase(self) -> None:
         import screens_new as sn
         snap = screen_app.GameSnapshot
-        self.assertEqual(sn.cs_screen_for(snap(round_phase="freezetime")), "buy")
+        self.assertEqual(sn.cs_screen_for(snap(round_phase="freezetime")), "live")
         self.assertEqual(sn.cs_screen_for(snap(round_phase="live", alive=False)), "death")
         self.assertEqual(sn.cs_screen_for(snap(round_phase="over", alive=True)), "death")
         self.assertEqual(sn.cs_screen_for(snap(round_phase="live", alive=True)), "live")
@@ -3593,7 +3644,7 @@ class DesignSwitchScenarios(Fix111Base):
             "faceit": ({"faceit": True, "cs2": True}, "faceit"),
             "msfs": ({"msfs": True}, "msfs"),
         }
-        expected_screen = {"cs2-buy": "buy", "cs2-death": "death", "cs2-live": "live"}
+        expected_screen = {"cs2-buy": "live", "cs2-death": "death", "cs2-live": "live"}
         for name, (kwargs, mode) in cases.items():
             with self.subTest(case=name):
                 panel = self.make_panel({"design": "new"})
@@ -4550,7 +4601,7 @@ class Cs2MenuMode113Tests(unittest.TestCase):
         def game(**kw):
             return screen_app.GameSnapshot(connected=True, in_match=True, **kw)
 
-        self.assertEqual(sn.cs_screen_for(game(round_phase="freezetime", alive=True)), "buy")
+        self.assertEqual(sn.cs_screen_for(game(round_phase="freezetime", alive=True)), "live")
         self.assertEqual(sn.cs_screen_for(game(round_phase="live", alive=True)), "live")
         self.assertEqual(sn.cs_screen_for(game(round_phase="live", alive=False)), "death")
         self.assertEqual(sn.cs_screen_for(game(round_phase="over", alive=True)), "death")
@@ -4691,7 +4742,7 @@ class GsiReplay113Tests(unittest.TestCase):
     def test_match_payloads_select_round_screens(self) -> None:
         import screens_new as sn
         for phase, health, expected in (
-            ("warmup", 100, "live"), ("live", 100, "live"), ("freeze", 100, "buy"),
+            ("warmup", 100, "live"), ("live", 100, "live"), ("freeze", 100, "live"),
             ("live", 0, "death"),
         ):
             self.assertEqual(self.post(self.match_payload(phase, health)), 200)
@@ -4761,6 +4812,50 @@ class BatteryDiscoveryRetry113Tests(unittest.TestCase):
                 patch.object(monitor._stop, "wait", side_effect=stop_wait):
             monitor._scan_windows_loop()
         self.assertEqual(monitor._current_windows_devices()[0], [known])
+
+    def test_windows_scan_never_uses_association_endpoint_inquiry(self) -> None:
+        import asyncio
+        import battery_runtime
+        kinds_seen = []
+
+        class Dev:
+            def __init__(self, name, percent):
+                self.name, self.id, self.is_enabled = name, "id-" + name, True
+                self.properties = {"System.Devices.BatteryLife": percent,
+                                   "System.Devices.ContainerId": "c-" + name}
+
+        async def fake_find(aqs, props, kind):
+            kinds_seen.append(kind)
+            if kind == battery_runtime.DeviceInformationKind.ASSOCIATION_ENDPOINT:
+                raise OSError(-2147467260, "operation aborted")  # E_ABORT after ~60 s inquiry
+            return [Dev("Headset", 55)] if kind == battery_runtime.DeviceInformationKind.DEVICE_CONTAINER else []
+
+        devices = asyncio.run(battery_runtime.BatteryDeviceMonitor._scan_windows(find=fake_find))
+        self.assertNotIn(battery_runtime.DeviceInformationKind.ASSOCIATION_ENDPOINT, kinds_seen)
+        self.assertEqual([(d.name, d.percent) for d in devices], [("Headset", 55)])
+
+    def test_one_aborted_kind_keeps_other_kinds(self) -> None:
+        import asyncio
+        import battery_runtime
+        K = battery_runtime.DeviceInformationKind
+
+        class Dev:
+            name, id, is_enabled = "Speaker", "id-s", True
+            properties = {"System.Devices.BatteryLife": 40}
+
+        async def fake_find(aqs, props, kind):
+            if kind == K.DEVICE:
+                raise OSError(-2147467260, "operation aborted")
+            return [Dev()]
+
+        devices = asyncio.run(battery_runtime.BatteryDeviceMonitor._scan_windows(find=fake_find))
+        self.assertEqual([d.percent for d in devices], [40])
+
+        async def all_abort(aqs, props, kind):
+            raise OSError(-2147467260, "operation aborted")
+
+        with self.assertRaises(OSError):
+            asyncio.run(battery_runtime.BatteryDeviceMonitor._scan_windows(find=all_abort))
 
     def test_distinct_error_is_logged_at_most_every_five_minutes(self) -> None:
         seen: dict[str, float] = {}

@@ -498,6 +498,11 @@ def probe_lghub_input_batteries(
 
 WINDOWS_SCAN_KEEP_FAILURES = 3
 WINDOWS_SCAN_MAX_BACKOFF = 120.0
+# Cache-backed kinds only; see BatteryDeviceMonitor._scan_windows.
+WINDOWS_SCAN_KINDS = (
+    DeviceInformationKind.DEVICE_CONTAINER,
+    DeviceInformationKind.DEVICE,
+)
 
 
 class BatteryDeviceMonitor:
@@ -737,17 +742,30 @@ class BatteryDeviceMonitor:
                 self._stop.wait(min(30.0, 1.0 * (2 ** min(failures - 1, 5))))
 
     @staticmethod
-    async def _scan_windows() -> list[BatteryDevice]:
+    async def _scan_windows(find=None, kinds=None) -> list[BatteryDevice]:
+        """Read battery levels from the PnP cache (containers + device nodes).
+
+        AssociationEndpoint enumeration is deliberately not used: with any AQS
+        it starts an active Bluetooth/WSD/UPnP inquiry that takes 30-60 s and
+        Windows aborts it from time to time (E_ABORT 0x80004004, "operation
+        aborted"), which v1.1.3 logged every few minutes. Paired Bluetooth
+        devices that report a battery expose the same System.Devices.BatteryLife
+        on their device container, which is served from cache instantly.
+        One failing kind no longer discards the others; only a scan where
+        every kind fails raises.
+        """
+        if find is None:
+            find = DeviceInformation.find_all_async_with_kind_aqs_filter_and_additional_properties
+        if kinds is None:
+            kinds = WINDOWS_SCAN_KINDS
         found: list[BatteryDevice] = []
-        kinds = (
-            DeviceInformationKind.ASSOCIATION_ENDPOINT,
-            DeviceInformationKind.DEVICE_CONTAINER,
-            DeviceInformationKind.DEVICE,
-        )
+        errors: list[Exception] = []
         for kind in kinds:
-            devices = await DeviceInformation.find_all_async_with_kind_aqs_filter_and_additional_properties(
-                "", BATTERY_PROPERTIES, kind,
-            )
+            try:
+                devices = await find("", BATTERY_PROPERTIES, kind)
+            except OSError as exc:
+                errors.append(exc)
+                continue
             for device in devices:
                 properties = dict(device.properties)
                 raw_percent = properties.get("System.Devices.BatteryLife")
@@ -779,6 +797,8 @@ class BatteryDeviceMonitor:
                     ),
                     charging=bool(properties.get("System.Devices.BatteryPlusCharging", False)),
                 ))
+        if errors and len(errors) == len(kinds):
+            raise errors[0]
         return found
 
     @staticmethod
