@@ -1,6 +1,13 @@
 # Sabasakal Mini Screen 3.5″
 
-Sürüm 1.1.1
+Sürüm 1.1.2
+
+1.1.2 düzeltmeleri: "Kaydet ve başlat" artık seçilen tasarımı, ekran yönünü ve
+diğer ayarları ekran başlamadan önce gerçekten kaydediyor (1.1.1'de bir Qt
+sinyal argümanı kaydı atlatıyordu). Tasarımların adı artık Claude (varsayılan)
+ve Codex; MSFS görünüm seçicisi yalnızca Codex'te görünür, Claude tek şehir
+(ilk şehir kutusu) için hava durumu gösterir, Codex üç şehri korur. Ekran yönü
+ekran çalışırken de değiştirilebilir.
 
 1.1.1 düzeltmeleri: "Ekran" kartındaki seçiciler artık üst üste binmiyor,
 180° ekran yönü LCD'de gerçekten uygulanıyor (iki tasarımda da, USB yeniden
@@ -25,8 +32,8 @@ otomasyonu veya paket yakalama yapmaz.
 
 1.1.0 ile gelenler:
 
-- Kontrol panelinden seçilebilen iki ekran tasarımı: **Yeni** (varsayılan) ve
-  **Klasik**.
+- Kontrol panelinden seçilebilen iki ekran tasarımı: **Claude** (varsayılan) ve
+  **Codex**.
 - FACEIT güvenlik modu: FACEIT Anti-Cheat çalışırken Game State Integration
   dinleyicisi kapatılır, yalnızca sistem panelleri gösterilir.
 - Bomba sayacı kaldırıldı.

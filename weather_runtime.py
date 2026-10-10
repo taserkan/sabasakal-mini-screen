@@ -23,9 +23,24 @@ KNOWN_CITY_COORDINATES = {
 }
 
 
+_MOJIBAKE_MARKERS = ("Ã", "Ä", "Å", "Â")
+
+
+def repair_mojibake(text: str) -> str:
+    """Undo UTF-8 text that was decoded as cp1252/latin-1 (e.g. "MuÄŸla")."""
+    if not any(marker in text for marker in _MOJIBAKE_MARKERS):
+        return text
+    for codec in ("cp1252", "latin-1"):
+        try:
+            return text.encode(codec).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    return text
+
+
 def format_city_name(value: object) -> str:
     """Return a tidy city label using Turkish dotted/dotless-I casing."""
-    text = " ".join(str(value).strip().split())[:24]
+    text = " ".join(repair_mojibake(str(value)).strip().split())[:24]
 
     def capitalise(part: str) -> str:
         if not part:

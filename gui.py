@@ -58,7 +58,7 @@ from i18n import SUPPORTED_LANGUAGES, normalize_language, translate
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -199,10 +199,23 @@ MSFS_LAYOUTS = {
     "Klasik": "classic",
     "Kokpit şeridi": "cockpit",
 }
+# Display names are product names and are not translated. Internal keys
+# stay "new"/"classic" so existing settings files keep working.
 DESIGNS = {
-    "Yeni": "new",
-    "Klasik": "classic",
+    "Claude": "new",
+    "Codex": "classic",
 }
+
+
+def weather_cities_for_design(settings: dict) -> tuple[str, ...]:
+    """Claude (new) design shows one city: the first weather_cities entry.
+
+    The full three-city list stays stored for the Codex (classic) design.
+    """
+    cities = normalise_city_names(settings.get("weather_cities"))
+    if settings.get("design") == "classic":
+        return cities
+    return cities[:1]
 # Partition used to send only the changed pixels of a new-design frame.
 NEW_DESIGN_TILES = tuple(
     (left, top, left + 120, top + 40)
@@ -1445,8 +1458,7 @@ class ControlPanel(QWidget):
         self.rotation_combo.addItem("180°", "180")
         selected_rotation = "180" if self.settings.get("rotation") == "180" else "normal"
         self.rotation_combo.setCurrentIndex(self.rotation_combo.findData(selected_rotation))
-        self.rotation_combo.currentIndexChanged.connect(self._refresh_preview)
-        self.edit_controls.append(self.rotation_combo)
+        self.rotation_combo.currentIndexChanged.connect(self._rotation_changed)
 
         self.design_combo = QComboBox()
         for label, value in DESIGNS.items():
@@ -1454,9 +1466,9 @@ class ControlPanel(QWidget):
         self.design_combo.setCurrentIndex(
             max(0, self.design_combo.findData(self.settings.get("design", "new")))
         )
-        self.design_combo.currentIndexChanged.connect(self._refresh_preview)
+        self.design_combo.currentIndexChanged.connect(self._design_changed)
         self.design_combo.setToolTip(
-            "Yeni: oyuna ve uçuş evresine göre değişen sade ekranlar. Klasik: önceki görünüm."
+            "Claude: oyuna ve uçuş evresine göre değişen sade ekranlar. Codex: önceki görünüm."
         )
         self.edit_controls.append(self.design_combo)
 
@@ -1481,7 +1493,10 @@ class ControlPanel(QWidget):
             combo.setFixedHeight(34)
             combo.setMinimumWidth(150)
             combo.setStyleSheet("padding: 4px 10px;")
-            selector_grid.addWidget(self._label(caption, "device"), row, 0)
+            caption_label = self._label(caption, "device")
+            if combo is self.msfs_layout_combo:
+                self.msfs_layout_caption = caption_label
+            selector_grid.addWidget(caption_label, row, 0)
             selector_grid.addWidget(combo, row, 1)
         screen_form.addLayout(selector_grid)
 
@@ -1555,6 +1570,7 @@ class ControlPanel(QWidget):
             self.edit_controls.append(city_input)
             weather_line.addWidget(city_input, 1)
         hardware_form.addLayout(weather_line)
+        self._sync_design_dependent_controls()
         quick_columns.addWidget(hardware_box, 1)
         left_layout.addWidget(self.quick_card)
 
@@ -1778,6 +1794,7 @@ class ControlPanel(QWidget):
             self.design_combo.addItem(self._tr(label), value)
         self.design_combo.setCurrentIndex(max(0, self.design_combo.findData(selected_design)))
         self.design_combo.blockSignals(False)
+        self._sync_design_dependent_controls()
 
     def _apply_language(self, refresh_preview: bool = True) -> None:
         self.setWindowTitle(self._window_title())
@@ -1916,6 +1933,33 @@ class ControlPanel(QWidget):
         else:
             _runtime_log("system shutdown cleanup completed")
 
+    def _is_classic_design(self) -> bool:
+        return str(self.design_combo.currentData() or "new") == "classic"
+
+    def _sync_design_dependent_controls(self) -> None:
+        classic = self._is_classic_design()
+        if hasattr(self, "msfs_layout_caption"):
+            self.msfs_layout_caption.setVisible(classic)
+            self.msfs_layout_combo.setVisible(classic)
+        for index, field in enumerate(getattr(self, "weather_city_inputs", ())):
+            field.setVisible(classic or index == 0)
+
+    def _design_changed(self, _index: int) -> None:
+        self._sync_design_dependent_controls()
+        self._refresh_preview()
+
+    def _rotation_changed(self, _index: int) -> None:
+        # Rotation stays editable while the screen runs; the worker re-reads
+        # self.settings every cycle and reconfigures the panel.
+        if self.worker and self.worker.is_alive():
+            self.settings = {**self.settings, "rotation": self._rotation()}
+            try:
+                save_settings_file(self.settings)
+            except Exception as exc:
+                _runtime_log(f"rotation save failed: {type(exc).__name__}: {exc}")
+            _runtime_log(f"rotation changed while running; rotation={self._rotation()}")
+        self._refresh_preview()
+
     def _rotation(self) -> str:
         return str(self.rotation_combo.currentData() or "normal")
 
@@ -1932,7 +1976,10 @@ class ControlPanel(QWidget):
         sample_temps = (24.0, 19.0, 16.0)
         return tuple(
             WeatherReading(city, sample_temps[index], sample_codes[index])
-            for index, city in enumerate(self._weather_city_names())
+            for index, city in enumerate(weather_cities_for_design({
+                "design": str(self.design_combo.currentData() or "new"),
+                "weather_cities": self._weather_city_names(),
+            }))
         )
 
     def _snapshot_settings(self) -> dict:
@@ -2062,6 +2109,7 @@ class ControlPanel(QWidget):
         self.autostart_check.setChecked(False)
         self.msfs_layout_combo.setCurrentIndex(self.msfs_layout_combo.findData("cockpit"))
         self.design_combo.setCurrentIndex(self.design_combo.findData("new"))
+        self._sync_design_dependent_controls()
         for field, city in zip(self.weather_city_inputs, DEFAULT_WEATHER_CITIES):
             field.setText(city)
         for field in self.hardware_inputs.values():
@@ -2425,7 +2473,11 @@ class ControlPanel(QWidget):
             )
         return True
 
-    def start_screen(self, persist: bool = True) -> None:
+    def start_screen(self, _checked: bool = False, *, persist: bool = True) -> None:
+        # QPushButton.clicked / QAction.triggered pass a "checked" bool as the
+        # first positional argument. In v1.1.1 that bool landed in ``persist``
+        # (False), so the Start button never saved the UI choices and the
+        # worker ran with the settings loaded at launch.
         _runtime_log("start_screen requested")
         if self.worker and self.worker.is_alive():
             _runtime_log("start_screen ignored; worker already alive")
@@ -2484,7 +2536,7 @@ class ControlPanel(QWidget):
         audio_monitor = AudioSpectrumMonitor()
         battery_monitor = BatteryDeviceMonitor(interval=2.0, limit=3)
         msfs_monitor = MSFSTelemetryMonitor()
-        weather_monitor = WeatherMonitor(self.settings.get("weather_cities"))
+        weather_monitor = WeatherMonitor(weather_cities_for_design(self.settings))
         applied_display_settings = None
         last_view_mode: str | None = None
         last_match_signature = None

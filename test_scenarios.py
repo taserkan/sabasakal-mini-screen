@@ -3089,7 +3089,7 @@ class RedesignAndFixScenarios(unittest.TestCase):
         panel._set_status("Mini ekran bağlı · canlı", "#FFFFFF")
         panel.language_combo.setCurrentIndex(panel.language_combo.findData("en"))
         self.assertEqual(panel.status_label.text(), "Mini ekran bağlı · canlı")
-        self.assertEqual(panel.design_combo.toolTip()[:4], "New:")
+        self.assertEqual(panel.design_combo.toolTip()[:7], "Claude:")
         panel.close()
 
 
@@ -3661,9 +3661,13 @@ class ScreenCardLayoutScenarios(Fix111Base):
 
     def test_screen_card_rows_do_not_overlap(self) -> None:
         for language in ("tr", "en"):
-            for size_name in ("default", "minimum"):
-                with self.subTest(language=language, size=size_name):
+            for size_name, design in (
+                ("default", "new"), ("minimum", "new"),
+                ("default", "classic"), ("minimum", "classic"),
+            ):
+                with self.subTest(language=language, size=size_name, design=design):
                     panel = self.make_panel(language=language)
+                    panel.design_combo.setCurrentIndex(panel.design_combo.findData(design))
                     panel.show()
                     if size_name == "minimum":
                         panel.resize(panel.minimumSize())
@@ -3673,6 +3677,11 @@ class ScreenCardLayoutScenarios(Fix111Base):
                     box, widgets = self.card_widgets(panel)
                     box_rect = box.rect().translated(box.mapTo(panel, box.rect().topLeft()))
                     rects = []
+                    widgets = [widget for widget in widgets if not widget.isHidden()]
+                    if design == "classic":
+                        self.assertIn(panel.msfs_layout_combo, widgets)
+                    else:
+                        self.assertNotIn(panel.msfs_layout_combo, widgets)
                     for widget in widgets:
                         self.assertTrue(widget.isVisible(), widget)
                         top_left = widget.mapTo(panel, widget.rect().topLeft())
@@ -3691,6 +3700,8 @@ class ScreenCardLayoutScenarios(Fix111Base):
                         panel.quick_card.height(), panel.quick_card.minimumSizeHint().height(),
                     )
                     for combo in (panel.rotation_combo, panel.design_combo, panel.msfs_layout_combo):
+                        if combo.isHidden():
+                            continue
                         # Offscreen font metrics are inflated; only check the
                         # guaranteed minimum width and the shared column.
                         self.assertGreaterEqual(combo.width(), 150)
@@ -4238,6 +4249,212 @@ class MouseDpiScenarios(unittest.TestCase):
                 self.assertGreaterEqual(changed[0], 338)
                 self.assertLessEqual(changed[2], 456)
 
+
+
+class RealUserInteractionScenarios(unittest.TestCase):
+    """Drive the panel like a person would: keyboard/mouse on real widgets."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.worker_settings: list[dict] = []
+        self.autostart_calls: list[bool] = []
+        gui.SETTINGS_PATH.unlink(missing_ok=True)
+
+    def make_panel(self, saved: dict | None = None) -> gui.ControlPanel:
+        if saved is not None:
+            gui.APP_DATA.mkdir(parents=True, exist_ok=True)
+            gui.SETTINGS_PATH.write_text(
+                json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+        recorder = self.worker_settings
+        autostart = self.autostart_calls
+        patches = (
+            patch.object(gui, "get_auto_hardware_labels", return_value={"cpu": "", "gpu": "", "ram": ""}),
+            patch.object(gui, "get_metrics", return_value={}),
+            patch.object(gui.ControlPanel, "_screen_worker", lambda panel: recorder.append(dict(panel.settings))),
+            patch.object(gui.ControlPanel, "_install_gsi", lambda panel, quiet=False: None),
+            patch.object(gui.ControlPanel, "_apply_autostart_async", lambda panel, enabled: autostart.append(enabled)),
+        )
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        panel = gui.ControlPanel()
+        panel.show()
+        self.app.processEvents()
+        self.addCleanup(panel.deleteLater)
+        return panel
+
+    def choose(self, combo, value) -> None:
+        """Select an item with the keyboard, which emits activated like a user."""
+        from PySide6.QtTest import QTest
+        target = combo.findData(value)
+        self.assertGreaterEqual(target, 0, value)
+        combo.setFocus()
+        QTest.keyClick(combo, Qt.Key.Key_Home)
+        for _ in range(target):
+            QTest.keyClick(combo, Qt.Key.Key_Down)
+        self.app.processEvents()
+        self.assertEqual(combo.currentData(), value)
+
+    def click(self, widget) -> None:
+        from PySide6.QtTest import QTest
+        QTest.mouseClick(widget, Qt.MouseButton.LeftButton)
+        self.app.processEvents()
+
+    def type_into(self, field, text: str) -> None:
+        from PySide6.QtTest import QTest
+        field.setFocus()
+        field.selectAll()
+        QTest.keyClick(field, Qt.Key.Key_Delete)
+        # QTest.keyClicks cannot synthesise non-Latin-1 keys (İ, ş, ğ) and
+        # aborts the process; insert() is what an IME commit does.
+        field.insert(text)
+        QTest.keyClick(field, Qt.Key.Key_Tab)
+        self.app.processEvents()
+
+    def saved(self) -> dict:
+        return json.loads(gui.SETTINGS_PATH.read_text(encoding="utf-8"))
+
+    def start(self, panel) -> None:
+        self.click(panel.start_button)
+        if panel.worker is not None:
+            panel.worker.join(2)
+
+    def run_full_interaction(self, language: str) -> None:
+        from PySide6.QtTest import QTest
+        panel = self.make_panel()
+        self.choose(panel.language_combo, language)
+        self.choose(panel.design_combo, "classic")
+        self.choose(panel.rotation_combo, "180")
+        self.choose(panel.msfs_layout_combo, "classic")
+        panel.brightness_slider.setFocus()
+        for _ in range(5):
+            QTest.keyClick(panel.brightness_slider, Qt.Key.Key_Right)
+        self.click(panel.autostart_check)
+        self.assertTrue(panel.autostart_check.isChecked())
+        self.start(panel)
+        expected = {
+            "design": "classic", "rotation": "180", "msfs_layout": "classic",
+            "brightness": 60, "autostart": True, "language": language,
+        }
+        saved = self.saved()
+        self.assertEqual({key: saved[key] for key in expected}, expected)
+        self.assertEqual(len(self.worker_settings), 1)
+        received = self.worker_settings[0]
+        self.assertEqual({key: received[key] for key in expected}, expected)
+        self.assertIn(True, self.autostart_calls)
+
+    def test_start_button_saves_and_passes_user_choices_in_turkish(self) -> None:
+        self.run_full_interaction("tr")
+
+    def test_start_button_saves_and_passes_user_choices_in_english(self) -> None:
+        self.run_full_interaction("en")
+
+    def test_new_design_choice_survives_start_from_codex_settings(self) -> None:
+        saved = default_settings()
+        saved.update(design="classic", rotation="normal")
+        panel = self.make_panel(saved)
+        self.choose(panel.design_combo, "new")
+        self.choose(panel.rotation_combo, "180")
+        self.start(panel)
+        self.assertEqual((self.saved()["design"], self.saved()["rotation"]), ("new", "180"))
+        self.assertEqual(
+            (self.worker_settings[0]["design"], self.worker_settings[0]["rotation"]), ("new", "180"),
+        )
+
+    def test_design_labels_are_claude_and_codex(self) -> None:
+        panel = self.make_panel()
+        for language in ("tr", "en"):
+            self.choose(panel.language_combo, language)
+            labels = {panel.design_combo.itemData(i): panel.design_combo.itemText(i)
+                      for i in range(panel.design_combo.count())}
+            self.assertEqual(labels, {"new": "Claude", "classic": "Codex"})
+        self.assertEqual(panel.design_combo.currentData(), "new")
+
+    def test_msfs_layout_combo_only_visible_for_codex(self) -> None:
+        panel = self.make_panel()
+        self.assertEqual(panel.design_combo.currentData(), "new")
+        self.assertFalse(panel.msfs_layout_combo.isVisible())
+        self.assertFalse(panel.msfs_layout_caption.isVisible())
+        self.choose(panel.design_combo, "classic")
+        self.assertTrue(panel.msfs_layout_combo.isVisible())
+        self.assertTrue(panel.msfs_layout_caption.isVisible())
+        self.assertTrue(panel.msfs_layout_combo.isEnabled())
+        self.assertGreater(
+            panel.msfs_layout_combo.geometry().top(), panel.design_combo.geometry().bottom(),
+        )
+        self.choose(panel.design_combo, "new")
+        self.assertFalse(panel.msfs_layout_combo.isVisible())
+        self.assertFalse(panel.msfs_layout_caption.isVisible())
+
+    def test_saved_values_are_shown_after_startup_without_reset(self) -> None:
+        saved = default_settings()
+        saved.update(design="classic", rotation="180", msfs_layout="classic",
+                     brightness=70, autostart=True, language="en")
+        panel = self.make_panel(saved)
+        self.assertEqual(panel.design_combo.currentData(), "classic")
+        self.assertEqual(panel.design_combo.currentText(), "Codex")
+        self.assertEqual(panel.rotation_combo.currentData(), "180")
+        self.assertEqual(panel.msfs_layout_combo.currentData(), "classic")
+        self.assertTrue(panel.msfs_layout_combo.isVisible())
+        self.assertEqual(panel.brightness_slider.value(), 70)
+        self.assertTrue(panel.autostart_check.isChecked())
+        self.assertEqual(panel.language_combo.currentData(), "en")
+        self.start(panel)
+        self.assertEqual(self.saved()["design"], "classic")
+        self.assertEqual(self.worker_settings[0]["rotation"], "180")
+
+    def test_rotation_can_change_while_running(self) -> None:
+        panel = self.make_panel()
+        self.start(panel)
+        panel.worker = Mock(is_alive=Mock(return_value=True))
+        panel._set_editing_enabled(False)
+        self.assertTrue(panel.rotation_combo.isEnabled())
+        self.choose(panel.rotation_combo, "180")
+        self.assertEqual(panel.settings["rotation"], "180")
+        self.assertEqual(self.saved()["rotation"], "180")
+        panel.worker = None
+
+    def test_turkish_city_names_round_trip_and_mojibake_is_repaired(self) -> None:
+        saved = default_settings()
+        saved["design"] = "classic"
+        saved["weather_cities"] = ["Batman", "MuÄŸla", "Ä°stanbul"]
+        panel = self.make_panel(saved)
+        self.assertEqual([f.text() for f in panel.weather_city_inputs],
+                         ["Batman", "Muğla", "İstanbul"])
+        self.type_into(panel.weather_city_inputs[0], "Şanlıurfa")
+        self.click(panel.save_button)
+        raw = gui.SETTINGS_PATH.read_bytes()
+        self.assertIn("Şanlıurfa".encode("utf-8"), raw)
+        self.assertIn("Muğla".encode("utf-8"), raw)
+        self.assertEqual(self.saved()["weather_cities"], ["Şanlıurfa", "Muğla", "İstanbul"])
+        self.assertEqual(gui.load_settings()["weather_cities"], ["Şanlıurfa", "Muğla", "İstanbul"])
+
+    def test_claude_design_uses_single_city_and_keeps_codex_list(self) -> None:
+        saved = default_settings()
+        saved["weather_cities"] = ["Batman", "Muğla", "İstanbul"]
+        panel = self.make_panel(saved)
+        self.assertEqual(panel.design_combo.currentData(), "new")
+        visible = [field.isVisible() for field in panel.weather_city_inputs]
+        self.assertEqual(visible, [True, False, False])
+        self.type_into(panel.weather_city_inputs[0], "İzmir")
+        self.start(panel)
+        self.assertEqual(self.saved()["weather_cities"], ["İzmir", "Muğla", "İstanbul"])
+        self.assertEqual(gui.weather_cities_for_design(self.worker_settings[0]), ("İzmir",))
+        self.choose(panel.design_combo, "classic") if panel._editing_enabled else None
+
+    def test_codex_design_shows_three_cities_live(self) -> None:
+        panel = self.make_panel()
+        self.choose(panel.design_combo, "classic")
+        self.assertEqual([f.isVisible() for f in panel.weather_city_inputs], [True, True, True])
+        self.choose(panel.design_combo, "new")
+        self.assertEqual([f.isVisible() for f in panel.weather_city_inputs], [True, False, False])
+        self.choose(panel.design_combo, "classic")
+        self.start(panel)
+        self.assertEqual(len(gui.weather_cities_for_design(self.worker_settings[0])), 3)
 
 
 if __name__ == "__main__":

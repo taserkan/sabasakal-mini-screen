@@ -1,6 +1,13 @@
 # Sabasakal Mini Screen 3.5″
 
-Version 1.1.1
+Version 1.1.2
+
+1.1.2 fixes: "Save and start" really saves the chosen design, orientation and
+other options before the screen starts (a Qt signal argument skipped the save
+in 1.1.1). The designs are now called Claude (default) and Codex; the MSFS
+layout selector is shown only for Codex, and Claude shows weather for a single
+city (the first city field) while Codex keeps all three. Orientation can be
+changed while the screen is running.
 
 1.1.1 fixes: the "Display" card no longer draws its selectors on top of each
 other, the 180° orientation now really rotates the LCD (applied in software,
@@ -20,8 +27,8 @@ battery information in one compact, themeable interface.
 - CPU/GPU temperature, CPU clock, VRAM and used-memory readouts
 - Smooth critical alerts for load and temperature
 - CS2 pre-queue Valve/FACEIT ping view using non-invasive public/local data
-- Two screen designs selectable in the control panel: **Yeni** (new, default)
-  and **Klasik** (classic)
+- Two screen designs selectable in the control panel: **Claude** (new, default)
+  and **Codex** (classic)
 - CS2 competitive/Wingman economy and deathmatch statistics (the bomb timer was
   removed in 1.1.0)
 - FACEIT safety mode: while FACEIT Anti-Cheat runs, the Game State Integration
@@ -39,13 +46,13 @@ battery information in one compact, themeable interface.
 
 ## CS2 previews
 
-### New design (Yeni)
+### Claude design (new)
 
 ![CS2 live panel, new design](docs/images/new/cs2-live-dark-en.png)
 ![CS2 buy panel, new design](docs/images/new/cs2-buy-en.png)
 ![MSFS cruise panel, new design](docs/images/new/msfs-cruise-en.png)
 
-### Classic design (Klasik): CT / T panels
+### Codex design (classic): CT / T panels
 
 ![CS2 CT panel](docs/images/cs2-ct.png)
 ![CS2 T panel](docs/images/cs2-t.png)
