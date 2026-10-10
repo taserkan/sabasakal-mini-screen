@@ -39,6 +39,7 @@ from media_runtime import (
 )
 from msfs_runtime import FlightTelemetry
 from weather_runtime import WeatherReading
+from app_log import log_exception, log_info
 
 
 WIDTH = 480
@@ -3123,69 +3124,203 @@ def _orientation_value(orientation_module: object, rotation: str):
     return orientation_module.LANDSCAPE
 
 
-def send_to_screen(image: Image.Image, port: str, brightness: int, rotation: str = "normal") -> None:
-    sys.path.insert(0, str(DRIVER_ROOT))
-    from library.lcd.lcd_comm import Orientation
+SERIAL_WRITE_TIMEOUT_SECONDS = 6.0
+SERIAL_OPEN_ATTEMPTS = 3
+SERIAL_RECONNECT_ATTEMPTS = 3
+
+
+class DisplayConnectionError(OSError):
+    """The USB display could not be opened or stopped accepting data."""
+
+
+@functools.lru_cache(maxsize=1)
+def _robust_display_class():
+    """Return a Rev-A driver subclass that never exits and never hides errors.
+
+    The upstream driver calls ``sys.exit`` when the port cannot be opened,
+    swallows ``SerialTimeoutException`` on writes and silently reopens the
+    port on other serial errors (dropping the configured ``write_timeout``).
+    For a long-running GUI those behaviours either kill the worker thread or
+    leave the panel showing a torn frame. This subclass opens the port with a
+    write timeout every time and lets every failure propagate so that
+    :class:`ScreenSession` can rebuild the whole session cleanly.
+    """
+    if str(DRIVER_ROOT) not in sys.path:
+        sys.path.insert(0, str(DRIVER_ROOT))
+    import serial  # pyserial, used by the driver
     from library.lcd.lcd_comm_rev_a import LcdCommRevA
 
-    display = LcdCommRevA(com_port=port)
+    class RobustLcdCommRevA(LcdCommRevA):
+        def openSerial(self):  # noqa: N802 - driver API name
+            last_error: Exception | None = None
+            for attempt in range(SERIAL_OPEN_ATTEMPTS):
+                com_port = self.com_port
+                if com_port == "AUTO":
+                    com_port = self.auto_detect_com_port()
+                    if not com_port:
+                        last_error = DisplayConnectionError("COM port not found")
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                try:
+                    self.lcd_serial = serial.Serial(
+                        com_port, 115200, timeout=1, rtscts=True,
+                        write_timeout=SERIAL_WRITE_TIMEOUT_SECONDS,
+                    )
+                    return
+                except Exception as exc:  # serial.SerialException, OSError
+                    last_error = exc
+                    time.sleep(0.5 * (attempt + 1))
+            raise DisplayConnectionError(f"display port could not be opened: {last_error}")
+
+        def WriteLine(self, line: bytes):  # noqa: N802 - driver API name
+            # Propagate SerialTimeoutException/SerialException instead of the
+            # upstream "log and continue / silently reopen" behaviour.
+            self.serial_write(line)
+
+        def ReadData(self, readSize: int):  # noqa: N802,N803 - driver API name
+            return self.serial_read(readSize)
+
+        def __del__(self):
+            try:
+                self.closeSerial()
+            except Exception:
+                pass
+
+    return RobustLcdCommRevA
+
+
+def send_to_screen(image: Image.Image, port: str, brightness: int, rotation: str = "normal") -> None:
+    session = ScreenSession(port, brightness, rotation)
     try:
-        display.InitializeComm()
-        display.ScreenOn()
-        display.SetOrientation(_orientation_value(Orientation, rotation))
-        display.SetBrightness(brightness)
-        display.DisplayPILImage(image.convert("RGB"))
+        session.show(image)
     finally:
-        display.closeSerial()
+        session.close()
 
 
 class ScreenSession:
+    """Serial display session that rebuilds itself after any write failure."""
+
     def __init__(self, port: str, brightness: int, rotation: str = "normal") -> None:
-        sys.path.insert(0, str(DRIVER_ROOT))
+        if str(DRIVER_ROOT) not in sys.path:
+            sys.path.insert(0, str(DRIVER_ROOT))
         from library.lcd.lcd_comm import Orientation
-        from library.lcd.lcd_comm_rev_a import LcdCommRevA
 
         self.orientation_module = Orientation
-        self.display = LcdCommRevA(com_port=port)
-        self.display.InitializeComm()
-        # Stop/shutdown powers the panel down immediately. Always wake it
-        # before configuring and drawing the first frame of a new session.
-        self.display.ScreenOn()
+        self.port = port
+        self.brightness = brightness
+        self.rotation = rotation
+        self.display = None
+        self.reconnects = 0
+        self._open()
+
+    def _open(self) -> None:
+        display_class = _robust_display_class()
+        try:
+            display = display_class(com_port=self.port)
+        except SystemExit as exc:  # defensive: never let the driver exit us
+            raise DisplayConnectionError("display driver requested exit") from exc
+        try:
+            serial_connection = getattr(display, "lcd_serial", None)
+            if serial_connection is not None:
+                # A disconnected or contended USB display must not leave the
+                # worker blocked forever inside a serial write.
+                serial_connection.write_timeout = SERIAL_WRITE_TIMEOUT_SECONDS
+            display.InitializeComm()
+            # Stop/shutdown powers the panel down immediately. Always wake it
+            # before configuring and drawing the first frame of a new session.
+            display.ScreenOn()
+            display.SetOrientation(_orientation_value(self.orientation_module, self.rotation))
+            display.SetBrightness(self.brightness)
+        except BaseException as exc:
+            try:
+                display.closeSerial()
+            except Exception:
+                pass
+            if isinstance(exc, SystemExit):
+                raise DisplayConnectionError("display driver requested exit") from exc
+            raise
+        self.display = display
+
+    def _close_quietly(self) -> None:
+        display, self.display = self.display, None
+        if display is not None:
+            try:
+                display.closeSerial()
+            except Exception:
+                pass
+
+    def _reconnect(self) -> None:
+        """Close, reopen and fully reinitialise; restores orientation/brightness."""
+        self._close_quietly()
+        last_error: Exception | None = None
+        for attempt in range(SERIAL_RECONNECT_ATTEMPTS):
+            if attempt:
+                time.sleep(min(4.0, 0.5 * (2 ** attempt)))
+            try:
+                self._open()
+                self.reconnects += 1
+                log_info("display", f"display session rebuilt; attempt={attempt + 1}")
+                return
+            except Exception as exc:
+                last_error = exc
+                log_exception("display", "display reconnect attempt failed", exc, 0)
+        raise DisplayConnectionError(f"display reconnect failed: {last_error}")
+
+    def _with_recovery(self, operation: Callable[[], None], full_frame: Image.Image | None) -> None:
+        try:
+            if self.display is None:
+                raise DisplayConnectionError("display session is closed")
+            operation()
+            return
+        except Exception as exc:
+            log_exception("display", "display write failed; rebuilding session", exc, 0)
+        self._reconnect()
+        if full_frame is not None:
+            # After a reconnect the panel content is unknown: resend all of it.
+            self._display_full(full_frame)
+        else:
+            operation()
+
+    def _flush(self) -> None:
         serial_connection = getattr(self.display, "lcd_serial", None)
         if serial_connection is not None:
-            # A disconnected or contended USB display must not leave the
-            # worker blocked forever inside a serial write.
-            serial_connection.write_timeout = 6.0
-        self.display.SetOrientation(_orientation_value(Orientation, rotation))
-        self.display.SetBrightness(brightness)
+            serial_connection.flush()
+
+    def _display_full(self, image: Image.Image) -> None:
+        self.display.DisplayPILImage(image.convert("RGB"))
+        self._flush()
 
     def configure(self, brightness: int, rotation: str) -> None:
-        self.display.SetOrientation(_orientation_value(self.orientation_module, rotation))
-        self.display.SetBrightness(brightness)
+        self.brightness = brightness
+        self.rotation = rotation
+
+        def apply() -> None:
+            self.display.SetOrientation(_orientation_value(self.orientation_module, rotation))
+            self.display.SetBrightness(brightness)
+
+        self._with_recovery(apply, None)
 
     def show(self, image: Image.Image) -> None:
-        self.display.DisplayPILImage(image.convert("RGB"))
-        serial_connection = getattr(self.display, "lcd_serial", None)
-        if serial_connection is not None:
-            serial_connection.flush()
+        self._with_recovery(lambda: self._display_full(image), image)
 
     def show_regions(self, image: Image.Image, regions: list[tuple[int, int, int, int]]) -> None:
-        for left, top, right, bottom in regions:
-            crop = image.crop((left, top, right, bottom)).convert("RGB")
-            self.display.DisplayPILImage(crop, x=left, y=top)
-        serial_connection = getattr(self.display, "lcd_serial", None)
-        if serial_connection is not None:
-            serial_connection.flush()
+        def send() -> None:
+            for left, top, right, bottom in regions:
+                crop = image.crop((left, top, right, bottom)).convert("RGB")
+                self.display.DisplayPILImage(crop, x=left, y=top)
+            self._flush()
+
+        self._with_recovery(send, image)
 
     def power_off(self) -> None:
         """Blank the physical panel immediately without a full-frame transfer."""
+        if self.display is None:
+            return
         self.display.ScreenOff()
-        serial_connection = getattr(self.display, "lcd_serial", None)
-        if serial_connection is not None:
-            serial_connection.flush()
+        self._flush()
 
     def close(self) -> None:
-        self.display.closeSerial()
+        self._close_quietly()
 
 
 def main() -> int:
@@ -3222,36 +3357,66 @@ def main() -> int:
         print("Ekrana tek kare gönderildi.")
 
     if args.run_screen:
-        screen = ScreenSession(args.port, args.brightness)
-        gsi_server = GSIServer(game_state)
-        gsi_server.start()
+        screen = None
+        gsi_server = None
         frame_count = 0
+        failures = 0
         try:
             while True:
                 started = time.monotonic()
-                game_active = args.force_cs2 or cs2_is_running()
-                metrics = get_metrics()
-                faceit_active = faceit_ac_is_running()
-                if faceit_active:
-                    pings, source = FACEIT_PING_MONITOR.read(), "FACEIT"
-                elif game_active:
-                    pings, source = STEAM_PING_MONITOR.read(), "VALVE"
-                else:
-                    pings, source = [], "VALVE"
-                frame = render_screen(
-                    metrics, game_state.snapshot(), game_active or faceit_active,
-                    matchmaking_pings=pings, matchmaking_source=source,
-                    animation_time=started,
-                )
-                screen.show(frame)
+                try:
+                    if screen is None:
+                        screen = ScreenSession(args.port, args.brightness)
+                    faceit_active = faceit_ac_is_running()
+                    # FACEIT kill switch: no CS game data while FACEIT AC runs.
+                    if faceit_active and gsi_server is not None:
+                        gsi_server.close()
+                        gsi_server = None
+                    elif not faceit_active and gsi_server is None:
+                        try:
+                            gsi_server = GSIServer(game_state)
+                            gsi_server.start()
+                        except OSError as exc:
+                            log_exception("cli", "GSI listener unavailable", exc)
+                            gsi_server = None
+                    game_active = args.force_cs2 or cs2_is_running()
+                    metrics = get_metrics()
+                    if faceit_active:
+                        pings, source = FACEIT_PING_MONITOR.read(), "FACEIT"
+                    elif game_active:
+                        pings, source = STEAM_PING_MONITOR.read(), "VALVE"
+                    else:
+                        pings, source = [], "VALVE"
+                    frame = render_screen(
+                        metrics,
+                        GameSnapshot() if faceit_active else game_state.snapshot(),
+                        game_active or faceit_active,
+                        matchmaking_pings=pings, matchmaking_source=source,
+                        animation_time=started,
+                    )
+                    screen.show(frame)
+                    failures = 0
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    failures += 1
+                    log_exception("cli", "frame failed", exc)
+                    print(f"Kare gönderilemedi: {type(exc).__name__}: {exc}", file=sys.stderr)
+                    if screen is not None:
+                        screen.close()
+                        screen = None
+                    time.sleep(min(30.0, 1.0 * (2 ** min(failures, 5))))
+                    continue
                 frame_count += 1
                 if args.cycles and frame_count >= args.cycles:
                     break
                 elapsed = time.monotonic() - started
                 time.sleep(max(0.2, args.interval - elapsed))
         finally:
-            gsi_server.close()
-            screen.close()
+            if gsi_server is not None:
+                gsi_server.close()
+            if screen is not None:
+                screen.close()
 
     if not (args.preview or args.screen_once or args.run_screen):
         default_preview = ROOT / "preview.png"
