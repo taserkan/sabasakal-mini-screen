@@ -2947,12 +2947,14 @@ def draw_battery_devices(
         _draw_device_icon(image, draw, device.kind, 347, center_y - 9, color)
         percent_text = f"{device.percent}%"
         label_width = 451 - 370 - 4 - draw.textlength(percent_text, font=FONTS["small_bold"])
-        label = _fit_text(
-            draw, labels.get(device.kind) or device.name, FONTS["small_bold"], label_width,
-        )
+        label_text = labels.get(device.kind) or device.name
+        label_font = FONTS["small_bold"]
+        if draw.textlength(label_text, font=label_font) > label_width:
+            label_font = FONTS["tiny_bold"]  # e.g. "Keyboard" next to "100%"
+        label = _fit_text(draw, label_text, label_font, label_width)
         draw.text(
             (370, center_y), label,
-            font=FONTS["small_bold"], fill=colors["text"], anchor="lm",
+            font=label_font, fill=colors["text"], anchor="lm",
         )
         draw.text(
             (451, center_y), percent_text,
@@ -3247,6 +3249,14 @@ def render_media_visual_patch(
     return patch
 
 
+def _vram_label(megabytes: float | None) -> str:
+    """Same unit as the Claude design: GB once the value reaches 1 GB."""
+    value = float(megabytes or 0)
+    if value >= 1024:
+        return f"{value / 1024:.1f} GB VRAM"
+    return f"{int(value)} MB VRAM"
+
+
 def render_screen(
     metrics: dict[str, float | None],
     game_state: GameSnapshot | None,
@@ -3311,7 +3321,7 @@ def render_screen(
         gpu_load_color,
         labels["gpu"],
         _temperature(metrics.get("gpu_temp")),
-        f"{int(float(metrics['gpu_memory'] or 0))} MB VRAM",
+        _vram_label(metrics.get("gpu_memory")),
         colors,
         value_color=gpu_load_alert,
         percent_color=gpu_load_alert,
