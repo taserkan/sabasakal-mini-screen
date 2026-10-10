@@ -105,8 +105,6 @@ ENGLISH: dict[str, str] = {
     "{name} rengi": "{name} colour",
     "Seçili renk: {colour}": "Selected colour: {colour}",
     # Preview context and sample data
-    "CS2 · CT savunma ve bomba imha görünümü": "CS2 · CT defence and bomb defusal view",
-    "CS2 · T hücum ve bombayı koruma görünümü": "CS2 · T attack and bomb defence view",
     "CS2 · ölüm maçı öldürme ve kafa vuruşu görünümü":
         "CS2 · deathmatch kills and headshots view",
     "MSFS 2024 · canlı uçuş bilgileri": "MSFS 2024 · live flight information",
@@ -150,7 +148,6 @@ ENGLISH: dict[str, str] = {
     "Mini ekran bekleniyor · {error}": "Waiting for mini display · {error}",
     "Bağlantı yenileniyor · {error}": "Refreshing connection · {error}",
     "Ölüm maçı · öldürme ve HS verisi canlı": "Deathmatch · kills and HS data live",
-    "CS2 açık · C4 ve ekonomi verisi canlı": "CS2 running · C4 and economy data live",
     "CS2 maçı açık · canlı veriler izleniyor": "CS2 match active · monitoring live data",
     "FACEIT AC açık · FACEIT pingleri yenileniyor": "FACEIT AC running · refreshing FACEIT pings",
     "CS2 açık · eşleştirme pingleri yenileniyor": "CS2 running · refreshing matchmaking pings",
@@ -187,20 +184,8 @@ ENGLISH: dict[str, str] = {
     "ÖLDÜRME": "KILLS",
     "KAFA VURUŞU": "HEADSHOTS",
     "{value} kafa vuruşu": "{value} headshots",
-    "CT · C4'ü imha et": "CT · Defuse the C4",
-    "T · Bombayı koru": "T · Defend the bomb",
-    "C4 kuruldu": "C4 planted",
     "sn": "sec",
-    "Çözülüyor": "Defusing",
-    "Çözme yetişmez": "Not enough time",
-    "CT çözüyor": "CT is defusing",
-    "Kitli de yetişmez": "Too late with kit",
-    "Kitsiz yetişmez": "Too late without kit",
-    "Bombayı koru": "Defend the bomb",
-    "Patlamaya kalan": "Time to explosion",
     "Para": "Money",
-    "5 sn çözme": "5 sec defuse",
-    "10 sn çözme": "10 sec defuse",
     "Sistem sesi": "System audio",
     "Ses oynatılıyor": "Audio playing",
     "Kulaklık": "Headset",
@@ -215,6 +200,9 @@ ENGLISH: dict[str, str] = {
     "km/sa": "km/h",
     "kullanımda": "in use",
     "Otomatik başlatma ayarlanamadı · {error}": "Autostart could not be updated · {error}",
+    "CS2 · CT ekonomi görünümü": "CS2 · CT economy view",
+    "CS2 · T ekonomi görünümü": "CS2 · T economy view",
+    "CS2 açık · ekonomi verisi canlı": "CS2 running · economy data live",
 }
 
 

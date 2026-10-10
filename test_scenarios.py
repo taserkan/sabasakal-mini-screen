@@ -865,56 +865,6 @@ class PerformanceCounterScenarios(unittest.TestCase):
         self.assertEqual(screen_app.format_airspeed_kmh(146.0), "270 km/sa")
         self.assertEqual(screen_app.format_altitude_km(12540.0), "3,82 km")
 
-    def test_bomb_panel_uses_kit_icon_and_defuse_duration_instead_of_kit_text(self) -> None:
-        self.assertEqual(screen_app._defuse_duration_label(True), "5 sn çözme")
-        self.assertEqual(screen_app._defuse_duration_label(False), "10 sn çözme")
-        with patch.object(screen_app, "_draw_defuse_kit_icon") as icon:
-            screen_app.render_screen(
-                self.sample_metrics(),
-                screen_app.GameSnapshot(
-                    connected=True, in_match=True, team="CT", has_defuse_kit=True,
-                    bomb_planted=True, bomb_seconds=27.0,
-                ),
-                True,
-            )
-        icon.assert_called_once()
-        self.assertTrue(icon.call_args.kwargs["available"])
-        with patch.object(screen_app, "_draw_bomb_icon") as bomb_icon:
-            screen_app.render_screen(
-                self.sample_metrics(),
-                screen_app.GameSnapshot(
-                    connected=True, in_match=True, team="T",
-                    bomb_planted=True, bomb_seconds=27.0,
-                ),
-                True,
-            )
-        bomb_icon.assert_called_once()
-
-    def test_ct_kit_and_t_bomb_icons_are_visually_distinct(self) -> None:
-        colors = dict(gui.PALETTES["Kuzey"])
-        kit = Image.new("RGB", (36, 36), colors["panel_2"])
-        bomb = Image.new("RGB", (36, 36), colors["panel_2"])
-        screen_app._draw_defuse_kit_icon(
-            kit, ImageDraw.Draw(kit), 5, 5, colors["cpu"], colors, available=True,
-        )
-        screen_app._draw_bomb_icon(
-            bomb, ImageDraw.Draw(bomb), 5, 5, colors["warning"], colors,
-        )
-        self.assertIsNotNone(ImageChops.difference(kit, bomb).getbbox())
-
-    def test_bomb_bar_colors_are_interpreted_for_each_team(self) -> None:
-        colors = dict(gui.PALETTES["Kuzey"])
-        self.assertEqual(screen_app._bomb_color(20.0, "CT", False, colors), colors["cpu"])
-        self.assertEqual(screen_app._bomb_color(8.0, "CT", False, colors), colors["danger"])
-        self.assertEqual(screen_app._bomb_color(8.0, "CT", True, colors), colors["warning"])
-        self.assertEqual(screen_app._bomb_color(4.0, "CT", True, colors), colors["danger"])
-        self.assertEqual(screen_app._bomb_color(8.0, "T", False, colors), colors["warning"])
-        self.assertEqual(screen_app._bomb_color(3.0, "T", False, colors), colors["cpu"])
-        self.assertEqual(
-            screen_app._bomb_color(20.0, "T", False, colors, defusing=True),
-            colors["danger"],
-        )
-
     def test_normal_battery_semantics_are_neutral_in_every_palette(self) -> None:
         for name, colors in gui.PALETTES.items():
             self.assertEqual(screen_app._battery_color(80, colors), colors["text"], name)
@@ -1285,9 +1235,10 @@ class PerformanceCounterScenarios(unittest.TestCase):
                 "state": {"money": 3200},
             },
             "map": {"phase": "live", "round_wins": {}},
-            "bomb": {"state": "defusing"},
+            "round": {"bomb": "planted"},
         })
-        self.assertTrue(game_state.snapshot().bomb_defusing)
+        self.assertTrue(game_state.snapshot().bomb_planted)
+        self.assertFalse(hasattr(game_state.snapshot(), "bomb_seconds"))
 
     def test_death_packet_without_player_does_not_flash_back_to_ping_panel(self) -> None:
         game_state = screen_app.CS2GameState()
@@ -1336,50 +1287,13 @@ class PerformanceCounterScenarios(unittest.TestCase):
         self.assertEqual(snapshot.money, 3100)
         self.assertTrue(snapshot.has_defuse_kit)
 
-    def test_bomb_timer_uses_cs2_phase_countdown_instead_of_packet_arrival_time(self) -> None:
-        game_state = screen_app.CS2GameState()
-        payload = {
-            "provider": {"steamid": "local-player"},
-            "player": {
-                "steamid": "local-player", "team": "CT", "activity": "playing",
-                "state": {"money": 3200},
-            },
-            "map": {"phase": "live", "round_wins": {}},
-            "bomb": {"state": "planted"},
-            "phase_countdowns": {"phase": "bomb", "phase_ends_in": "39.64"},
-        }
-        with patch("app.time.monotonic", side_effect=(100.0, 100.0)):
-            game_state.update(payload)
-            snapshot = game_state.snapshot()
-        self.assertAlmostEqual(snapshot.bomb_seconds, 39.64, places=2)
-
-    def test_bomb_timer_fallback_compensates_gsi_throttle_delay(self) -> None:
-        game_state = screen_app.CS2GameState()
-        payload = {
-            "provider": {"steamid": "local-player"},
-            "player": {
-                "steamid": "local-player", "team": "T", "activity": "playing",
-                "state": {"money": 3200},
-            },
-            "map": {"phase": "live", "round_wins": {}},
-            "bomb": {"state": "planted"},
-        }
-        with patch("app.time.monotonic", side_effect=(200.0, 200.0)):
-            game_state.update(payload)
-            snapshot = game_state.snapshot()
-        self.assertAlmostEqual(
-            snapshot.bomb_seconds,
-            40.0 - screen_app.GSI_THROTTLE_SECONDS,
-            places=2,
-        )
-
     def test_msfs_fast_refresh_budget_is_below_two_tenths(self) -> None:
         self.assertLessEqual(gui.MSFS_TELEMETRY_REFRESH_INTERVAL, 0.15)
         self.assertLessEqual(gui.MSFS_WORKER_INTERVAL, 0.10)
 
     def test_live_cs2_money_and_deathmatch_stats_refresh_with_gsi(self) -> None:
         self.assertLessEqual(gui.LIVE_GAME_WORKER_INTERVAL, 0.20)
-        self.assertLessEqual(gui.BOMB_WORKER_INTERVAL, 0.20)
+        self.assertFalse(hasattr(gui, "BOMB_WORKER_INTERVAL"))
 
     def test_matchmaking_ping_uses_only_cs2_console_output(self) -> None:
         self.assertEqual(screen_app.CS2_EXACT_PING_MODE, "console_log")
@@ -1428,18 +1342,6 @@ class PerformanceCounterScenarios(unittest.TestCase):
         self.assertTrue(changed)
         self.assertNotIn("-vconsole", updated)
         self.assertIn("-condebug", updated)
-
-    def test_bomb_timer_uses_small_fast_regions_instead_of_full_panel(self) -> None:
-        self.assertLessEqual(gui.BOMB_WORKER_INTERVAL, 0.20)
-        full_area = (
-            (gui.BOTTOM_REGION[2] - gui.BOTTOM_REGION[0])
-            * (gui.BOTTOM_REGION[3] - gui.BOTTOM_REGION[1])
-        )
-        live_area = sum(
-            (right - left) * (bottom - top)
-            for left, top, right, bottom in (gui.BOMB_TIMER_REGION, gui.BOMB_BAR_REGION)
-        )
-        self.assertLess(live_area, full_area / 2)
 
     def test_media_updates_stay_within_serial_frame_budget(self) -> None:
         regions = (
@@ -2016,24 +1918,6 @@ class LocalizationScenarios(unittest.TestCase):
         self.assertIn("Now", economy)
         self.assertIn("If you win", economy)
 
-        bomb_ct = self.rendered_text(
-            panel_active=True,
-            snapshot=screen_app.GameSnapshot(
-                connected=True, in_match=True, team="CT", money=4250,
-                has_defuse_kit=True, bomb_planted=True, bomb_seconds=8.0,
-            ),
-        )
-        self.assertIn("CT · Defuse the C4", bomb_ct)
-        self.assertIn("Money", bomb_ct)
-
-        bomb_t = self.rendered_text(
-            panel_active=True,
-            snapshot=screen_app.GameSnapshot(
-                connected=True, in_match=True, team="T", money=4250,
-                bomb_planted=True, bomb_seconds=4.0,
-            ),
-        )
-        self.assertIn("T · Defend the bomb", bomb_t)
 
         deathmatch = self.rendered_text(
             panel_active=True,

@@ -161,10 +161,8 @@ FONTS = {
     "gauge_unit": load_font(17, heavy=True),
     "ping": load_font(24, True),
     "money": load_font(21, True),
-    "bomb": load_font(42, True),
-    "bomb_label": load_font(14, heavy=True),
-    "bomb_badge": load_font(11, heavy=True),
-    "bomb_marker": load_font(10, True),
+    "big_value": load_font(42, True),
+    "panel_title": load_font(14, heavy=True),
     # The complete value tile is repainted for every live update, so the
     # original, wider Segoe face remains tear-free without sacrificing size.
     "sensor": load_font(21, heavy=True),
@@ -185,13 +183,29 @@ class GameSnapshot:
     loss_bonus: int | None = None
     team: str = ""
     has_defuse_kit: bool = False
+    # Only the round state ("planted") is kept: it changes the T loss award.
+    # There is deliberately no bomb countdown/timer anywhere in the app.
     bomb_planted: bool = False
-    bomb_seconds: float | None = None
-    bomb_defusing: bool = False
     game_mode: str = ""
     kills: int | None = None
     headshot_kills: int | None = None
     headshot_percent: int | None = None
+    # Extended official-GSI fields used by the new design.
+    map_name: str = ""
+    round_phase: str = ""
+    round_number: int | None = None
+    score_ct: int | None = None
+    score_t: int | None = None
+    loss_streak: int | None = None
+    alive: bool | None = None
+    round_kills: int | None = None
+    round_headshots: int | None = None
+    round_damage: int | None = None
+    match_kills: int | None = None
+    match_deaths: int | None = None
+    match_assists: int | None = None
+    match_mvps: int | None = None
+    match_score: int | None = None
 
 
 def _round_winner(value: str) -> str | None:
@@ -306,8 +320,9 @@ class CS2GameState:
         self._lock = threading.Lock()
         self._data: dict = {}
         self._last_update = 0.0
-        self._bomb_started: float | None = None
         self._last_local_player: dict = {}
+        self._pending_save: dict | None = None
+        self._last_save = 0.0
         # CS2 resets state.round_kills/round_killhs after every death in
         # Deathmatch.  Keep a match-local accumulator so the panel represents
         # the scoreboard instead of only the current life.
@@ -377,34 +392,48 @@ class CS2GameState:
             return
 
     def _save_deathmatch_stats_locked(self) -> None:
+        """Queue the cache payload; the disk write happens outside the lock."""
+        if self._dm_cache_path is None:
+            return
+        payload = {
+            "saved_at": time.time(),
+            "identity": self._dm_identity,
+            "phase": self._dm_phase,
+            "countdown_seconds": self._dm_countdown_seconds,
+            "kills": self._dm_kills,
+            "headshots": self._dm_headshots,
+            "life_kills": self._dm_life_kills,
+            "life_headshots": self._dm_life_headshots,
+            # These official GSI cumulative fields also make the cache a
+            # privacy-safe diagnostic record: no name or Steam ID is
+            # written, only the counters needed to verify match borders.
+            "match_kills": self._dm_match_kills,
+            "match_deaths": self._dm_match_deaths,
+            "match_score": self._dm_match_score,
+            "last_health": self._dm_last_health,
+            "death_seen": self._dm_death_seen,
+            "last_reset_reason": self._dm_last_reset_reason,
+        }
+        self._pending_save = payload
+
+    def _flush_pending_save(self, force: bool = False) -> None:
+        """Write at most every 2 s, never while holding the state lock."""
+        now = time.monotonic()
+        with self._lock:
+            payload = self._pending_save
+            if payload is None or (not force and now - self._last_save < 2.0):
+                return
+            self._pending_save = None
+            self._last_save = now
         if self._dm_cache_path is None:
             return
         try:
-            payload = {
-                "saved_at": time.time(),
-                "identity": self._dm_identity,
-                "phase": self._dm_phase,
-                "countdown_seconds": self._dm_countdown_seconds,
-                "kills": self._dm_kills,
-                "headshots": self._dm_headshots,
-                "life_kills": self._dm_life_kills,
-                "life_headshots": self._dm_life_headshots,
-                # These official GSI cumulative fields also make the cache a
-                # privacy-safe diagnostic record: no name or Steam ID is
-                # written, only the counters needed to verify match borders.
-                "match_kills": self._dm_match_kills,
-                "match_deaths": self._dm_match_deaths,
-                "match_score": self._dm_match_score,
-                "last_health": self._dm_last_health,
-                "death_seen": self._dm_death_seen,
-                "last_reset_reason": self._dm_last_reset_reason,
-            }
             self._dm_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self._dm_cache_path.with_suffix(".tmp")
+            temporary = self._dm_cache_path.with_suffix(f".{os.getpid()}.tmp")
             temporary.write_text(json.dumps(payload), encoding="utf-8")
             os.replace(temporary, self._dm_cache_path)
-        except OSError:
-            pass
+        except OSError as exc:
+            log_exception("gsi", "deathmatch cache write failed", exc)
 
     def _clear_deathmatch_stats_locked(self) -> None:
         if self._dm_cache_path is None:
@@ -591,7 +620,23 @@ class CS2GameState:
 
     def update(self, payload: dict) -> None:
         now = time.monotonic()
+        # "previously"/"added" are diff sections; merging them would leave
+        # stale nested values in the state forever.
+        payload = {
+            key: value for key, value in payload.items()
+            if key not in {"previously", "added", "auth"}
+        }
         with self._lock:
+            incoming_map = payload.get("map")
+            current_map = self._data.get("map")
+            if (
+                isinstance(incoming_map, dict) and isinstance(current_map, dict)
+                and incoming_map.get("name") and current_map.get("name")
+                and incoming_map.get("name") != current_map.get("name")
+            ):
+                # New map: forget every section of the previous match.
+                self._data = {}
+                self._last_local_player = {}
             provider_id = str((payload.get("provider") or {}).get("steamid") or "")
             player = payload.get("player") or {}
             player_id = str(player.get("steamid") or "")
@@ -608,30 +653,6 @@ class CS2GameState:
                 # can arrive without a player section and must still reset
                 # the Deathmatch totals at the correct boundary.
                 self._update_deathmatch_stats_locked(payload, {})
-            round_data = payload.get("round") or {}
-            bomb_data = payload.get("bomb") or {}
-            bomb_state = str(bomb_data.get("state") or round_data.get("bomb") or "").lower()
-            planted = bomb_state in {"planted", "defusing"}
-            if planted and self._bomb_started is None:
-                phase_countdowns = payload.get("phase_countdowns") or {}
-                countdown = bomb_data.get("countdown")
-                if (
-                    countdown is None
-                    and str(phase_countdowns.get("phase") or "").lower() == "bomb"
-                ):
-                    countdown = phase_countdowns.get("phase_ends_in")
-                try:
-                    if bomb_state != "planted":
-                        raise ValueError
-                    remaining = max(0.0, min(40.0, float(countdown)))
-                    self._bomb_started = now - (40.0 - remaining)
-                except (TypeError, ValueError):
-                    # GSI batches updates according to its throttle value. If
-                    # CS2 omits phase_ends_in, compensate that known delivery
-                    # delay instead of starting a fresh 40.0-second clock.
-                    self._bomb_started = now - GSI_THROTTLE_SECONDS
-            elif not planted:
-                self._bomb_started = None
             # GSI packets are normally complete, but death/observer boundary
             # packets can omit a top-level section for one delivery. Preserve
             # the last value for omitted sections while accepting every
@@ -640,6 +661,7 @@ class CS2GameState:
             merged.update(payload)
             self._data = merged
             self._last_update = now
+        self._flush_pending_save()
 
     def snapshot(self, force_competitive_economy: bool = False) -> GameSnapshot:
         now = time.monotonic()
@@ -647,7 +669,6 @@ class CS2GameState:
             payload = dict(self._data)
             player = dict(self._last_local_player)
             last_update = self._last_update
-            bomb_started = self._bomb_started
             dm_kills = self._dm_kills
             dm_headshots = self._dm_headshots
             dm_gameover_started = self._dm_gameover_started
@@ -680,10 +701,7 @@ class CS2GameState:
         )
         has_kit = bool(state.get("defusekit"))
         round_data = payload.get("round") or {}
-        bomb_data = payload.get("bomb") or {}
-        bomb_state = str(bomb_data.get("state") or round_data.get("bomb") or "").lower()
-        bomb_planted = bomb_state in {"planted", "defusing"} and bomb_started is not None
-        bomb_seconds = max(0.0, 40.0 - (now - bomb_started)) if bomb_planted else None
+        bomb_planted = str(round_data.get("bomb") or "").lower() == "planted"
         next_win, next_loss, loss_bonus = calculate_economy(
             money, team, map_data, bomb_planted,
             force_competitive=force_competitive_economy,
@@ -718,13 +736,48 @@ class CS2GameState:
             team=team,
             has_defuse_kit=has_kit,
             bomb_planted=bomb_planted,
-            bomb_seconds=bomb_seconds,
-            bomb_defusing=bomb_state == "defusing",
             game_mode=str(map_data.get("mode") or ""),
             kills=kills,
             headshot_kills=headshot_kills,
             headshot_percent=headshot_percent,
+            **_extended_round_fields(map_data, round_data, player, team),
         )
+
+
+def _int_or_none(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _extended_round_fields(map_data: dict, round_data: dict, player: dict, team: str) -> dict:
+    """Official GSI values for the buy/death/live screens of the new design."""
+    state = player.get("state") if isinstance(player.get("state"), dict) else {}
+    match_stats = player.get("match_stats") if isinstance(player.get("match_stats"), dict) else {}
+    team_ct = map_data.get("team_ct") if isinstance(map_data.get("team_ct"), dict) else {}
+    team_t = map_data.get("team_t") if isinstance(map_data.get("team_t"), dict) else {}
+    own_team = team_ct if team == "CT" else team_t if team == "T" else {}
+    health = _int_or_none(state.get("health"))
+    played = _int_or_none(map_data.get("round"))
+    return {
+        "map_name": str(map_data.get("name") or ""),
+        "round_phase": str(round_data.get("phase") or "").lower(),
+        # map.round counts completed rounds; the current round is +1.
+        "round_number": None if played is None else played + 1,
+        "score_ct": _int_or_none(team_ct.get("score")),
+        "score_t": _int_or_none(team_t.get("score")),
+        "loss_streak": _int_or_none(own_team.get("consecutive_round_losses")),
+        "alive": None if health is None else health > 0,
+        "round_kills": _int_or_none(state.get("round_kills")),
+        "round_headshots": _int_or_none(state.get("round_killhs")),
+        "round_damage": _int_or_none(state.get("round_totaldmg")),
+        "match_kills": _int_or_none(match_stats.get("kills")),
+        "match_deaths": _int_or_none(match_stats.get("deaths")),
+        "match_assists": _int_or_none(match_stats.get("assists")),
+        "match_mvps": _int_or_none(match_stats.get("mvps")),
+        "match_score": _int_or_none(match_stats.get("score")),
+    }
 
 
 class _GSIHandler(http.server.BaseHTTPRequestHandler):
@@ -801,11 +854,18 @@ class CS2ConsolePingMonitor:
     _PING_LINE = re.compile(r"(?i)\b([a-z][a-z0-9]{2,3}):\s*(\d+)\s*ms\b")
     _PING_LOCATION = re.compile(r"(?im)Ping location:\s*([^\r\n]+)")
 
+    VALUE_MAX_AGE_SECONDS = 600.0
+    TAIL_KEEP_BYTES = 256 * 1024
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._values: list[RelayPing] = []
+        self._values_at = 0.0
         self._last_read = 0.0
         self._last_size = -1
+        self._offset = 0
+        self._path: Path | None = None
+        self._tail = ""
 
     @classmethod
     def parse_ping_text(cls, text: str) -> dict[str, int]:
@@ -833,11 +893,17 @@ class CS2ConsolePingMonitor:
         cfg_dir = find_cs2_cfg_dir()
         return cfg_dir.parent / "console.log" if cfg_dir is not None else None
 
+    def _current_values(self, now: float) -> list[RelayPing]:
+        if self._values and now - self._values_at > self.VALUE_MAX_AGE_SECONDS:
+            # A ping table from an old session must not be shown as current.
+            self._values = []
+        return list(self._values)
+
     def read(self) -> list[RelayPing]:
         now = time.monotonic()
         with self._lock:
             if now - self._last_read < CS2_CONSOLE_PING_READ_INTERVAL_SECONDS:
-                return list(self._values)
+                return self._current_values(now)
             self._last_read = now
         path = self._console_log_path()
         if path is None:
@@ -845,24 +911,41 @@ class CS2ConsolePingMonitor:
         try:
             size = path.stat().st_size
             with self._lock:
+                if path != self._path or size < self._offset:
+                    # New file or truncated by a CS2 restart: start over, but
+                    # never read more than the last megabyte.
+                    self._path = path
+                    self._offset = max(0, size - 1024 * 1024)
+                    self._tail = ""
                 if size == self._last_size:
-                    return list(self._values)
+                    return self._current_values(now)
                 self._last_size = size
+                offset = self._offset
             with path.open("rb") as stream:
-                stream.seek(max(0, size - 1024 * 1024))
-                text = stream.read().decode("utf-8", errors="ignore")
-            parsed = self.parse_ping_text(text)
+                stream.seek(offset)
+                chunk = stream.read(max(0, size - offset))
+            text = chunk.decode("utf-8", errors="ignore")
+            with self._lock:
+                self._offset = offset + len(chunk)
+                # Keep a bounded tail so a table split across reads still parses.
+                self._tail = (self._tail + text)[-self.TAIL_KEEP_BYTES:]
+                tail = self._tail
+            parsed = self.parse_ping_text(tail)
             rows = [
                 RelayPing(code, MATCHMAKING_POP_NAMES[code], "", float(latency))
                 for code, latency in parsed.items()
             ]
             rows.sort(key=lambda item: item.latency_ms)
-            if len(rows) >= 3:
-                with self._lock:
-                    self._values = rows[:3]
             with self._lock:
-                return list(self._values)
-        except OSError:
+                if len(rows) >= 3 and text and self.parse_ping_text(text):
+                    self._values = rows[:3]
+                    self._values_at = now
+                elif len(rows) >= 3 and not self._values:
+                    self._values = rows[:3]
+                    self._values_at = now
+                return self._current_values(now)
+        except OSError as exc:
+            log_exception("cs2-ping", "console.log read failed", exc)
             return []
 
     def close(self) -> None:
@@ -898,14 +981,58 @@ FACEIT_LOCATION_TARGETS = {
 }
 
 
+PROCESS_SCAN_TTL_SECONDS = 2.0
+
+
+class ProcessScanner:
+    """One psutil.process_iter pass shared by every "is X running" check.
+
+    The screen loop used to walk the whole process table three times per
+    cycle (CS2, FACEIT, MSFS). The table is now scanned at most once every
+    PROCESS_SCAN_TTL_SECONDS and the result is shared.
+    """
+
+    def __init__(self, ttl: float = PROCESS_SCAN_TTL_SECONDS) -> None:
+        self.ttl = ttl
+        self._lock = threading.Lock()
+        self._scanned_at = -1e9
+        self._names: dict[str, float] = {}
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._scanned_at = -1e9
+
+    def names(self) -> dict[str, float]:
+        now = time.monotonic()
+        with self._lock:
+            if now - self._scanned_at < self.ttl:
+                return self._names
+        names: dict[str, float] = {}
+        for process in psutil.process_iter(["name", "create_time"]):
+            try:
+                name = (process.info.get("name") or "").lower()
+                if name:
+                    created = float(process.info.get("create_time") or 0.0)
+                    names[name] = min(names.get(name, created), created) if name in names else created
+            except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError, ValueError):
+                continue
+        with self._lock:
+            self._names = names
+            self._scanned_at = now
+        return names
+
+    def running(self, name: str) -> bool:
+        return name.lower() in self.names()
+
+    def created_at(self, name: str) -> float | None:
+        return self.names().get(name.lower())
+
+
+PROCESS_SCANNER = ProcessScanner()
+
+
 def faceit_ac_is_running() -> bool:
-    for process in psutil.process_iter(["name"]):
-        try:
-            if (process.info.get("name") or "").lower() == "faceitclient.exe":
-                return True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return False
+    return PROCESS_SCANNER.running("faceitclient.exe")
 
 
 class FaceitPingMonitor:
@@ -944,9 +1071,25 @@ class FaceitPingMonitor:
             for location, hosts in FACEIT_LOCATION_TARGETS.items()
             for host in hosts
         ]
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(targets), thread_name_prefix="faceit-ping",
+        )
+        try:
+            self._loop(executor, targets)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+            with self._lock:
+                self._started = False
+
+    def _loop(self, executor: concurrent.futures.ThreadPoolExecutor, targets: list) -> None:
         while not self._stop.is_set():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as executor:
-                samples = list(executor.map(self._probe, targets))
+            if not faceit_ac_is_running():
+                # Nothing to show: do not send ICMP probes in the background.
+                with self._lock:
+                    self._values = []
+                self._stop.wait(5.0)
+                continue
+            samples = list(executor.map(self._probe, targets))
             grouped: dict[str, list[float]] = {}
             for sample in samples:
                 if sample is not None:
@@ -967,29 +1110,35 @@ atexit.register(FACEIT_PING_MONITOR.close)
 
 
 def cs2_is_running() -> bool:
-    for process in psutil.process_iter(["name"]):
-        try:
-            if (process.info.get("name") or "").lower() == "cs2.exe":
-                return True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return False
+    return PROCESS_SCANNER.running("cs2.exe")
 
 
 def msfs_session_seconds() -> float | None:
     """Return the current MSFS 2024 process age, or None when it is closed."""
-    for process in psutil.process_iter(["name", "create_time"]):
-        try:
-            if (process.info.get("name") or "").lower() != "flightsimulator2024.exe":
-                continue
-            started_at = float(process.info.get("create_time") or time.time())
-            return max(0.0, time.time() - started_at)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError, ValueError):
-            continue
-    return None
+    started_at = PROCESS_SCANNER.created_at("flightsimulator2024.exe")
+    if started_at is None:
+        return None
+    return max(0.0, time.time() - (started_at or time.time()))
+
+
+_CFG_DIR_CACHE: tuple[float, Path | None] | None = None
+CFG_DIR_CACHE_SECONDS = 300.0
 
 
 def find_cs2_cfg_dir() -> Path | None:
+    """Cached lookup (registry + libraryfolders.vdf parse is not free)."""
+    global _CFG_DIR_CACHE
+    now = time.monotonic()
+    cached = _CFG_DIR_CACHE
+    if cached is not None and now - cached[0] < CFG_DIR_CACHE_SECONDS:
+        if cached[1] is None or cached[1].is_dir():
+            return cached[1]
+    result = _find_cs2_cfg_dir_uncached()
+    _CFG_DIR_CACHE = (now, result)
+    return result
+
+
+def _find_cs2_cfg_dir_uncached() -> Path | None:
     candidates: list[Path] = []
     if os.name == "nt":
         try:
@@ -1136,7 +1285,6 @@ def gsi_config_text() -> str:
         "player_state" "1"
         "player_match_stats" "1"
         "player_weapons" "1"
-        "bomb" "1"
         "phase_countdowns" "1"
     }}
 }}
@@ -1151,7 +1299,9 @@ def install_gsi_config() -> Path:
     content = gsi_config_text()
     if not target.exists() or target.read_text(encoding="utf-8", errors="ignore") != content:
         target.write_text(content, encoding="utf-8")
-    install_cs2_console_log_launch_option()
+    # FACEIT kill switch: never touch CS2 launch options while FACEIT AC runs.
+    if not faceit_ac_is_running():
+        install_cs2_console_log_launch_option()
     return target
 
 
@@ -1901,14 +2051,37 @@ def draw_smooth_arc(
     """Draw one continuous anti-aliased arc without wrap seams or endpoint dots."""
     if end <= start:
         return
-    scale = 4
-    layer = Image.new("RGBA", (image.width * scale, image.height * scale), (0, 0, 0, 0))
+    _paste_supersampled(image, bbox, ((start, end, fill),), width)
+
+
+def _paste_supersampled(
+    image: Image.Image,
+    bbox: tuple[int, int, int, int],
+    sectors: tuple[tuple[float, float, str], ...],
+    width: int,
+    scale: int = 4,
+) -> None:
+    """Anti-alias only the ring's own bounding box instead of a 4x full frame.
+
+    The old implementation allocated and LANCZOS-resized a 1920x1280 RGBA
+    layer for every ring on every frame; the local layer is ~40x smaller.
+    """
+    left, top, right, bottom = bbox
+    pad = 2
+    x0, y0 = max(0, left - pad), max(0, top - pad)
+    x1, y1 = min(image.width, right + pad + 1), min(image.height, bottom + pad + 1)
+    if x1 <= x0 or y1 <= y0:
+        return
+    local_bbox = (left - x0, top - y0, right - x0, bottom - y0)
+    layer = Image.new("RGBA", ((x1 - x0) * scale, (y1 - y0) * scale), (0, 0, 0, 0))
     layer_draw = ImageDraw.Draw(layer)
-    layer_draw.polygon(
-        _annular_sector_points(bbox, start, end, width, scale), fill=fill,
-    )
-    layer = layer.resize(image.size, Image.Resampling.LANCZOS)
-    image.paste(layer, (0, 0), layer)
+    for start, end, fill in sectors:
+        if end > start:
+            layer_draw.polygon(
+                _annular_sector_points(local_bbox, start, end, width, scale), fill=fill,
+            )
+    layer = layer.resize((x1 - x0, y1 - y0), Image.Resampling.LANCZOS)
+    image.paste(layer, (x0, y0), layer)
 
 
 def _annular_sector_points(
@@ -1953,22 +2126,12 @@ def draw_smooth_progress_ring(
     width: int,
 ) -> None:
     """Render track and progress together so their shared cap has no blend seam."""
-    scale = 4
-    layer = Image.new("RGBA", (image.width * scale, image.height * scale), (0, 0, 0, 0))
-    layer_draw = ImageDraw.Draw(layer)
-    layer_draw.polygon(
-        _annular_sector_points(bbox, start, end, width, scale),
-        fill=track_fill,
-    )
-    if progress_end > start:
-        layer_draw.polygon(
-            _annular_sector_points(bbox, start, min(progress_end, end), width, scale),
-            fill=progress_fill,
-        )
     # Downsample only once. Two independently antialiased layers created the
     # bright triangular wedge at the common open-ring start on the LCD.
-    layer = layer.resize(image.size, Image.Resampling.LANCZOS)
-    image.paste(layer, (0, 0), layer)
+    _paste_supersampled(image, bbox, (
+        (start, end, track_fill),
+        (start, min(progress_end, end), progress_fill),
+    ), width)
 
 
 def point_on_circle(cx: int, cy: int, radius: int, angle_deg: float) -> tuple[float, float]:
@@ -2107,6 +2270,14 @@ def _load_cs2_hero() -> Image.Image | None:
 
 def add_cs2_backdrop(image: Image.Image, colors: dict[str, str]) -> None:
     """Draw the CS2 hero image with a theme-aware tactical overlay."""
+    backdrop, mask = _cs2_backdrop(colors["panel"])
+    image.paste(backdrop, (15, 161), mask)
+
+
+@functools.lru_cache(maxsize=8)
+def _cs2_backdrop(panel_color: str) -> tuple[Image.Image, Image.Image]:
+    """Static per palette: blend once instead of on every frame."""
+    colors = {"panel": panel_color}
     width, height = 450, 144
     hero = _load_cs2_hero()
     panel_rgb = ImageColor.getrgb(colors["panel"])
@@ -2122,7 +2293,7 @@ def add_cs2_backdrop(image: Image.Image, colors: dict[str, str]) -> None:
 
     mask = Image.new("L", (width, height), 0)
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, width - 1, height - 1), radius=7, fill=255)
-    image.paste(overlay.convert("RGB"), (15, 161), mask)
+    return overlay.convert("RGB"), mask
 
 
 def draw_open_ring(
@@ -2272,45 +2443,6 @@ def _money(value: int | None) -> str:
     return rendered.replace(",", ".") if _RENDER_LANGUAGE.get() == "tr" else rendered
 
 
-def _bomb_color(
-    seconds: float,
-    team: str,
-    has_kit: bool,
-    colors: dict[str, str],
-    defusing: bool = False,
-) -> str:
-    """Interpret the defuse window from the local player's side."""
-    if defusing:
-        return colors["danger"]
-    if team == "CT":
-        if not has_kit:
-            if seconds <= 10.0:
-                return colors["danger"]
-            if seconds <= 12.0:
-                return mix_color(colors["danger"], colors["cpu"], (seconds - 10.0) / 2.0)
-            return colors["cpu"]
-        if seconds <= 4.0:
-            return colors["danger"]
-        if seconds <= 5.0:
-            return mix_color(colors["danger"], colors["warning"], seconds - 4.0)
-        if seconds <= 10.0:
-            return colors["warning"]
-        return colors["cpu"]
-    if team == "T":
-        if seconds <= 4.0:
-            return colors["cpu"]
-        if seconds <= 5.0:
-            return mix_color(colors["cpu"], colors["warning"], seconds - 4.0)
-        if seconds <= 10.0:
-            return colors["warning"]
-        return _team_accent(team, colors)
-    if seconds <= 4.0:
-        return colors["danger"]
-    if seconds <= 10.0:
-        return colors["warning"]
-    return colors["cpu"]
-
-
 def draw_matchmaking_panel(
     draw: ImageDraw.ImageDraw,
     pings: list[RelayPing],
@@ -2355,7 +2487,7 @@ def draw_economy_panel(
     else:
         title, team_label = _t("Maç ekonomisi"), ""
     draw.rounded_rectangle((18, 169, 22, 296), radius=2, fill=team_color)
-    draw.text((28, 181), title, font=FONTS["bomb_label"], fill=team_color)
+    draw.text((28, 181), title, font=FONTS["panel_title"], fill=team_color)
     if team_label:
         badge_left = right - 35
         draw.rounded_rectangle(
@@ -2383,7 +2515,7 @@ def draw_deathmatch_panel(
     colors: dict[str, str], right: int = 449,
 ) -> None:
     draw.rounded_rectangle((18, 169, 22, 296), radius=2, fill=colors["danger"])
-    draw.text((28, 181), _t("Ölüm Maçı"), font=FONTS["bomb_label"], fill=colors["text"])
+    draw.text((28, 181), _t("Ölüm Maçı"), font=FONTS["panel_title"], fill=colors["text"])
     center = round((28 + right) / 2)
     draw.line((center, 209, center, 284), fill=colors["edge"], width=1)
     left_center = round((28 + center) / 2)
@@ -2393,7 +2525,7 @@ def draw_deathmatch_panel(
         fill=colors["muted"], anchor="mm",
     )
     draw.text(
-        (left_center, 259), str(snapshot.kills or 0), font=FONTS["bomb"],
+        (left_center, 259), str(snapshot.kills or 0), font=FONTS["big_value"],
         fill=colors["text"], anchor="mm",
     )
     draw.text(
@@ -2410,81 +2542,6 @@ def draw_deathmatch_panel(
             (right_center, 284), _t("{value} kafa vuruşu", value=snapshot.headshot_kills),
             font=FONTS["small_bold"], fill=colors["muted"], anchor="mm",
         )
-
-
-def draw_bomb_panel(
-    image: Image.Image, draw: ImageDraw.ImageDraw, snapshot: GameSnapshot,
-    colors: dict[str, str], right: int = 449,
-) -> None:
-    seconds = max(0.0, min(40.0, float(snapshot.bomb_seconds or 0.0)))
-    color = _bomb_color(
-        seconds, snapshot.team, snapshot.has_defuse_kit, colors,
-        defusing=snapshot.bomb_defusing,
-    )
-    team_color = _team_accent(snapshot.team, colors)
-    if snapshot.team == "CT":
-        title = _t("CT · C4'ü imha et")
-    elif snapshot.team == "T":
-        title = _t("T · Bombayı koru")
-    else:
-        title = _t("C4 kuruldu")
-    draw.rounded_rectangle((18, 169, 22, 296), radius=2, fill=team_color)
-    draw.text((28, 179), title, font=FONTS["bomb_label"], fill=team_color)
-    draw.text((28, 249), f"{seconds:04.1f}", font=FONTS["bomb"], fill=colors["text"], anchor="ls")
-    draw.text((147, 246), _t("sn"), font=FONTS["small_bold"], fill=color, anchor="ls")
-    if snapshot.team == "CT":
-        required = 5.0 if snapshot.has_defuse_kit else 10.0
-        if snapshot.bomb_defusing:
-            kit_text, kit_color = _t("Çözülüyor"), colors["warning"]
-        elif seconds <= required:
-            kit_text, kit_color = _t("Çözme yetişmez"), colors["danger"]
-        else:
-            kit_text = _defuse_duration_label(snapshot.has_defuse_kit)
-            kit_color = colors["cpu"] if snapshot.has_defuse_kit else colors["warning"]
-    elif snapshot.team == "T":
-        if snapshot.bomb_defusing:
-            kit_text, kit_color = _t("CT çözüyor"), colors["danger"]
-        elif seconds <= 5.0:
-            kit_text, kit_color = _t("Kitli de yetişmez"), colors["cpu"]
-        elif seconds <= 10.0:
-            kit_text, kit_color = _t("Kitsiz yetişmez"), colors["warning"]
-        else:
-            kit_text, kit_color = _t("Bombayı koru"), team_color
-    else:
-        kit_text = _t("Patlamaya kalan")
-        kit_color = colors["warning"]
-    badge_left = max(181, right - 137)
-    if snapshot.team == "CT":
-        _draw_defuse_kit_icon(
-            image, draw, badge_left + 4, 181, kit_color, colors,
-            available=snapshot.has_defuse_kit,
-        )
-        draw.text((badge_left + 30, 192), kit_text, font=FONTS["bomb_badge"], fill=colors["text"], anchor="lm")
-    elif snapshot.team == "T":
-        _draw_bomb_icon(image, draw, badge_left + 5, 182, kit_color, colors)
-        draw.text((badge_left + 30, 192), kit_text, font=FONTS["bomb_badge"], fill=colors["text"], anchor="lm")
-    else:
-        draw.text((right, 192), kit_text, font=FONTS["bomb_badge"], fill=colors["text"], anchor="rm")
-
-    track = (28, 269, right, 286)
-    draw.rounded_rectangle(track, radius=8, fill=colors["track"])
-    fill_right = 28 + round((right - 28) * (seconds / 40.0))
-    if fill_right > 28:
-        draw.rounded_rectangle((28, 269, fill_right, 286), radius=8, fill=color)
-    track_width = right - 28
-    for threshold in (5, 10):
-        marker_x = 28 + round(track_width * (threshold / 40.0))
-        draw.line((marker_x, 267, marker_x, 288), fill=colors["text"], width=1)
-        draw.text(
-            (marker_x, 297), str(threshold), font=FONTS["bomb_marker"],
-            fill=colors["muted"], anchor="mm",
-        )
-    draw.text((right - 2, 249), f"{_money(snapshot.money)}", font=FONTS["money"], fill=colors["text"], anchor="rs")
-    draw.text((right - 2, 226), _t("Para"), font=FONTS["small_bold"], fill=colors["muted"], anchor="rs")
-
-
-def _defuse_duration_label(has_kit: bool) -> str:
-    return _t("5 sn çözme") if has_kit else _t("10 sn çözme")
 
 
 def _team_accent(team: str, colors: dict[str, str]) -> str:
@@ -2521,36 +2578,6 @@ def _paste_tinted_icon(
     top = box[1] + ((height - icon.height) // 2)
     image.paste(tinted, (left, top), tinted)
     return True
-
-
-def _draw_bomb_icon(
-    image: Image.Image,
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    color: str,
-    colors: dict[str, str],
-) -> None:
-    if not _paste_tinted_icon(image, "dynamite", (x, y, x + 21, y + 21), color):
-        draw.rounded_rectangle((x + 2, y + 4, x + 18, y + 17), radius=2, outline=color, width=2)
-
-
-def _draw_defuse_kit_icon(
-    image: Image.Image,
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    color: str,
-    colors: dict[str, str],
-    available: bool,
-) -> None:
-    """Compact bolt-cutter icon; intentionally ringless to save HUD space."""
-    cutter = mix_color("#5E9EFF", colors["text"], 0.08) if available else colors["danger"]
-    if not _paste_tinted_icon(image, "bolt-cutter", (x, y, x + 21, y + 21), cutter):
-        draw.line((x + 4, y + 17, x + 17, y + 4), fill=cutter, width=2)
-        draw.line((x + 4, y + 4, x + 17, y + 17), fill=cutter, width=2)
-    if not available:
-        draw.line((x + 2, y + 19, x + 19, y + 2), fill=colors["danger"], width=2)
 
 
 def weather_condition_kind(weather_code: int) -> str:
@@ -3145,9 +3172,7 @@ def render_screen(
 
     snapshot = game_state or GameSnapshot()
     content_right = 320 if battery_devices else 449
-    if snapshot.bomb_planted and snapshot.bomb_seconds is not None:
-        draw_bomb_panel(image, draw, snapshot, colors, content_right)
-    elif snapshot.in_match and _is_deathmatch_mode(snapshot.game_mode):
+    if snapshot.in_match and _is_deathmatch_mode(snapshot.game_mode):
         draw_deathmatch_panel(draw, snapshot, colors, content_right)
     elif snapshot.in_match and snapshot.next_win_money is not None:
         draw_economy_panel(draw, snapshot, colors, content_right)

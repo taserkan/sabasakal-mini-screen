@@ -230,9 +230,6 @@ VALUE_REGIONS = [
     [(360, 49, 448, 123), (337, 126, 466, 158)],
 ]
 BOTTOM_REGION = (14, 160, 467, 307)
-BOMB_TIMER_REGION = (20, 205, 174, 260)
-BOMB_BAR_REGION = (24, 264, 455, 302)
-BOMB_WORKER_INTERVAL = 0.20
 LIVE_GAME_WORKER_INTERVAL = 0.20
 BATTERY_PANEL_REGION = (337, 202, 456, 295)
 MSFS_PANEL_REGION_WITH_BATTERY = (14, 160, 337, 307)
@@ -2124,8 +2121,8 @@ class ControlPanel(QWidget):
             metrics = self._preview_metrics()
             context_labels = {
                 "daily": "Günlük kullanım · medya görünümü",
-                "cs2_ct": "CS2 · CT savunma ve bomba imha görünümü",
-                "cs2_t": "CS2 · T hücum ve bombayı koruma görünümü",
+                "cs2_ct": "CS2 · CT ekonomi görünümü",
+                "cs2_t": "CS2 · T ekonomi görünümü",
                 "deathmatch": "CS2 · ölüm maçı öldürme ve kafa vuruşu görünümü",
                 "msfs": "MSFS 2024 · canlı uçuş bilgileri",
                 "weather": "Boşta kullanım · seçili şehirlerin hava durumu",
@@ -2158,7 +2155,6 @@ class ControlPanel(QWidget):
                         next_win_money=7500, next_loss_money=6150,
                         loss_bonus=1900, team="CT" if is_ct else "T",
                         has_defuse_kit=is_ct,
-                        bomb_planted=True, bomb_seconds=8.0 if is_ct else 4.0,
                     ),
                     True,
                     self.settings["colors"],
@@ -2370,7 +2366,6 @@ class ControlPanel(QWidget):
         last_view_mode: str | None = None
         last_match_signature = None
         last_economy_signature = None
-        last_bomb_tick: int | None = None
         last_media_signature = None
         last_battery_signature = None
         last_battery_layout_signature = None
@@ -2406,7 +2401,6 @@ class ControlPanel(QWidget):
         matchmaking_pings = []
         matchmaking_source = "VALVE"
         match_signature = None
-        bomb_tick = -1
         sent_frame = None
         media_base_frame = None
         media_render_future: Future | None = None
@@ -2426,14 +2420,35 @@ class ControlPanel(QWidget):
                 language=render_language,
             )
             return metrics, frame
+        last_gsi_attempt = 0.0
+
+        def ensure_gsi(faceit_running: bool) -> None:
+            """FACEIT kill switch: no GSI listener while FACEIT AC runs."""
+            nonlocal gsi_server, game_state, last_gsi_attempt
+            if faceit_running:
+                if gsi_server is not None:
+                    try:
+                        gsi_server.close()
+                    except Exception as exc:
+                        _runtime_log(f"GSI listener close failed: {type(exc).__name__}: {exc}")
+                    gsi_server = None
+                    # Forget everything received before FACEIT started.
+                    game_state = CS2GameState()
+                    _runtime_log("FACEIT AC running; CS2 game-data features disabled")
+                return
+            if gsi_server is None and time.monotonic() - last_gsi_attempt >= 10.0:
+                last_gsi_attempt = time.monotonic()
+                try:
+                    gsi_server = GSIServer(game_state)
+                    gsi_server.start()
+                except Exception as exc:
+                    # The screen keeps working even when CS2's local GSI
+                    # listener is temporarily unavailable.
+                    _runtime_log(f"GSI listener unavailable: {type(exc).__name__}: {exc}")
+                    gsi_server = None
+
         try:
-            try:
-                gsi_server = GSIServer(game_state)
-                gsi_server.start()
-            except Exception:
-                # The screen and FACEIT ping panel can keep working even when
-                # CS2's local GSI listener is temporarily unavailable.
-                gsi_server = None
+            ensure_gsi(faceit_ac_is_running())
             media_monitor.start()
             audio_monitor.start()
             battery_monitor.start()
@@ -2458,7 +2473,6 @@ class ControlPanel(QWidget):
                         applied_display_settings = (brightness, current["rotation"])
                         last_view_mode = None
                         last_match_signature = None
-                        last_bomb_tick = None
                         last_media_signature = None
                         last_battery_signature = None
                         last_battery_layout_signature = None
@@ -2493,9 +2507,7 @@ class ControlPanel(QWidget):
                         screen.configure(*display_settings)
                         applied_display_settings = display_settings
                     context_refresh_interval = (
-                        BOMB_WORKER_INTERVAL if snapshot.bomb_planted
-                        else LIVE_GAME_WORKER_INTERVAL if snapshot.in_match
-                        else 0.45
+                        LIVE_GAME_WORKER_INTERVAL if snapshot.in_match else 0.45
                     )
                     if (
                         cycle_started - last_context_refresh >= context_refresh_interval
@@ -2505,9 +2517,10 @@ class ControlPanel(QWidget):
                         msfs_elapsed = msfs_session_seconds()
                         msfs_active = msfs_elapsed is not None
                         faceit_active = faceit_ac_is_running()
+                        ensure_gsi(faceit_active)
                         snapshot = (
-                            game_state.snapshot(force_competitive_economy=faceit_active)
-                            if game_active else GameSnapshot()
+                            game_state.snapshot()
+                            if game_active and not faceit_active else GameSnapshot()
                         )
                         panel_active = game_active or faceit_active
                         if not snapshot.in_match and faceit_active:
@@ -2520,8 +2533,7 @@ class ControlPanel(QWidget):
                         match_signature = (
                             snapshot.connected, snapshot.in_match, snapshot.money,
                             snapshot.next_win_money, snapshot.next_loss_money,
-                            snapshot.team, snapshot.has_defuse_kit,
-                            snapshot.bomb_planted, snapshot.bomb_defusing,
+                            snapshot.team, snapshot.bomb_planted,
                             snapshot.game_mode,
                             snapshot.kills, snapshot.headshot_kills,
                             snapshot.headshot_percent,
@@ -2543,10 +2555,6 @@ class ControlPanel(QWidget):
                                 f"loss={snapshot.next_loss_money}; bonus={snapshot.loss_bonus}"
                             )
                             last_economy_signature = economy_signature
-                        bomb_tick = (
-                            int(max(0.0, snapshot.bomb_seconds or 0.0) * 5)
-                            if snapshot.bomb_planted else -1
-                        )
                         if (
                             panel_active and not snapshot.in_match
                             and match_signature != last_match_signature
@@ -2611,7 +2619,6 @@ class ControlPanel(QWidget):
                             f"mode={view_mode}; game_active={game_active}; "
                             f"gsi_connected={snapshot.connected}; in_match={snapshot.in_match}; "
                             f"team={snapshot.team or '-'}; game_mode={snapshot.game_mode or '-'}; "
-                            f"bomb={snapshot.bomb_planted}; "
                             f"ping_source={matchmaking_source}; ping_count={len(matchmaking_pings)}"
                         )
                     media_signature = media_snapshot.signature if media_snapshot.visible else ("Sistem sesi", "", "", "playing")
@@ -2778,10 +2785,6 @@ class ControlPanel(QWidget):
                             bottom_changed = True
                         if view_mode == "idle" and weather_changed:
                             bottom_changed = True
-                        bomb_timer_changed = (
-                            view_mode == "game" and snapshot.bomb_planted
-                            and bomb_tick != last_bomb_tick
-                        )
                         if bottom_changed:
                             regions.clear()
                             regions.append(
@@ -2794,8 +2797,6 @@ class ControlPanel(QWidget):
                                 last_msfs_telemetry_refresh = now
                                 sent_flight_signature = flight_signature
                             media_gauge_cycle = True
-                        elif bomb_timer_changed:
-                            regions.extend((BOMB_TIMER_REGION, BOMB_BAR_REGION))
                         elif battery_changed:
                             regions.clear()
                             regions.append(BATTERY_PANEL_REGION)
@@ -2902,20 +2903,6 @@ class ControlPanel(QWidget):
                 last_view_mode = view_mode
                 self._screen_progress_at = time.monotonic()
                 last_match_signature = match_signature
-                if bomb_tick != last_bomb_tick:
-                    if bomb_tick >= 0 and (last_bomb_tick is None or last_bomb_tick < 0):
-                        _runtime_log(
-                            f"bomb timer started; seconds={bomb_tick / 5:.1f}; team={snapshot.team}"
-                        )
-                    elif bomb_tick < 0 and last_bomb_tick is not None and last_bomb_tick >= 0:
-                        _runtime_log("bomb timer ended")
-                    elif last_bomb_tick is not None:
-                        for checkpoint in (30, 20, 10, 4):
-                            threshold = checkpoint * 5
-                            if last_bomb_tick > threshold >= bomb_tick:
-                                _runtime_log(f"bomb timer checkpoint; seconds={checkpoint}")
-                                break
-                last_bomb_tick = bomb_tick
                 last_media_signature = media_signature
                 last_battery_signature = battery_signature
                 last_battery_layout_signature = battery_layout_signature
@@ -2935,7 +2922,7 @@ class ControlPanel(QWidget):
                     if "deathmatch" in snapshot.game_mode.lower():
                         status_message = "Ölüm maçı · öldürme ve HS verisi canlı"
                     elif snapshot.next_win_money is not None:
-                        status_message = "CS2 açık · C4 ve ekonomi verisi canlı"
+                        status_message = "CS2 açık · ekonomi verisi canlı"
                     else:
                         status_message = "CS2 maçı açık · canlı veriler izleniyor"
                 elif faceit_active:
@@ -2966,8 +2953,7 @@ class ControlPanel(QWidget):
                     last_status_message = translated_status
                 elapsed = time.monotonic() - cycle_started
                 target_interval = (
-                    BOMB_WORKER_INTERVAL if snapshot.bomb_planted
-                    else LIVE_GAME_WORKER_INTERVAL if snapshot.in_match
+                    LIVE_GAME_WORKER_INTERVAL if snapshot.in_match
                     else 0.045 if media_mode else MSFS_WORKER_INTERVAL if msfs_active
                     else float(current["interval"])
                 )
