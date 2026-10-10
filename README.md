@@ -1,6 +1,15 @@
 # Sabasakal Mini Screen 3.5″
 
-Version 1.1.3
+Version 1.1.4
+
+1.1.4 fixes: the Windows battery scan no longer runs the 30-60 s
+AssociationEndpoint inquiry that Windows periodically aborted (E_ABORT log
+lines); the CPU sensor host writes its cache on a fixed 1 s cadence even when
+LibreHardwareMonitor is slow under game load (no more stale-cache restarts);
+the Claude design's buy-phase money/FULL BUY/ECO/FORCE screen is removed
+(freezetime shows the live-round screen); screen changes wait for a stable
+request (2.5 s minimum dwell) and large changes are sent as a left-to-right
+wipe instead of a top-to-bottom tear.
 
 1.1.3 fixes: CPU, GPU and RAM follow Windows Task Manager (1 s counters
 without extra averaging, GPU = busiest engine type, RAM "in use" with one

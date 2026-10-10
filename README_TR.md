@@ -1,6 +1,14 @@
 # Sabasakal Mini Screen 3.5″
 
-Sürüm 1.1.3
+Sürüm 1.1.4
+
+1.1.4 düzeltmeleri: Windows pil taraması artık Windows'un zaman zaman iptal
+ettiği 30-60 sn'lik AssociationEndpoint taramasını yapmıyor (E_ABORT günlük
+satırları bitti); CPU sensör yardımcısı, oyun yükünde LibreHardwareMonitor
+yavaşlasa da önbelleği sabit 1 sn aralıkla yazıyor; Claude tasarımındaki satın
+alma (para/FULL BUY/ECO/FORCE) ekranı kaldırıldı (freezetime canlı round
+ekranını gösterir); ekran geçişleri kararlı istek bekler (en az 2,5 sn) ve
+büyük değişimler soldan sağa silme efektiyle gönderilir.
 
 1.1.3 düzeltmeleri: CPU, GPU ve RAM değerleri Windows Görev Yöneticisi ile
 aynı (1 sn sayaçlar, ek ortalama yok, GPU = en yoğun motor türü, RAM

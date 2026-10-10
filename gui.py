@@ -64,7 +64,7 @@ from i18n import SUPPORTED_LANGUAGES, normalize_language, translate
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -233,7 +233,8 @@ NEW_DESIGN_TILES = tuple(
 # the panel changes, the same pixels are sent as full-height column strips
 # left-to-right instead: each strip lands in ~1/8 of the transfer time, which
 # reads as a deliberate horizontal wipe. It costs no extra bandwidth (no
-# crossfade frames), so it finishes as fast as one full frame.
+# crossfade frames), so it finishes as fast as one full frame. Measured on the
+# real panel: 1.20 s per full frame (~256 KB/s), see tools/render_transitions.py.
 WIPE_STRIP_WIDTH = 60
 WIPE_STRIPS = tuple((left, 0, left + WIPE_STRIP_WIDTH, 320) for left in range(0, 480, WIPE_STRIP_WIDTH))
 WIPE_AREA_FRACTION = 0.45
