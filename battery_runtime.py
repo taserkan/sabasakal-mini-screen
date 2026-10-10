@@ -22,11 +22,20 @@ from app_log import log_exception
 from winrt.windows.devices.enumeration import DeviceInformation, DeviceInformationKind
 
 
+# DEVPKEY_Device_IsConnected: live link state of a device node.
+DEVPKEY_DEVICE_IS_CONNECTED = "{83da6326-97a6-4088-9453-a1923f573b29} 15"
+WINDOWS_CONNECTION_PROPERTIES = (
+    "System.Devices.Aep.IsConnected",
+    "System.Devices.Connected",
+    DEVPKEY_DEVICE_IS_CONNECTED,
+)
 BATTERY_PROPERTIES = (
     "System.Devices.BatteryLife",
     "System.Devices.BatteryPlusCharging",
     "System.Devices.Category",
     "System.Devices.Aep.IsConnected",
+    "System.Devices.Connected",
+    DEVPKEY_DEVICE_IS_CONNECTED,
     "System.Devices.Aep.ContainerId",
     "System.Devices.ContainerId",
     "System.Devices.ModelName",
@@ -230,6 +239,13 @@ def _send_websocket_frame(stream: socket.socket, opcode: int, payload: bytes) ->
         header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, length)
     masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
     stream.sendall(header + mask + masked)
+
+
+def windows_device_connected(properties: dict) -> bool:
+    states = [properties.get(key) for key in WINDOWS_CONNECTION_PROPERTIES]
+    if any(state is False for state in states):
+        return False
+    return any(state is True for state in states)
 
 
 def parse_lghub_connected_slugs(message: object) -> set[str]:
@@ -661,6 +677,25 @@ class BatteryDeviceMonitor:
         self._last_logitech_devices = list(stable)
         return stable
 
+    def _without_lghub_disconnected(
+        self, devices: list[BatteryDevice],
+    ) -> list[BatteryDevice]:
+        """Never let a Windows cache entry (fresh or kept across failed scans)
+        resurrect a peripheral G HUB positively reports as disconnected."""
+        ready, infos = self._current_lghub_infos()
+        if not ready:
+            return devices
+        offline = {
+            info.get("name", "").casefold() for info in infos.values()
+            if info.get("state") != LGHUB_CONNECTED_STATE and info.get("name")
+        }
+        online = {
+            info.get("name", "").casefold() for info in infos.values()
+            if info.get("state") == LGHUB_CONNECTED_STATE
+        }
+        offline -= online
+        return [device for device in devices if device.name.casefold() not in offline]
+
     def _scan_windows_loop(self) -> None:
         """Isolate slow WinRT enumeration so it can never block G HUB events."""
         failures = 0
@@ -775,8 +810,10 @@ class BatteryDeviceMonitor:
                     continue
                 if not 0 <= percent <= 100:
                     continue
-                connected = properties.get("System.Devices.Aep.IsConnected")
-                if connected is False or not device.is_enabled:
+                # The PnP cache keeps the last BatteryLife of a powered-off
+                # peripheral (its dongle stays present). Only a positive live
+                # connection state proves the value is current.
+                if not device.is_enabled or not windows_device_connected(properties):
                     continue
                 name = _clean_name(
                     device.name
@@ -885,14 +922,23 @@ class BatteryDeviceMonitor:
                 ready, device_infos = self._current_lghub_infos()
                 live_percentages: dict[str, int] = {}
                 if ready and device_infos:
-                    live_states = probe_lghub_input_batteries(device_infos)
+                    # G HUB's battery endpoint keeps answering SUCCESS with the
+                    # last percentage of a powered-off headset whose dongle is
+                    # still plugged in. Presence therefore comes only from the
+                    # device list/state events; the probe may only downgrade.
+                    active_infos = {
+                        slug: info for slug, info in device_infos.items()
+                        if info.get("state") == LGHUB_CONNECTED_STATE
+                    }
+                    live_states = probe_lghub_input_batteries(active_infos)
                     state_updates: dict[str, dict[str, str]] = {}
                     for slug, (connected, percent) in live_states.items():
-                        info = dict(device_infos[slug])
-                        info["state"] = LGHUB_CONNECTED_STATE if connected else "NOT_CONNECTED"
-                        device_infos[slug] = info
-                        state_updates[slug] = info
-                        if connected and percent is not None:
+                        if not connected:
+                            info = dict(device_infos[slug])
+                            info["state"] = "NOT_CONNECTED"
+                            device_infos[slug] = info
+                            state_updates[slug] = info
+                        elif percent is not None:
                             live_percentages[slug] = percent
                     self._update_lghub_infos(state_updates)
                 connected_slugs = (
@@ -939,6 +985,7 @@ class BatteryDeviceMonitor:
                     ]
             logitech_devices = self._with_mouse_dpi(logitech_devices)
             windows_devices, windows_error = self._current_windows_devices()
+            windows_devices = self._without_lghub_disconnected(windows_devices)
             self._publish(BatterySnapshot(
                 devices=select_battery_devices(
                     [*logitech_devices, *windows_devices], self.limit,

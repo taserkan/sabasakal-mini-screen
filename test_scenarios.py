@@ -277,14 +277,18 @@ class SettingsScenarios(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["palette"], "Kuzey")
 
     def test_autostart_reconciliation_repairs_enabled_entry(self) -> None:
-        with patch.object(gui, "set_windows_autostart") as setter:
+        with patch.object(gui, "set_windows_autostart") as setter, patch.object(
+            gui, "_startup_task_command", return_value=None,
+        ):
             self.assertTrue(gui.reconcile_windows_autostart(True))
         setter.assert_called_once_with(True)
 
     def test_autostart_reconciliation_does_not_crash_on_registry_error(self) -> None:
         with patch.object(
             gui, "set_windows_autostart", side_effect=OSError("registry unavailable"),
-        ), patch.object(gui, "_runtime_log") as runtime_log:
+        ), patch.object(gui, "_startup_task_command", return_value=None), patch.object(
+            gui, "_runtime_log",
+        ) as runtime_log:
             self.assertFalse(gui.reconcile_windows_autostart(True))
         self.assertIn("autostart reconciliation failed", runtime_log.call_args.args[0])
 
@@ -4824,7 +4828,8 @@ class BatteryDiscoveryRetry113Tests(unittest.TestCase):
             def __init__(self, name, percent):
                 self.name, self.id, self.is_enabled = name, "id-" + name, True
                 self.properties = {"System.Devices.BatteryLife": percent,
-                                   "System.Devices.ContainerId": "c-" + name}
+                                   "System.Devices.ContainerId": "c-" + name,
+                                   "System.Devices.Connected": True}
 
         async def fake_find(aqs, props, kind):
             kinds_seen.append(kind)
@@ -4843,7 +4848,7 @@ class BatteryDiscoveryRetry113Tests(unittest.TestCase):
 
         class Dev:
             name, id, is_enabled = "Speaker", "id-s", True
-            properties = {"System.Devices.BatteryLife": 40}
+            properties = {"System.Devices.BatteryLife": 40, "System.Devices.Connected": True}
 
         async def fake_find(aqs, props, kind):
             if kind == K.DEVICE:
@@ -4895,6 +4900,248 @@ class PerformanceMode113Tests(unittest.TestCase):
         self.assertIn("IsStorageEnabled = false", source)
         self.assertIn("ProcessPriorityClass.BelowNormal", source)
         self.assertIn("GameRunning() ? 2000 : 1000", source)
+
+
+class HeadsetPresence115Tests(unittest.TestCase):
+    """v1.1.5: a powered-off peripheral must disappear even if a source still
+    answers with its last battery value."""
+
+    HEADSET = {"state": "NOT_CONNECTED", "name": "PRO X WIRELESS",
+               "kind": "headset", "device_id": "dev2"}
+    MOUSE = {"state": "ACTIVE", "name": "PRO X SUPERLIGHT 2",
+             "kind": "mouse", "device_id": "dev3"}
+
+    def run_once(self, infos, probe_result, db_devices=None, windows=()):
+        import battery_runtime as br
+        monitor = br.BatteryDeviceMonitor(interval=2.0)
+        monitor._lghub_ready = True
+        monitor._lghub_infos = {slug: dict(info) for slug, info in infos.items()}
+        monitor._windows_devices = list(windows)
+        if db_devices is None:
+            db_devices = [
+                br.BatteryDevice(f"lghub:{slug}", info["name"], 54, info["kind"])
+                for slug, info in infos.items()
+            ]
+        probed = {}
+
+        def fake_probe(candidates):
+            probed.update(candidates)
+            return {slug: probe_result[slug] for slug in candidates if slug in probe_result}
+
+        def fake_scan(connected_slugs=None, device_infos=None):
+            return [d for d in db_devices
+                    if d.stable_id.removeprefix("lghub:") in (connected_slugs or set())]
+
+        def stop_wait(timeout=None):
+            monitor._stop.set()
+            return True
+
+        with patch.object(br, "probe_lghub_input_batteries", fake_probe), \
+                patch.object(monitor, "_scan_lghub", side_effect=fake_scan), \
+                patch.object(monitor, "_with_mouse_dpi", side_effect=lambda d: d), \
+                patch.object(monitor._refresh, "wait", side_effect=stop_wait):
+            monitor._run()
+        return monitor, [d.name for d in monitor.snapshot().devices], probed
+
+    def test_headset_off_with_dongle_present_is_hidden(self) -> None:
+        # Live G HUB: list says NOT_CONNECTED, battery endpoint still SUCCESS 54%.
+        monitor, names, probed = self.run_once(
+            {"proxwirelessheadset": self.HEADSET, "prox2wirelessmouse": self.MOUSE},
+            {"proxwirelessheadset": (True, 54), "prox2wirelessmouse": (True, 60)},
+        )
+        self.assertEqual(names, ["PRO X SUPERLIGHT 2"])
+        self.assertNotIn("proxwirelessheadset", probed)
+        self.assertEqual(monitor._lghub_infos["proxwirelessheadset"]["state"], "NOT_CONNECTED")
+
+    def test_ghub_disconnect_event_hides_headset_immediately(self) -> None:
+        import battery_runtime as br
+        monitor = br.BatteryDeviceMonitor(interval=30.0)
+        monitor._replace_lghub_infos({"proxwirelessheadset": dict(self.HEADSET, state="ACTIVE")})
+        monitor._refresh.clear()
+        monitor._update_lghub_infos(br.parse_lghub_device_infos({
+            "path": "/devices/state/changed",
+            "payload": {"slotPrefix": "proxwirelessheadset", "state": "NOT_CONNECTED",
+                        "displayName": "PRO X WIRELESS", "deviceType": "HEADSET", "id": "dev2"},
+        }))
+        self.assertTrue(monitor._refresh.is_set())  # wakes _run instantly
+        _monitor, names, _ = self.run_once(
+            dict(monitor._lghub_infos), {"proxwirelessheadset": (True, 54)},
+        )
+        self.assertEqual(names, [])
+
+    def test_headset_back_on_reappears(self) -> None:
+        _m, names, _ = self.run_once(
+            {"proxwirelessheadset": dict(self.HEADSET, state="ACTIVE")},
+            {"proxwirelessheadset": (True, 77)},
+        )
+        self.assertEqual(names, ["PRO X WIRELESS"])
+
+    def test_mouse_sleeping_stays_mouse_off_disappears(self) -> None:
+        # Sleeping: G HUB keeps the mouse ACTIVE (battery may be momentarily unknown).
+        _m, names, _ = self.run_once(
+            {"prox2wirelessmouse": self.MOUSE}, {"prox2wirelessmouse": (True, None)},
+        )
+        self.assertEqual(names, ["PRO X SUPERLIGHT 2"])
+        # Off: G HUB reports NOT_CONNECTED; a stale SUCCESS must not revive it.
+        _m, names, _ = self.run_once(
+            {"prox2wirelessmouse": dict(self.MOUSE, state="NOT_CONNECTED")},
+            {"prox2wirelessmouse": (True, 60)},
+        )
+        self.assertEqual(names, [])
+
+    def test_battery_endpoint_missing_path_downgrades_active_device(self) -> None:
+        monitor, names, _ = self.run_once(
+            {"prox2wirelessmouse": self.MOUSE}, {"prox2wirelessmouse": (False, None)},
+        )
+        self.assertEqual(names, [])
+        self.assertEqual(monitor._lghub_infos["prox2wirelessmouse"]["state"], "NOT_CONNECTED")
+
+    def test_windows_cache_kept_after_failures_cannot_resurrect_lghub_off_device(self) -> None:
+        import battery_runtime as br
+        cached = br.BatteryDevice("win:c1", "PRO X WIRELESS", 54, "headset")
+        _m, names, _ = self.run_once(
+            {"proxwirelessheadset": self.HEADSET}, {}, windows=[cached],
+        )
+        self.assertEqual(names, [])
+
+    def test_windows_scan_requires_positive_connection_state(self) -> None:
+        import asyncio
+        import battery_runtime as br
+
+        class Dev:
+            def __init__(self, name, props):
+                self.name, self.id, self.is_enabled = name, "id-" + name, True
+                self.properties = {"System.Devices.BatteryLife": 50, **props}
+
+        devices = [
+            Dev("Stale", {}),
+            Dev("Off", {"System.Devices.Connected": False}),
+            Dev("DevOff", {br.DEVPKEY_DEVICE_IS_CONNECTED: False, "System.Devices.Connected": True}),
+            Dev("BtOn", {"System.Devices.Aep.IsConnected": True}),
+            Dev("On", {br.DEVPKEY_DEVICE_IS_CONNECTED: True}),
+        ]
+
+        async def fake_find(aqs, props, kind):
+            self.assertIn(br.DEVPKEY_DEVICE_IS_CONNECTED, props)
+            return devices
+
+        found = asyncio.run(br.BatteryDeviceMonitor._scan_windows(fake_find, ("k",)))
+        self.assertEqual([d.name for d in found], ["BtOn", "On"])
+
+
+class StartupAndQuit115Tests(unittest.TestCase):
+    def test_first_watchdog_pass_is_a_normal_start(self) -> None:
+        previous = gui._SENSOR_HOST_SESSION_STARTED
+        gui._SENSOR_HOST_SESSION_STARTED = False
+        try:
+            with tempfile.TemporaryDirectory() as directory, patch.object(
+                gui, "ensure_sensor_host", return_value=True,
+            ) as ensure, patch.object(gui, "_runtime_log") as log:
+                self.assertFalse(gui.nudge_sensor_host_if_stale(Path(directory) / "old.json"))
+            ensure.assert_called_once_with(restart=False)
+            text = " ".join(str(c.args[0]) for c in log.call_args_list)
+            self.assertNotIn("restarted", text)
+            self.assertIn("first start", text)
+        finally:
+            gui._SENSOR_HOST_SESSION_STARTED = previous
+
+    @staticmethod
+    def schtasks(command):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if "/Query" in argv and "/XML" in argv:
+                if command is None:
+                    return SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
+                xml = ('<?xml version="1.0" encoding="UTF-16"?><Task><Actions><Exec>'
+                       f'<Command>{command}</Command><Arguments>--autorun</Arguments>'
+                       '</Exec></Actions></Task>')
+                return SimpleNamespace(returncode=0, stdout=xml.encode("utf-16"), stderr=b"")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return calls, fake_run
+
+    def reconcile(self, enabled, command, current):
+        calls, fake_run = self.schtasks(command)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(gui.subprocess, "run", side_effect=fake_run), \
+                patch.object(gui, "APP_DATA", Path(directory)), \
+                patch.object(gui, "STARTUP_TASK_STATE_PATH", Path(directory) / "s.json"), \
+                patch.object(gui, "_startup_action", return_value=(current, "--autorun")), \
+                patch.object(gui, "_set_windows_run_fallback"), \
+                patch.object(gui, "_remove_windows_startup_shortcut", return_value=True), \
+                patch.object(gui, "_runtime_log") as log:
+            self.assertTrue(gui.reconcile_windows_autostart(enabled))
+        verbs = [next((a for a in argv if a in ("/Create", "/Delete")), None) for argv in calls]
+        return [v for v in verbs if v], " ".join(str(c.args[0]) for c in log.call_args_list)
+
+    def test_enabled_task_pointing_to_old_exe_is_repaired(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            current = str(Path(directory) / "v115" / "Sabasakal-Mini-Screen.exe")
+            verbs, log = self.reconcile(True, r"C:\gone\v1.0.12\Sabasakal-Mini-Screen.exe", current)
+        self.assertEqual(verbs, ["/Create"])
+        self.assertIn("startup task repaired", log)
+
+    def test_disabled_task_pointing_to_missing_exe_is_removed(self) -> None:
+        verbs, log = self.reconcile(False, r"C:\gone\v1.0.12\Sabasakal-Mini-Screen.exe", r"C:\x\a.exe")
+        self.assertEqual(verbs, ["/Delete"])
+        self.assertIn("stale startup task removed", log)
+
+    def test_disabled_task_pointing_to_other_existing_exe_is_repointed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            old = Path(directory) / "old.exe"
+            old.write_bytes(b"")
+            verbs, _log = self.reconcile(False, str(old), str(Path(directory) / "new.exe"))
+        self.assertEqual(verbs, ["/Create"])
+
+    def test_disabled_without_task_does_nothing(self) -> None:
+        verbs, _log = self.reconcile(False, None, r"C:\x\a.exe")
+        self.assertEqual(verbs, [])
+
+    def test_disabled_task_already_current_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            exe = Path(directory) / "a.exe"
+            exe.write_bytes(b"")
+            verbs, _log = self.reconcile(False, str(exe), str(exe))
+        self.assertEqual(verbs, [])
+
+    def test_quit_request_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            exited = []
+            panel = SimpleNamespace(_exit_application=lambda: exited.append(True))
+            with patch.object(gui, "APP_DATA", root), \
+                    patch.object(gui, "QUIT_REQUEST_PATH", root / "quit.request"), \
+                    patch.object(gui, "QUIT_ACK_PATH", root / "quit.ack"), \
+                    patch.object(gui, "_runtime_log"):
+
+                def primary():
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline:
+                        if gui.ControlPanel._consume_quit_request(panel):
+                            return
+                        time.sleep(0.05)
+
+                thread = threading.Thread(target=primary)
+                thread.start()
+                self.assertTrue(gui.request_running_instance_quit(timeout_seconds=3))
+                thread.join()
+            self.assertEqual(exited, [True])
+            self.assertFalse((root / "quit.request").exists())
+
+    def test_unanswered_quit_request_times_out_and_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(gui, "APP_DATA", root), \
+                    patch.object(gui, "QUIT_REQUEST_PATH", root / "quit.request"), \
+                    patch.object(gui, "QUIT_ACK_PATH", root / "quit.ack"):
+                self.assertFalse(gui.request_running_instance_quit(timeout_seconds=0.3))
+            self.assertFalse((root / "quit.request").exists())
+
+    def test_quit_flag_is_handled_before_single_instance(self) -> None:
+        source = Path(gui.__file__).read_text(encoding="utf-8")
+        main_src = source.split("def main() -> int:", 1)[1]
+        self.assertLess(main_src.index("args.quit"), main_src.index("_acquire_single_instance"))
 
 
 if __name__ == "__main__":

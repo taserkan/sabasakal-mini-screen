@@ -64,13 +64,17 @@ from i18n import SUPPORTED_LANGUAGES, normalize_language, translate
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
 RUNTIME_FALLBACK_LOG_PATH = APP_DATA / "runtime-current.log"
 ACTIVATE_REQUEST_PATH = APP_DATA / "show-window.request"
 ACTIVATE_ACK_PATH = APP_DATA / "show-window.ack"
+# Graceful-quit IPC: a file in the user's %APPDATA% works from a non-elevated
+# caller to the elevated primary (no window messages, so UIPI does not apply).
+QUIT_REQUEST_PATH = APP_DATA / "quit.request"
+QUIT_ACK_PATH = APP_DATA / "quit.ack"
 INSTANCE_STATE_PATH = APP_DATA / "instance.json"
 STARTUP_TASK_STATE_PATH = APP_DATA / "startup-task-state.json"
 SENSOR_OWNER_STALE_SECONDS = 12.0
@@ -83,6 +87,8 @@ SENSOR_HOST_SOURCE_PATH = (
 LEGACY_SENSOR_TASK_NAMES = ("CS2ScreenSensors", "SabasakalScreenSensors")
 _SENSOR_HOST_PROCESS: subprocess.Popen | None = None
 _SENSOR_HOST_STARTED_AT = 0.0
+# True once this session launched its own sensor host at least once.
+_SENSOR_HOST_SESSION_STARTED = False
 _SENSOR_HOST_LOCK = threading.RLock()
 _LEGACY_SENSOR_TASKS_CLEANED = False
 APP_ICON_PATH = RESOURCE_ROOT / "sabasakal-logo.ico"
@@ -543,7 +549,7 @@ def _serialize_sensor_host(function):
 @_serialize_sensor_host
 def ensure_sensor_host(restart: bool = False) -> bool:
     """Run exactly one hidden sensor child under the already-elevated UI."""
-    global _SENSOR_HOST_PROCESS, _SENSOR_HOST_STARTED_AT
+    global _SENSOR_HOST_PROCESS, _SENSOR_HOST_STARTED_AT, _SENSOR_HOST_SESSION_STARTED
     if os.name != "nt" or not getattr(sys, "frozen", False):
         return False
     _remove_legacy_sensor_tasks_once()
@@ -576,6 +582,7 @@ def ensure_sensor_host(restart: bool = False) -> bool:
             env=environment,
         )
         _SENSOR_HOST_STARTED_AT = time.monotonic()
+        _SENSOR_HOST_SESSION_STARTED = True
         _runtime_log(f"sensor host started directly; pid={_SENSOR_HOST_PROCESS.pid}")
         return True
     except OSError as exc:
@@ -634,6 +641,15 @@ def nudge_sensor_host_if_stale(
     # Do not kill a healthy new child before it can publish its first sample.
     if _sensor_host_is_running() and time.monotonic() - _SENSOR_HOST_STARTED_AT < max_age:
         return False
+    if not _SENSOR_HOST_SESSION_STARTED:
+        # The old cache belongs to the previous session; this is a normal
+        # first start, not a watchdog restart.
+        started = ensure_sensor_host(restart=False)
+        _runtime_log(
+            "sensor host first start (previous session cache)"
+            if started else "sensor host first start failed"
+        )
+        return False
     restarted = ensure_sensor_host(restart=True)
     _runtime_log(
         "stale sensor cache; direct host restarted"
@@ -682,6 +698,33 @@ def _request_existing_window() -> str | None:
         return token
     except OSError:
         return None
+
+
+def request_running_instance_quit(timeout_seconds: float = 15.0) -> bool:
+    """Ask the primary instance to run its normal tray-Exit path."""
+    try:
+        APP_DATA.mkdir(parents=True, exist_ok=True)
+        token = f"{os.getpid()}-{time.time_ns()}"
+        QUIT_ACK_PATH.unlink(missing_ok=True)
+        QUIT_REQUEST_PATH.write_text(token, encoding="ascii")
+    except OSError:
+        return False
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while time.monotonic() < deadline:
+        try:
+            if QUIT_ACK_PATH.read_text(encoding="ascii").strip() == token:
+                QUIT_ACK_PATH.unlink(missing_ok=True)
+                return True
+        except OSError:
+            pass
+        time.sleep(0.10)
+    # Nobody consumed it: do not let a later launch quit on a stale request.
+    try:
+        if QUIT_REQUEST_PATH.read_text(encoding="ascii").strip() == token:
+            QUIT_REQUEST_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return False
 
 
 def _wait_for_activation_ack(token: str, timeout_seconds: float = 2.0) -> bool:
@@ -1105,10 +1148,50 @@ def _startup_task_exists() -> bool:
         return False
 
 
+def _startup_task_command() -> str | None:
+    """Return the registered startup task's executable, or None if absent."""
+    try:
+        result = subprocess.run(
+            ["schtasks.exe", "/Query", "/TN", STARTUP_TASK_NAME, "/XML"],
+            capture_output=True, timeout=10, creationflags=_hidden_flags(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    raw = result.stdout or b""
+    text = raw if isinstance(raw, str) else None
+    if text is None:
+        for encoding in ("utf-16", "utf-8", "mbcs"):
+            try:
+                text = raw.decode(encoding)
+                if "<Task" in text:
+                    break
+            except (UnicodeError, LookupError):
+                continue
+        else:
+            text = raw.decode("utf-8", "replace")
+    match = re.search(r"<Command>(.*?)</Command>", text or "", re.S)
+    if not match:
+        return ""
+    from html import unescape
+    return unescape(match.group(1)).strip().strip('"')
+
+
+def _same_path(a: str, b: str) -> bool:
+    try:
+        return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
+    except OSError:
+        return False
+
+
 def _startup_task_is_current() -> bool:
     try:
         saved = json.loads(STARTUP_TASK_STATE_PATH.read_text(encoding="utf-8"))
-        return saved == _expected_startup_task_state() and _startup_task_exists()
+        if saved != _expected_startup_task_state():
+            return False
+        command = _startup_task_command()
+        return bool(command) and _same_path(command, _startup_action()[0])
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
 
@@ -1187,9 +1270,32 @@ def set_windows_autostart(enabled: bool) -> None:
 
 
 def reconcile_windows_autostart(enabled: bool) -> bool:
-    """Repair the sole elevated startup task and follow the current EXE path."""
+    """Repair the sole elevated startup task and follow the current EXE path.
+
+    Enabled: install/refresh the task for this EXE. Disabled: a task left
+    behind by an older (moved/deleted) copy is removed when its EXE no longer
+    exists, or re-pointed to this EXE when it targets another existing copy.
+    """
     try:
-        set_windows_autostart(enabled)
+        command = _startup_task_command()
+        if enabled:
+            if command and not _same_path(command, _startup_action()[0]):
+                _runtime_log(f"startup task repaired; old={command}")
+            set_windows_autostart(True)
+            return True
+        if command is None:
+            return True
+        current = _startup_action()[0]
+        if command and _same_path(command, current):
+            return True
+        if not command or not Path(command).exists():
+            _runtime_log(f"stale startup task removed; target={command or '?'}")
+            if not _remove_windows_startup_task():
+                raise OSError("Stale Windows startup task could not be removed")
+            return True
+        _runtime_log(f"startup task repaired; old={command}; new={current}")
+        if not _install_windows_startup_task():
+            raise OSError("Elevated Windows startup task could not be repaired")
         return True
     except Exception as exc:
         _runtime_log(
@@ -1277,7 +1383,22 @@ class ControlPanel(QWidget):
         if smoke_test:
             QTimer.singleShot(900, self.close)
 
+    def _consume_quit_request(self) -> bool:
+        if not QUIT_REQUEST_PATH.exists():
+            return False
+        try:
+            token = QUIT_REQUEST_PATH.read_text(encoding="ascii").strip()
+            QUIT_REQUEST_PATH.unlink(missing_ok=True)
+            QUIT_ACK_PATH.write_text(token, encoding="ascii")
+        except OSError:
+            return False
+        _runtime_log("quit requested via --quit")
+        self._exit_application()
+        return True
+
     def _consume_activation_request(self) -> None:
+        if not self._smoke_test and self._consume_quit_request():
+            return
         if not ACTIVATE_REQUEST_PATH.exists():
             return
         try:
@@ -3536,13 +3657,18 @@ def main() -> int:
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--language", choices=tuple(SUPPORTED_LANGUAGES))
     parser.add_argument("--recover-pid", type=int, default=0)
+    parser.add_argument("--quit", action="store_true")
     args, _unknown = parser.parse_known_args()
+    if args.quit:
+        return 0 if request_running_instance_quit() else 1
     if args.recover_pid:
         _wait_for_recovery_parent(args.recover_pid)
     if not args.smoke_test and args.capture is None and not _acquire_single_instance(
         activate_existing=not args.autorun,
     ):
         return 0
+    if not args.smoke_test and args.capture is None:
+        QUIT_REQUEST_PATH.unlink(missing_ok=True)
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_DISPLAY_NAME)
     app.setOrganizationName("Sabasakal")

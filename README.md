@@ -1,6 +1,13 @@
 # Sabasakal Mini Screen 3.5″
 
-Version 1.1.4
+Version 1.1.5
+
+1.1.5 fixes: a powered-off wireless headset/mouse (USB dongle still plugged
+in) now disappears from the screen within seconds - G HUB's connection state
+is authoritative and Windows cached battery values need a live connection;
+the first sensor-host start is no longer logged as a restart; a startup task
+left pointing at an old copy is repaired or removed; `--quit` asks the running
+instance to exit cleanly.
 
 1.1.4 fixes: the Windows battery scan no longer runs the 30-60 s
 AssociationEndpoint inquiry that Windows periodically aborted (E_ABORT log

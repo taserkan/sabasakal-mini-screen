@@ -1,6 +1,11 @@
 # Sabasakal Mini Screen 3.5″
 
-Sürüm 1.1.4
+Sürüm 1.1.5
+
+1.1.5 düzeltmeleri: kapatılan kablosuz kulaklık/fare (USB alıcı takılı kalsa
+da) birkaç saniye içinde ekrandan kalkıyor; ilk sensör başlatması artık
+yeniden başlatma olarak günlüğe yazılmıyor; eski kopyayı gösteren başlangıç
+görevi onarılıyor veya siliniyor; `--quit` çalışan uygulamayı düzgünce kapatıyor.
 
 1.1.4 düzeltmeleri: Windows pil taraması artık Windows'un zaman zaman iptal
 ettiği 30-60 sn'lik AssociationEndpoint taramasını yapmıyor (E_ABORT günlük
