@@ -157,23 +157,190 @@ def _trusted_install_roots() -> tuple[str, ...]:
     return tuple(dict.fromkeys(roots))
 
 
-def is_trusted_simconnect_location(executable: str | os.PathLike) -> bool:
-    """Accept only Program Files or Microsoft Store (WindowsApps) installs.
+_UNTRUSTED_WELL_KNOWN_SIDS = frozenset({
+    "S-1-1-0",       # Everyone
+    "S-1-5-11",      # Authenticated Users
+    "S-1-5-32-545",  # BUILTIN\Users
+    "S-1-5-4",       # INTERACTIVE
+})
+# Only these principals may hold write rights. Anything else (OWNER RIGHTS,
+# per-user SIDs, custom groups, ...) makes the location untrusted.
+_ADMIN_ONLY_SIDS = frozenset({
+    "S-1-5-18",      # SYSTEM
+    "S-1-5-19",      # LOCAL SERVICE
+    "S-1-5-20",      # NETWORK SERVICE
+    "S-1-5-32-544",  # BUILTIN\Administrators
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",  # TrustedInstaller
+})
+# Rights that let a principal replace or plant files (write/append data = add
+# file/subdirectory on folders), delete them, or rewrite the ACL/owner.
+_WRITE_MASK = (
+    0x00000002 | 0x00000004 | 0x00010000 | 0x00040000 | 0x00080000
+    | 0x40000000 | 0x10000000
+)
 
-    The application runs elevated. Loading a DLL from a user-writable folder
-    next to an arbitrary process named FlightSimulator2024.exe would allow
-    privilege escalation, therefore other locations are refused.
-    """
-    try:
-        resolved = os.path.normcase(str(Path(executable).resolve()))
-    except (OSError, ValueError):
-        return False
+
+def _is_xbox_games_path(resolved: str) -> bool:
+    parts = Path(resolved).parts
+    return (
+        len(parts) >= 2 and len(parts[0]) >= 2 and parts[0][1] == ":"
+        and parts[1].lower() == "xboxgames"
+    )
+
+
+def _is_trusted_root(resolved: str) -> bool:
     if f"{os.sep}windowsapps{os.sep}" in resolved:
+        return True
+    if _is_xbox_games_path(resolved):
         return True
     return any(resolved.startswith(root) for root in _trusted_install_roots())
 
 
+def _local_free(pointer) -> None:
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree(ctypes.cast(pointer, ctypes.c_void_p))
+
+
+def _sid_to_string(advapi32, sid) -> str | None:
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    text = wintypes.LPWSTR()
+    if not advapi32.ConvertSidToStringSidW(ctypes.c_void_p(sid), ctypes.byref(text)):
+        return None
+    try:
+        return text.value
+    finally:
+        _local_free(text)
+
+
+def _current_user_sid() -> str | None:
+    if os.name != "nt":
+        return None
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+    ]
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        return None
+    try:
+        size = wintypes.DWORD()
+        advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
+        buffer = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(token, 1, buffer, size, ctypes.byref(size)):
+            return None
+        sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+        return _sid_to_string(advapi32, sid)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+class _AclSizeInfo(ctypes.Structure):
+    _fields_ = [
+        ("AceCount", wintypes.DWORD),
+        ("AclBytesInUse", wintypes.DWORD),
+        ("AclBytesFree", wintypes.DWORD),
+    ]
+
+
+def _writable_by_untrusted(path: Path, untrusted: frozenset[str]) -> bool | None:
+    """True if an allow-ACE grants write rights to an untrusted SID.
+
+    None means the ACL could not be read; callers treat that as untrusted.
+    """
+    if os.name != "nt":
+        return None
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetAclInformation.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_int]
+    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    # SE_FILE_OBJECT = 1, DACL_SECURITY_INFORMATION = 4
+    result = advapi32.GetNamedSecurityInfoW(
+        str(path), 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor),
+    )
+    if result != 0:
+        return None
+    try:
+        if not dacl.value:
+            return True  # NULL DACL grants everyone full access.
+        info = _AclSizeInfo()
+        if not advapi32.GetAclInformation(dacl, ctypes.byref(info), ctypes.sizeof(info), 2):
+            return None
+        for index in range(info.AceCount):
+            ace = ctypes.c_void_p()
+            if not advapi32.GetAce(dacl, index, ctypes.byref(ace)):
+                return None
+            header = ctypes.cast(ace, ctypes.POINTER(ctypes.c_ubyte))
+            ace_type, ace_flags = header[0], header[1]
+            if ace_type != 0 or ace_flags & 0x08:  # allow-ACE that applies here
+                continue
+            mask = ctypes.cast(ace.value + 4, ctypes.POINTER(wintypes.DWORD))[0]
+            if not mask & _WRITE_MASK:
+                continue
+            sid = _sid_to_string(advapi32, ace.value + 8)
+            if sid is None or sid in untrusted or sid not in _ADMIN_ONLY_SIDS:
+                return True
+        return False
+    finally:
+        _local_free(descriptor)
+
+
+def _acl_protected(dll: Path) -> tuple[bool, str]:
+    untrusted = set(_UNTRUSTED_WELL_KNOWN_SIDS)
+    user_sid = _current_user_sid()
+    if user_sid:
+        untrusted.add(user_sid)
+    frozen = frozenset(untrusted)
+    for target in (dll.parent, dll):
+        writable = _writable_by_untrusted(target, frozen)
+        if writable is None:
+            return False, f"ACL could not be read: {target}"
+        if writable:
+            return False, f"writable by non-admin principals: {target}"
+    return True, "folder and DLL ACL are admin-only"
+
+
+def simconnect_trust_decision(library: str | os.PathLike) -> tuple[bool, str]:
+    """Decide whether SimConnect_internal.dll may be loaded (the app runs elevated).
+
+    Accepted: Program Files, WindowsApps, <drive>:\\XboxGames (Xbox app
+    managed), or any folder where neither the folder nor the DLL is writable
+    by Users, Authenticated Users, Everyone, INTERACTIVE or the current user.
+    """
+    try:
+        path = Path(library).resolve()
+    except (OSError, ValueError) as error:
+        return False, f"path could not be resolved: {error}"
+    if _is_trusted_root(os.path.normcase(str(path))):
+        return True, "trusted install root"
+    if not path.is_file():
+        return False, f"DLL not found: {path}"
+    return _acl_protected(path)
+
+
+def is_trusted_simconnect_location(executable: str | os.PathLike) -> bool:
+    """Path-only check: Program Files, WindowsApps or <drive>:\\XboxGames."""
+    try:
+        resolved = os.path.normcase(str(Path(executable).resolve()))
+    except (OSError, ValueError):
+        return False
+    return _is_trusted_root(resolved)
+
+
+_last_refusal: str | None = None
+
+
 def find_simconnect_library(process: psutil.Process | None = None) -> Path | None:
+    global _last_refusal
     process = process or _flight_simulator_process()
     if process is None:
         return None
@@ -183,11 +350,18 @@ def find_simconnect_library(process: psutil.Process | None = None) -> Path | Non
         return None
     if not executable:
         return None
-    if not is_trusted_simconnect_location(executable):
-        log_exception("msfs", f"SimConnect DLL refused outside Program Files/WindowsApps: {executable}")
-        return None
     candidate = Path(executable).resolve().parent / "SimConnect_internal.dll"
-    return candidate if candidate.is_file() else None
+    if not candidate.is_file():
+        trusted, reason = False, f"MSFS skipped: SimConnect_internal.dll not found next to {executable}"
+    else:
+        trusted, why = simconnect_trust_decision(candidate)
+        reason = f"MSFS skipped: SimConnect DLL refused ({why}): {candidate}"
+    if not trusted:
+        if reason != _last_refusal:
+            _last_refusal = reason
+            log_exception("msfs", reason)
+        return None
+    return candidate
 
 
 class _ProcessWatch:
@@ -694,5 +868,6 @@ class FlightPhaseTracker:
 __all__ = [
     "FlightPhaseState", "FlightPhaseTracker", "FlightTelemetry", "LandingRecord",
     "MSFSTelemetryMonitor", "find_simconnect_library", "is_trusted_simconnect_location",
+    "simconnect_trust_decision",
     "PHASE_APPROACH", "PHASE_CRUISE", "PHASE_GROUND", "PHASE_LANDING", "PHASE_RADIO",
 ]

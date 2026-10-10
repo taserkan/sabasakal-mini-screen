@@ -2968,6 +2968,44 @@ class RedesignAndFixScenarios(unittest.TestCase):
             Path(tempfile.gettempdir()) / "FlightSimulator2024.exe"
         ))
 
+    def test_simconnect_xbox_games_root_is_trusted(self) -> None:
+        import msfs_runtime
+        for drive in ("C:", "D:"):
+            self.assertTrue(msfs_runtime.is_trusted_simconnect_location(
+                drive + r"\XboxGames\Microsoft Flight Simulator 2024\Content\FlightSimulator2024.exe"
+            ))
+        self.assertFalse(msfs_runtime.is_trusted_simconnect_location(r"C:\Games\XboxGames\x.exe"))
+
+    def test_simconnect_acl_check_refuses_user_writable_folder(self) -> None:
+        import msfs_runtime
+        with tempfile.TemporaryDirectory() as directory:
+            dll = Path(directory) / "SimConnect_internal.dll"
+            dll.write_bytes(b"MZ")
+            trusted, reason = msfs_runtime.simconnect_trust_decision(dll)
+            self.assertFalse(trusted)
+            self.assertIn("writable", reason)
+
+    def test_simconnect_acl_check_accepts_protected_folder(self) -> None:
+        import msfs_runtime
+        dll = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "kernel32.dll"
+        with patch.object(msfs_runtime, "_is_trusted_root", return_value=False):
+            trusted, reason = msfs_runtime.simconnect_trust_decision(dll)
+        self.assertTrue(trusted, reason)
+
+    def test_simconnect_refusal_is_logged_once(self) -> None:
+        import msfs_runtime
+        with tempfile.TemporaryDirectory() as directory:
+            exe = Path(directory) / "FlightSimulator2024.exe"
+            exe.write_bytes(b"MZ")
+            (Path(directory) / "SimConnect_internal.dll").write_bytes(b"MZ")
+            process = type("P", (), {"info": {"exe": str(exe)}})()
+            with patch.object(msfs_runtime, "log_exception") as logged, \
+                    patch.object(msfs_runtime, "_last_refusal", None):
+                self.assertIsNone(msfs_runtime.find_simconnect_library(process))
+                self.assertIsNone(msfs_runtime.find_simconnect_library(process))
+            self.assertEqual(logged.call_count, 1)
+            self.assertIn("MSFS skipped", logged.call_args[0][1])
+
     def test_design_setting_is_persisted_and_sanitised(self) -> None:
         self.assertEqual(gui.DEFAULT_SETTINGS["design"], "new")
         with tempfile.TemporaryDirectory() as directory:
