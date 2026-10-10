@@ -89,7 +89,7 @@ internal static class Program
         }
     }
 
-    private static void WriteCache(string cachePath, float? cpuTemp, float? cpuClockMhz)
+    private static void WriteCache(string cachePath, float? cpuTemp, float? cpuClockMhz, float? cpuPower)
     {
         string? directory = Path.GetDirectoryName(cachePath);
         if (!string.IsNullOrWhiteSpace(directory))
@@ -98,6 +98,7 @@ internal static class Program
         string payload = JsonSerializer.Serialize(new
         {
             cpu_temp = cpuTemp,
+            cpu_power = cpuPower,
             cpu_freq = cpuClockMhz.HasValue
                 ? (float?)(cpuClockMhz.Value / 1000f)
                 : null,
@@ -189,9 +190,12 @@ internal static class Program
                     cpu, SensorType.Clock,
                     sensor => sensor.Name.StartsWith("CPU Core", StringComparison.OrdinalIgnoreCase));
 
+                float? cpuPower = FirstValue(
+                    cpu, SensorType.Power, "Package", "CPU Package", "CPU Cores");
+
                 try
                 {
-                    WriteCache(cachePath, cpuTemp, cpuClock);
+                    WriteCache(cachePath, cpuTemp, cpuClock, cpuPower);
                     consecutiveWriteErrors = 0;
                 }
                 catch (Exception writeError) when (

@@ -1312,7 +1312,7 @@ class EmbeddedSensorMonitor:
         self._lock = threading.Lock()
         self._started = False
         self._process: subprocess.Popen[str] | None = None
-        self._values: dict[str, float | None] = {"cpu_temp": None, "cpu_freq": None}
+        self._values: dict[str, float | None] = {"cpu_temp": None, "cpu_freq": None, "cpu_power": None}
 
     def start(self) -> None:
         with self._lock:
@@ -1354,6 +1354,7 @@ class EmbeddedSensorMonitor:
             return {
                 "cpu_temp": float(payload["cpu_temp"]) if payload.get("cpu_temp") is not None else None,
                 "cpu_freq": float(payload["cpu_freq"]) if payload.get("cpu_freq") is not None else None,
+                "cpu_power": float(payload["cpu_power"]) if payload.get("cpu_power") is not None else None,
             }
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
@@ -1464,8 +1465,12 @@ def run_sensor_bridge(
             cpu_freq_mhz = EmbeddedSensorMonitor._sensor_value(
                 sensors, "Clock", ("Cores (Average Effective)", "Cores (Average)", "Core #1"),
             )
+            cpu_power = EmbeddedSensorMonitor._sensor_value(
+                sensors, "Power", ("Package", "CPU Package", "CPU Cores"),
+            )
             values = {
                 "cpu_temp": cpu_temp,
+                "cpu_power": cpu_power,
                 "cpu_freq": (cpu_freq_mhz / 1000.0) if cpu_freq_mhz else None,
                 "timestamp": time.time(),
             }
@@ -1945,6 +1950,13 @@ class NvidiaNvmlMonitor:
                 ctypes.c_void_p, ctypes.POINTER(_NvmlMemoryInfo),
             ]
             dll.nvmlDeviceGetMemoryInfo.restype = ctypes.c_int
+            try:
+                dll.nvmlDeviceGetPowerUsage.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint),
+                ]
+                dll.nvmlDeviceGetPowerUsage.restype = ctypes.c_int
+            except AttributeError:
+                pass
             if dll.nvmlInit_v2() != 0:
                 return False
             count = ctypes.c_uint()
@@ -2000,6 +2012,19 @@ class NvidiaNvmlMonitor:
             )
             return load, heat, used_mb
 
+    def read_power_watts(self) -> float | None:
+        """Board power draw in watts (nvmlDeviceGetPowerUsage), if supported."""
+        with self._lock:
+            if not self._initialise() or self._dll is None:
+                return None
+            milliwatts = ctypes.c_uint()
+            try:
+                if self._dll.nvmlDeviceGetPowerUsage(self._handle, ctypes.byref(milliwatts)) != 0:
+                    return None
+            except (AttributeError, OSError):
+                return None
+            return milliwatts.value / 1000.0 if milliwatts.value else None
+
 
 NVIDIA_MONITOR = NvidiaNvmlMonitor()
 
@@ -2032,6 +2057,8 @@ def get_metrics() -> dict[str, float | None]:
         "gpu_load": gpu_load,
         "gpu_temp": gpu_temp if gpu_temp > 0 else None,
         "gpu_memory": task_gpu_memory if task_gpu_memory is not None else fallback_gpu_memory,
+        "gpu_power": NVIDIA_MONITOR.read_power_watts(),
+        "cpu_power": sensor_values.get("cpu_power"),
         # Task Manager defines used RAM as Total - Available.  This explicitly
         # matches that formula on Windows instead of relying on platform-
         # specific psutil percentage semantics.
