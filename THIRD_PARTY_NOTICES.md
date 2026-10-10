@@ -14,8 +14,9 @@ binary and source tree include or use the following third-party components.
 | Microsoft .NET runtime libraries | 10.0.x | MIT and bundled third-party terms | https://github.com/dotnet/runtime |
 | Lucide icons | snapshot | ISC | https://lucide.dev |
 | Game-Icons.net icons by Delapouite | snapshot | CC BY 3.0 | https://game-icons.net |
+| Barlow / Barlow Condensed fonts (`fonts/`) | 1.408 | SIL OFL 1.1 | https://github.com/jpt/barlow |
 
-The complete GPL, MPL, Apache and .NET license texts are in `licenses/`.
+The complete GPL, MPL, Apache, OFL and .NET license texts are in `licenses/`.
 The included display-driver source and its original attribution files are in
 `third_party/turing-smart-screen-python/`. Icon details are in
 `icons/LICENSES.md`.

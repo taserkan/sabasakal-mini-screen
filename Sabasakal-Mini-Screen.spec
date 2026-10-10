@@ -20,6 +20,10 @@ datas = [
     (str(driver_root / 'library' / 'log.py'), 'library'),
     (str(driver_root / 'library' / 'LICENSE'), 'library'),
     ('vendor', 'vendor'),
+    ('fonts', 'fonts'),
+    ('licenses', 'licenses'),
+    ('THIRD_PARTY_NOTICES.md', '.'),
+    ('LICENSE', '.'),
 ]
 binaries = [
     ('sensor-helper/publish/SabasakalSensorHost.exe', 'sensor-helper'),
@@ -56,7 +60,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
@@ -75,7 +79,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='Sabasakal-Mini-Screen',
 )

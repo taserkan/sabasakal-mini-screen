@@ -20,6 +20,8 @@ import json
 import math
 import os
 import re
+import hmac
+import secrets
 import subprocess
 import sys
 import threading
@@ -61,7 +63,33 @@ else:
 ICON_ROOT = ROOT / "icons" / "png"
 SENSOR_ROOT = ROOT / "vendor"
 GSI_PORT = 38791
-GSI_TOKEN = "cs2-screen-local-v1"
+GSI_TOKEN_PATH = APP_DATA / "gsi-token.txt"
+_GSI_TOKEN_CACHE: str | None = None
+
+
+def gsi_token() -> str:
+    """Random per-install GSI token stored in %APPDATA% (not a shared constant)."""
+    global _GSI_TOKEN_CACHE
+    if _GSI_TOKEN_CACHE:
+        return _GSI_TOKEN_CACHE
+    token = ""
+    try:
+        token = GSI_TOKEN_PATH.read_text(encoding="ascii").strip()
+    except OSError:
+        token = ""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{24,128}", token or ""):
+        token = secrets.token_urlsafe(32)
+        try:
+            GSI_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+            temporary = GSI_TOKEN_PATH.with_suffix(f".{os.getpid()}.tmp")
+            temporary.write_text(token, encoding="ascii")
+            os.replace(temporary, GSI_TOKEN_PATH)
+        except OSError as exc:
+            log_exception("gsi", "GSI token could not be stored", exc)
+    _GSI_TOKEN_CACHE = token
+    return token
+
+
 GSI_THROTTLE_SECONDS = 0.2
 GSI_MAX_PAYLOAD_BYTES = 1024 * 1024
 DEATHMATCH_RESULT_HOLD_SECONDS = 7.0
@@ -701,6 +729,12 @@ class CS2GameState:
 
 class _GSIHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler name
+        # CS2 never sends an Origin header; browsers always do for cross-site
+        # POSTs. Rejecting it blocks drive-by requests from web pages.
+        if self.headers.get("Origin") is not None:
+            self.send_response(403)
+            self.end_headers()
+            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > GSI_MAX_PAYLOAD_BYTES:
@@ -708,8 +742,11 @@ class _GSIHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            token = str((payload.get("auth") or {}).get("token") or "")
-            if token == GSI_TOKEN:
+            if not isinstance(payload, dict):
+                raise ValueError("GSI payload must be an object")
+            auth = payload.get("auth")
+            token = str((auth if isinstance(auth, dict) else {}).get("token") or "")
+            if hmac.compare_digest(token.encode(), gsi_token().encode()):
                 self.server.game_state.update(payload)  # type: ignore[attr-defined]
             self.send_response(200)
             self.end_headers()
@@ -1087,7 +1124,7 @@ def gsi_config_text() -> str:
     "heartbeat" "5.0"
     "auth"
     {{
-        "token" "{GSI_TOKEN}"
+        "token" "{gsi_token()}"
     }}
     "data"
     {{
