@@ -64,7 +64,7 @@ from i18n import SUPPORTED_LANGUAGES, normalize_language, translate
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -437,7 +437,10 @@ SETTINGS_CARD_HEIGHT = 706 + (QUICK_CARD_HEIGHT - 252)
 WINDOW_DEFAULT_SIZE = (1200, 890 + (QUICK_CARD_HEIGHT - 252))
 WINDOW_MINIMUM_SIZE = (1160, 860 + (QUICK_CARD_HEIGHT - 252))
 WORKER_RESTART_MAX_DELAY_MS = 60000
-DISPLAY_STALL_SECONDS = 8.0
+# Must exceed the worst-case ScreenSession reconnect (write timeout + three
+# open attempts with back-off) so an unplug is recovered in-process instead of
+# being mistaken for a native write that blocks forever.
+DISPLAY_STALL_SECONDS = 30.0
 
 
 def set_process_priority(below_normal: bool, process=None) -> bool:
@@ -995,7 +998,9 @@ def load_settings() -> dict:
         palette = saved.get("palette", settings["palette"])
         if palette == "Mono":
             palette = "Tek renk"
-        if palette not in PALETTES and palette not in settings["custom_palettes"]:
+        if not isinstance(palette, str) or (
+            palette not in PALETTES and palette not in settings["custom_palettes"]
+        ):
             palette = settings["palette"]
         settings["palette"] = palette
         palette_fallback = (
@@ -3111,9 +3116,12 @@ class ControlPanel(QWidget):
                                 snapshot.connected,
                                 check_gsi_restart(game_active, snapshot.connected),
                             )
-                        flight_state = (
-                            phase_tracker.update(flight_telemetry) if msfs_active else None
-                        )
+                        if msfs_active:
+                            flight_state = phase_tracker.update(flight_telemetry)
+                        else:
+                            # MSFS closed: the next session starts clean.
+                            phase_tracker.reset()
+                            flight_state = None
                         requested_cs = cs_screen_for(snapshot) if design_mode == "cs2" else ""
                         requested_phase = getattr(flight_state, "phase", "") if design_mode == "msfs" else ""
                         design_mode, shown_cs, shown_phase = screen_stabilizer.update(
@@ -3415,6 +3423,16 @@ class ControlPanel(QWidget):
                                     for region in send_regions:
                                         sent_frame.paste(transfer_frame.crop(region), region)
                 except Exception as exc:
+                    if not isinstance(exc, OSError):
+                        # A sensor/render/runtime bug is not a USB failure:
+                        # keep the serial session, log it and resend a full
+                        # frame next cycle instead of reconnecting the panel.
+                        _runtime_log(f"frame cycle failed: {type(exc).__name__}: {exc}")
+                        sent_frame = None
+                        last_view_mode = None
+                        self._screen_progress_at = time.monotonic()
+                        self.stop_event.wait(1.0)
+                        continue
                     self.screen_connected.clear()
                     _runtime_log(f"display refresh failed: {type(exc).__name__}: {exc}")
                     self.signals.status.emit(translate(
@@ -3467,7 +3485,9 @@ class ControlPanel(QWidget):
                         else "MSFS 2024 açık · kokpit bağlantısı bekleniyor"
                     )
                 elif media_mode:
-                    label = media_snapshot.platform or "Sistem sesi"
+                    label = media_snapshot.platform or translate(
+                        "Sistem sesi", current.get("language", "tr"),
+                    )
                     status_message = "{label} · ritim görselleştiriliyor"
                 else:
                     status_message = (
@@ -3507,7 +3527,9 @@ class ControlPanel(QWidget):
                         f"display could not be powered off: {type(exc).__name__}: {exc}"
                     )
                 try:
-                    screen.show(Image.new("RGB", (WIDTH, HEIGHT), "#000000"))
+                    getattr(screen, "show_once", screen.show)(
+                        Image.new("RGB", (WIDTH, HEIGHT), "#000000")
+                    )
                     _runtime_log("blank frame sent before display stop")
                 except Exception as exc:
                     _runtime_log(
@@ -3545,7 +3567,10 @@ class ControlPanel(QWidget):
             self.tray_start_action.setEnabled(True)
             self.tray_stop_action.setEnabled(False)
         self._set_editing_enabled(True)
-        connection_prefixes = ("Bağlantı", "Connection")
+        connection_prefixes = (
+            "Bağlantı", "Connection", "Mini ekran bekleniyor",
+            "Refreshing connection", "Waiting for mini display",
+        )
         if not self.status_label.text().startswith(connection_prefixes):
             self._set_status(self._tr("Ekran durduruldu"), "#6F7C90")
         if self._exit_requested:

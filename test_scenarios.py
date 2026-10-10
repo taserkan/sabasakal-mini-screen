@@ -5144,5 +5144,139 @@ class StartupAndQuit115Tests(unittest.TestCase):
         self.assertLess(main_src.index("args.quit"), main_src.index("_acquire_single_instance"))
 
 
+
+def _test_render_bug_keeps_usb_session(self) -> None:
+    """A non-USB error in one frame cycle must not reconnect the panel."""
+    panel = self.make_panel()
+    panel.stop_event = FastEvent()
+    panel.screen_connected = TrackingEvent()
+    screen = FakeScreen(panel.stop_event)
+    sessions: list[object] = []
+    calls = {"n": 0}
+
+    def metrics():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("sensor bug")
+        return {}
+
+    patches = list(self.worker_patches())
+    patches[4] = patch.object(gui, "get_metrics", side_effect=metrics)
+    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6],             patches[7], patches[8], patches[9], patch.object(
+                gui, "ScreenSession", side_effect=lambda *_a: sessions.append(1) or screen):
+        panel._screen_worker()
+    self.assertEqual(len(sessions), 1)
+    self.assertNotIn("close", screen.events[:-1])
+    panel.close()
+
+
+UiAndConnectionScenarios.test_render_bug_keeps_usb_session = _test_render_bug_keeps_usb_session
+
+
+import itertools  # noqa: E402
+from i18n import translate  # noqa: E402
+from msfs_runtime import FlightPhaseTracker  # noqa: E402
+from battery_runtime import BatteryDevice  # noqa: E402
+from weather_runtime import WeatherReading  # noqa: E402
+
+
+class Audit116Scenarios(unittest.TestCase):
+    def test_msfs_restart_in_air_does_not_record_fake_landing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tracker = FlightPhaseTracker(Path(directory) / "landings.json")
+            tracker.update(FlightTelemetry(connected=True, on_ground=False, altitude_agl_ft=8000,
+                                           vertical_speed_fpm=-2400), 0.0)
+            tracker.update(FlightTelemetry(), 1.0)  # sim closed/crashed mid-air
+            state = tracker.update(FlightTelemetry(connected=True, on_ground=True), 2.0)
+            tracker.update(FlightTelemetry(connected=True, on_ground=True), 20.0)
+            self.assertNotEqual(state.phase, "landing")
+            self.assertEqual(tracker.history, ())
+
+    def test_explicit_reset_after_msfs_closed(self) -> None:
+        tracker = FlightPhaseTracker(None)
+        tracker.update(FlightTelemetry(on_ground=False, vertical_speed_fpm=-900), 0.0)
+        tracker.reset()
+        self.assertEqual(tracker.update(FlightTelemetry(on_ground=True), 1.0).phase, "ground")
+        self.assertEqual(tracker.history, ())
+
+    def test_route_total_resets_for_next_flight_after_landing_window(self) -> None:
+        tracker = FlightPhaseTracker(None)
+        tracker.update(FlightTelemetry(on_ground=False, destination_ete_s=3600, ground_speed_kt=500), 0.0)
+        tracker.update(FlightTelemetry(on_ground=True, vertical_speed_fpm=-150), 1.0)
+        tracker.update(FlightTelemetry(on_ground=True, ground_speed_kt=0), 10.0)
+        self.assertIsNotNone(tracker.update(FlightTelemetry(on_ground=True, ground_speed_kt=0), 30.0).route_total_nm)
+        later = tracker.update(FlightTelemetry(on_ground=True, ground_speed_kt=0), 100.0)
+        self.assertIsNone(later.route_total_nm)
+
+    def test_removed_weather_city_disappears_even_without_network(self) -> None:
+        import weather_runtime as wr
+        monitor = wr.WeatherMonitor(["İstanbul", "Ankara"])
+        monitor._snapshot = wr.WeatherSnapshot(readings=(
+            wr.WeatherReading("İstanbul", 20.0, 0), wr.WeatherReading("Ankara", 10.0, 0)))
+        monitor.set_cities(["Ankara"])
+        self.assertEqual([r.city for r in monitor.snapshot().readings], ["Ankara"])
+
+    def test_codex_battery_and_weather_text_stay_inside_their_cells(self) -> None:
+        from PIL import ImageDraw
+        boxes: list[tuple] = []
+        original = ImageDraw.ImageDraw.text
+
+        def record(draw, xy, value, fill=None, font=None, anchor=None, *a, **k):
+            if font is not None and str(value).strip():
+                boxes.append((draw.textbbox(xy, value, font=font, anchor=anchor), str(value)))
+            return original(draw, xy, value, fill, font, anchor, *a, **k)
+
+        devices = (
+            BatteryDevice("a", "Mouse", 100, "mouse"),
+            BatteryDevice("b", "Headset", 100, "headset"),
+            BatteryDevice("c", "Keyboard", 100, "keyboard"),
+        )
+        weather = (WeatherReading("Kahramanmaraş Afşin Çağlayancerit", -12.0, 3),)
+        metrics = {"cpu_load": 100.0, "gpu_load": 100.0, "ram_load": 100.0, "cpu_temp": 99.0,
+                   "gpu_temp": 99.0, "cpu_freq": 5.8, "gpu_memory": 24000.0, "ram_used_gb": 127.9,
+                   "ram_total_gb": 128.0, "ram_used": 127.9}
+        for language in ("tr", "en"):
+            for count in (1, 3):
+                boxes.clear()
+                with patch.object(ImageDraw.ImageDraw, "text", record):
+                    screen_app.render_screen(metrics, None, False, battery_devices=devices[:count],
+                                             weather_readings=weather, language=language)
+                for (box, value) in boxes:
+                    self.assertGreaterEqual(box[0], 0, value)
+                    self.assertLessEqual(box[2], 480, value)
+                for (b1, t1), (b2, t2) in itertools.combinations(boxes, 2):
+                    overlap_x = min(b1[2], b2[2]) - max(b1[0], b2[0])
+                    overlap_y = min(b1[3], b2[3]) - max(b1[1], b2[1])
+                    self.assertFalse(overlap_x > 2 and overlap_y > 2, (language, count, t1, t2))
+
+    def test_design_tooltip_and_system_audio_label_are_translated(self) -> None:
+        self.assertEqual(
+            translate("Claude: oyuna ve uçuş evresine göre değişen sade ekranlar. Codex: önceki görünüm.", "en")[:7],
+            "Claude:")
+        self.assertEqual(translate("Sistem sesi", "en") != "Sistem sesi", True)
+
+    def test_wrong_typed_palette_does_not_discard_other_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(json.dumps({"palette": [], "rotation": "180", "language": "en"}), encoding="utf-8")
+            with patch.object(gui, "SETTINGS_PATH", path):
+                settings = gui.load_settings()
+            self.assertEqual(settings["rotation"], "180")
+            self.assertEqual(settings["language"], "en")
+
+    def test_display_watchdog_outlasts_a_full_reconnect(self) -> None:
+        worst = (screen_app.SERIAL_WRITE_TIMEOUT_SECONDS
+                 + screen_app.SERIAL_RECONNECT_ATTEMPTS * 4.0 + 3.0)
+        self.assertGreater(gui.DISPLAY_STALL_SECONDS, worst)
+
+    def test_stop_blank_frame_never_reconnects(self) -> None:
+        session = screen_app.ScreenSession.__new__(screen_app.ScreenSession)
+        session.display = None
+        session.rotation = "normal"
+        with patch.object(screen_app.ScreenSession, "_reconnect") as reconnect:
+            with self.assertRaises(OSError):
+                session.show_once(Image.new("RGB", (480, 320)))
+        reconnect.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

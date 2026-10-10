@@ -266,7 +266,10 @@ internal static class Program
                 // A sampler wedged for a full minute is a real hang: exit so the
                 // UI starts a fresh host instead of showing frozen values.
                 if (sampleAge > 60_000)
+                {
+                    stop.Cancel();
                     return 2;
+                }
                 if (sampleAge > 15_000)
                     temp = clock = power = null;
                 try
@@ -287,6 +290,8 @@ internal static class Program
                 await Task.Delay(1000);
             }
             stop.Cancel();
+            // Let the sampler finish its current sample before Close() runs.
+            sampler.Join(3000);
             return 0;
         }
         catch (Exception exception)

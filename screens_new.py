@@ -892,7 +892,7 @@ def render_msfs_ground(ctx: NewScreenContext) -> Image.Image:
     title = _t(ctx, "YERDE · TAKSİ") if moving else _t(ctx, "YERDE · PARK")
     _header(draw, ctx, 68, title, fit(draw, f.aircraft_title or "", 14, 250))
     _three_panels(draw, background, 92, 238, (
-        (_t(ctx, "Yer hızı"), _num(f.ground_speed_kt, 0), _t(ctx, "kt · sınır 25"),
+        (_t(ctx, "Yer hızı"), _num(f.ground_speed_kt, 0, ctx.language), _t(ctx, "kt · sınır 25"),
          ORANGE if (f.ground_speed_kt or 0) > 25 else WHITE),
         (_t(ctx, "Yakıt"), _num(_tons(f.fuel_lbs), 1, ctx.language), _t(ctx, "ton")),
         (_t(ctx, "Ağırlık"), _num(_tons(f.total_weight_lbs), 1, ctx.language), _t(ctx, "ton")),
@@ -917,7 +917,8 @@ def render_msfs_cruise(ctx: NewScreenContext) -> Image.Image:
         return image
     climbing = (f.vertical_speed_fpm or 0.0) > 500
     phase = _t(ctx, "TIRMANIŞ") if climbing else _t(ctx, "SEYİR")
-    title = f"{phase} · {_altitude_label(ctx, f.altitude_ft)}"
+    altitude = _altitude_label(ctx, f.altitude_ft)
+    title = f"{phase} · {altitude}" if altitude else phase
     next_wp = ""
     if f.next_wp_id and f.next_wp_distance_nm is not None:
         next_wp = _t(ctx, "Sonraki: {wp} {nm} nm", wp=f.next_wp_id, nm=_num(f.next_wp_distance_nm, 0, ctx.language))
@@ -948,10 +949,10 @@ def render_msfs_cruise(ctx: NewScreenContext) -> Image.Image:
         fuel_color = GREEN if above else RED
     head = f.headwind_kt
     if head is None:
-        wind_value, wind_sub = "—", f"GS {_num(f.ground_speed_kt, 0)}"
+        wind_value, wind_sub = "—", f"GS {_num(f.ground_speed_kt, 0, ctx.language)}"
     else:
         wind_value = f"{'-' if head > 0 else '+'}{int(round(abs(head)))} kt"
-        wind_sub = (_t(ctx, "karşıdan") if head > 0 else _t(ctx, "arkadan")) + f" · GS {_num(f.ground_speed_kt, 0)}"
+        wind_sub = (_t(ctx, "karşıdan") if head > 0 else _t(ctx, "arkadan")) + f" · GS {_num(f.ground_speed_kt, 0, ctx.language)}"
     _three_panels(draw, background, 136, 306, (
         (_t(ctx, "Varış (ETA)"), eta, _duration(ctx, ete)),
         (_t(ctx, "Varışta yakıt"), fuel_value, fuel_sub, fuel_color),
@@ -979,7 +980,7 @@ def render_msfs_approach(ctx: NewScreenContext) -> Image.Image:
     else:
         speed_label, speed_sub, speed_color = _t(ctx, "Hız"), "kt IAS", WHITE
     _three_panels(draw, background, 92, 238, (
-        (speed_label, _num(ias, 0), speed_sub, speed_color),
+        (speed_label, _num(ias, 0, ctx.language), speed_sub, speed_color),
         (_t(ctx, "Alçalma"), _num(f.vertical_speed_fpm, 0, ctx.language), "fpm"),
         (_t(ctx, "Yükseklik"), _num(f.altitude_agl_ft, 0, ctx.language), "ft AGL"),
     ))

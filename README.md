@@ -1,6 +1,14 @@
 # Sabasakal Mini Screen 3.5″
 
-Version 1.1.5
+Version 1.1.6
+
+1.1.6 fixes: unplugging/replugging the LCD reconnects in-process instead of
+restarting the app; a sensor or render error no longer resets the USB session;
+stopping with the panel unplugged no longer turns it back on; MSFS restarts
+no longer record fake landings or reuse old fuel/radio/route data; G HUB
+errors can no longer freeze the battery list; removed weather cities vanish at
+once; long Codex battery labels and city names are fitted; English tooltip and
+status fixes.
 
 1.1.5 fixes: a powered-off wireless headset/mouse (USB dongle still plugged
 in) now disappears from the screen within seconds - G HUB's connection state

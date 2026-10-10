@@ -6,7 +6,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -258,6 +258,11 @@ class WeatherMonitor:
             if normalised == self._cities:
                 return
             self._cities = normalised
+            # Removed cities disappear at once, even if the next fetch fails.
+            self._snapshot = _dc_replace(
+                self._snapshot,
+                readings=tuple(r for r in self._snapshot.readings if r.city in normalised),
+            )
         self._wake.set()
 
     def _run(self) -> None:

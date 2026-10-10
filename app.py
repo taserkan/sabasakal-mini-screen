@@ -2816,7 +2816,8 @@ def draw_weather_panel(
                 image, draw, center_x, 213, reading.weather_code, reading.is_day, colors,
             )
             draw.text(
-                (center_x, 254), reading.city,
+                (center_x, 254),
+                _fit_text(draw, reading.city, FONTS["weather_city"], column_width - 8),
                 font=FONTS["weather_city"], fill=colors["text"], anchor="mm",
             )
             draw.text(
@@ -2944,13 +2945,17 @@ def draw_battery_devices(
     for device, center_y in zip(devices, row_centers):
         color = _battery_color(device.percent, colors)
         _draw_device_icon(image, draw, device.kind, 347, center_y - 9, color)
-        label = labels.get(device.kind) or _fit_text(draw, device.name, FONTS["tiny"], 46)
+        percent_text = f"{device.percent}%"
+        label_width = 451 - 370 - 4 - draw.textlength(percent_text, font=FONTS["small_bold"])
+        label = _fit_text(
+            draw, labels.get(device.kind) or device.name, FONTS["small_bold"], label_width,
+        )
         draw.text(
             (370, center_y), label,
             font=FONTS["small_bold"], fill=colors["text"], anchor="lm",
         )
         draw.text(
-            (451, center_y), f"{device.percent}%",
+            (451, center_y), percent_text,
             font=FONTS["small_bold"], fill=color, anchor="rm",
         )
         dpi = getattr(device, "dpi", None)
@@ -3587,6 +3592,13 @@ class ScreenSession:
 
     def show(self, image: Image.Image) -> None:
         self._with_recovery(lambda: self._display_full(image), image)
+
+    def show_once(self, image: Image.Image) -> None:
+        """Send one full frame without reconnecting (used while stopping:
+        a reconnect would take seconds and switch the backlight back on)."""
+        if self.display is None:
+            raise DisplayConnectionError("display session is closed")
+        self._display_full(image)
 
     def show_regions(self, image: Image.Image, regions: list[tuple[int, int, int, int]]) -> None:
         def send() -> None:

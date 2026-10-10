@@ -206,14 +206,13 @@ ENGLISH: dict[str, str] = {
     # Design selector
     "Tasarım": "Design",
     "Yeni": "New",
-    "Yeni: oyuna ve uçuş evresine göre değişen sade ekranlar. Klasik: önceki görünüm.":
-        "New: clean screens that follow the game and flight phase. Classic: previous layout.",
+    "Claude: oyuna ve uçuş evresine göre değişen sade ekranlar. Codex: önceki görünüm.":
+        "Claude: clean screens that follow the game and flight phase. Codex: previous layout.",
     "Yeni tasarım · masaüstü": "New design · desktop",
     "Yeni tasarım · CS2 satın alma": "New design · CS2 buy phase",
     "Yeni tasarım · CS2 round sonu": "New design · CS2 round over",
     "Yeni tasarım · FACEIT (sadece sistem)": "New design · FACEIT (system only)",
     "Yeni tasarım · MSFS seyir": "New design · MSFS cruise",
-    "Hava durumu gösterilecek şehir.": "City to show the weather for.",
     # New design screens
     "Fare": "Mouse", "Klv": "Kbd", "Kulak": "Head", "Cihaz": "Device", "Chz": "Dev",
     "açık": "clear", "parçalı bulutlu": "partly cloudy", "sisli": "foggy",

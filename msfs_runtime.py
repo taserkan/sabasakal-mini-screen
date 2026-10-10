@@ -557,6 +557,10 @@ class MSFSTelemetryMonitor:
         )
 
     def _connect_and_read(self, library_path: Path) -> None:
+        # A new session (MSFS restart, other aircraft) must not mix in the
+        # previous session's fuel/radio/title values.
+        self._slow = {}
+        self._text = {}
         dll = ctypes.WinDLL(str(library_path))
         self._configure(dll)
         connection = wintypes.HANDLE()
@@ -767,6 +771,23 @@ class FlightPhaseTracker:
         except OSError as exc:
             log_exception("msfs", "landing history save failed", exc)
 
+    def reset(self) -> None:
+        """Forget the live flight (sim closed/disconnected); keep saved landings.
+
+        Without this an MSFS session that ended in the air leaves
+        ``_last_on_ground=False`` behind and the first on-ground packet of the
+        next session would be recorded as a (fake) touchdown."""
+        self._last_on_ground = None
+        self._last_airborne_vs = None
+        self._recent_g.clear()
+        self._touchdown_at = None
+        self._pending = None
+        self._landing = None
+        self._radio_signature = None
+        self._radio_until = 0.0
+        self._route_total = None
+        self._fuel_samples.clear()
+
     @property
     def history(self) -> tuple[LandingRecord, ...]:
         return tuple(self._history)
@@ -774,6 +795,9 @@ class FlightPhaseTracker:
     def update(self, telemetry: FlightTelemetry, now: float | None = None) -> FlightPhaseState:
         now = time.monotonic() if now is None else now
         on_ground = telemetry.on_ground
+        if on_ground is None and self._last_on_ground is not None:
+            # Telemetry lost: never bridge two sessions with one "touchdown".
+            self.reset()
         if telemetry.g_force is not None:
             self._recent_g.append((now, telemetry.g_force))
         if on_ground is False and telemetry.vertical_speed_fpm is not None:
@@ -809,7 +833,11 @@ class FlightPhaseTracker:
             remaining = telemetry.destination_ete_s / 3600.0 * telemetry.ground_speed_kt
             if self._route_total is None or remaining > self._route_total:
                 self._route_total = remaining
-        if on_ground and (telemetry.ground_speed_kt or 0.0) < 1.0 and self._landing is None:
+        landing_window_over = (
+            self._landing is None or self._touchdown_at is None
+            or now - self._touchdown_at >= LANDING_SCREEN_SECONDS
+        )
+        if on_ground and (telemetry.ground_speed_kt or 0.0) < 1.0 and landing_window_over:
             self._route_total = None
         if telemetry.fuel_lbs is not None:
             if self._fuel_samples and telemetry.fuel_lbs > self._fuel_samples[-1][1] + 50:

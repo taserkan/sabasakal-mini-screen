@@ -646,7 +646,7 @@ class BatteryDeviceMonitor:
                 if refresh_profile:
                     self._dpi_profile_at = now
                 self._dpi_reading = (device_id, reading)
-            except (OSError, ConnectionError, TimeoutError, json.JSONDecodeError, ValueError):
+            except Exception:  # DPI is optional: never stop the battery loop
                 self._dpi_reading = None
             self._dpi_at = now
         if self._dpi_reading is None or self._dpi_reading[1].dpi is None:
@@ -772,6 +772,8 @@ class BatteryDeviceMonitor:
                     self._lghub_ready = False
                     self._lghub_infos = {}
                     self._lghub_event_until = {}
+                # G HUB went away: never resurrect old percentages later.
+                self._last_logitech_devices = []
                 if was_ready:
                     self._refresh.set()
                 self._stop.wait(min(30.0, 1.0 * (2 ** min(failures - 1, 5))))
@@ -968,10 +970,14 @@ class BatteryDeviceMonitor:
                         for device in logitech_devices
                     ]
                     self._last_logitech_devices = list(logitech_devices)
-            except (
-                OSError, sqlite3.Error, UnicodeError, json.JSONDecodeError,
-                ConnectionError, TimeoutError,
-            ) as exc:
+            except Exception as exc:
+                # Any malformed G HUB data must not end this thread: a dead
+                # thread would freeze the last device list on the screen.
+                if not isinstance(exc, (
+                    OSError, sqlite3.Error, UnicodeError, json.JSONDecodeError,
+                    ConnectionError, TimeoutError,
+                )):
+                    log_exception("battery", "G HUB battery read failed", exc)
                 logitech_error = f"{type(exc).__name__}: {exc}"
                 ready, device_infos = self._current_lghub_infos()
                 if ready:

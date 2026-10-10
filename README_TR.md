@@ -1,6 +1,13 @@
 # Sabasakal Mini Screen 3.5″
 
-Sürüm 1.1.5
+Sürüm 1.1.6
+
+1.1.6 düzeltmeleri: mini ekran çıkarılıp takılınca uygulama yeniden
+başlamadan bağlanıyor; sensör/çizim hatası USB oturumunu sıfırlamıyor; ekran
+çıkarılmışken durdurmak paneli yeniden açmıyor; MSFS yeniden başlatılınca
+sahte iniş kaydı ve eski yakıt/telsiz/rota verisi yok; G HUB hatası pil
+listesini dondurmuyor; silinen hava durumu şehirleri hemen kalkıyor; Codex
+tasarımında uzun cihaz ve şehir adları sığdırılıyor.
 
 1.1.5 düzeltmeleri: kapatılan kablosuz kulaklık/fare (USB alıcı takılı kalsa
 da) birkaç saniye içinde ekrandan kalkıyor; ilk sensör başlatması artık
