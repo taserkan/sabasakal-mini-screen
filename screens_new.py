@@ -12,6 +12,7 @@ MSFS values from read-only SimConnect variables.
 from __future__ import annotations
 
 import collections
+import dataclasses
 import datetime as dt
 import functools
 import math
@@ -117,6 +118,8 @@ def font(size: int, condensed: bool = False) -> ImageFont.FreeTypeFont:
 class BatteryInfo:
     kind: str
     percent: int | None
+    dpi: int | None = None
+    dpi_warning: bool = False
 
 
 @dataclass(frozen=True)
@@ -305,9 +308,31 @@ def present_batteries(devices: Iterable, limit: int = 3) -> list[BatteryInfo]:
         if kind != "other" and kind in seen:
             continue
         seen.add(kind)
-        items.append(BatteryInfo(kind, max(0, min(100, int(percent)))))
+        dpi = getattr(device, "dpi", None) if kind == "mouse" else None
+        items.append(BatteryInfo(
+            kind, max(0, min(100, int(percent))), dpi,
+            bool(getattr(device, "dpi_warning", False)) and dpi is not None,
+        ))
     items.sort(key=lambda item: BATTERY_ORDER.get(item.kind, 3))
     return items[: max(0, limit)]
+
+
+def battery_value_parts(info: BatteryInfo) -> list[tuple[str, str]]:
+    """``82%`` (+ `` · 1200`` DPI for a G HUB mouse; orange on a CS2 mismatch)."""
+    parts = [(_pct(info.percent), battery_color(info.percent) if info.percent <= 30 else TEXT)]
+    if info.dpi is not None:
+        parts.append((f" · {info.dpi}", ORANGE if info.dpi_warning else TEXT))
+    return parts
+
+
+def _parts_width(draw, parts, size: int) -> float:
+    return sum(draw.textlength(value, font=font(size)) for value, _ in parts)
+
+
+def _draw_parts(draw, x: float, y: float, parts, size: int, anchor_v: str) -> float:
+    for value, color in parts:
+        x += text(draw, (x, y), value, size, color, anchor="l" + anchor_v)
+    return x
 
 
 def ram_reading(metrics: dict) -> tuple[float | None, float | None, float | None]:
@@ -406,16 +431,25 @@ def draw_strip(image: Image.Image, ctx: NewScreenContext, strip_bg: str, accent:
     # Battery items, right-aligned, measured before anything is drawn.
     small = font(14)
     center_y = (STRIP_HEIGHT - 3) / 2
-    right = WIDTH - 12
-    planned = []
-    for info in reversed(present_batteries(ctx.batteries)):
-        label = _t(ctx, BATTERY_LABELS[info.kind][1]) + " "
-        value = _pct(info.percent)
-        width = draw.textlength(label, font=small) + draw.textlength(value, font=small)
-        if right - width < x:
-            break
-        planned.append((info, label, value, right - width, right))
-        right -= width + 12
+
+    def plan(infos):
+        right = WIDTH - 12
+        placed = []
+        for info in reversed(infos):
+            label = _t(ctx, BATTERY_LABELS[info.kind][1]) + " "
+            value = battery_value_parts(info)
+            width = draw.textlength(label, font=small) + _parts_width(draw, value, 14)
+            if right - width < x:
+                break
+            placed.append((info, label, value, right - width, right))
+            right -= width + 12
+        return placed
+
+    infos = present_batteries(ctx.batteries)
+    planned = plan(infos)
+    if len(planned) < len(infos):
+        # Never lose a device for the DPI suffix: drop the DPI first.
+        planned = plan([dataclasses.replace(info, dpi=None) for info in infos])
     battery_left = planned[-1][3] if planned else WIDTH - 12
 
     if allow_ram:
@@ -429,9 +463,8 @@ def draw_strip(image: Image.Image, ctx: NewScreenContext, strip_bg: str, accent:
                 x = end + 14
 
     for info, label, value, left, item_right in planned:
-        color = battery_color(info.percent) if info.percent <= 30 else TEXT
-        value_width = text(draw, (item_right, center_y), value, 14, color, anchor="rm")
-        text(draw, (item_right - value_width, center_y), label, 14, WHITE, anchor="rm")
+        label_end = left + text(draw, (left, center_y), label, 14, WHITE, anchor="lm")
+        _draw_parts(draw, label_end, center_y, value, 14, "m")
         layout.append((f"battery:{info.kind}", (left, center_y - 9, item_right, center_y + 9)))
     return layout
 
@@ -587,8 +620,8 @@ def render_main(ctx: NewScreenContext) -> Image.Image:
         percent = info.percent
         rounded(draw, box, 8, panel_color(background))
         text(draw, (left + 10, battery_top + 8), _t(ctx, BATTERY_LABELS[info.kind][0]), 14, WHITE)
-        text(draw, (right - 10, battery_top + 8), _pct(percent), 14,
-             battery_color(percent) if percent <= 30 else TEXT, anchor="ra")
+        parts = battery_value_parts(info)
+        _draw_parts(draw, right - 10 - _parts_width(draw, parts, 14), battery_top + 8, parts, 14, "a")
         progress_bar(draw, (left + 10, battery_top + 28, right - 10, battery_top + 34),
                      percent / 100.0, battery_color(percent))
     return image
@@ -611,9 +644,9 @@ def faceit_battery_layout(ctx: NewScreenContext, draw: ImageDraw.ImageDraw | Non
     last = len(batteries) - 1
     for index, ((left, right), info) in enumerate(zip(slots, batteries)):
         label = _t(ctx, BATTERY_LABELS[info.kind][0]) + " "
-        value = _pct(info.percent)
+        value = battery_value_parts(info)
         label_width = draw.textlength(label, font=font(15))
-        value_width = draw.textlength(value, font=font(15))
+        value_width = _parts_width(draw, value, 15)
         total = label_width + value_width
         if len(batteries) == 1 or 0 < index < last:
             x = (left + right - total) / 2
@@ -645,9 +678,8 @@ def render_faceit(ctx: NewScreenContext) -> Image.Image:
     if items:
         rounded(draw, (14, battery_top, WIDTH - 14, HEIGHT - 14), 8, panel_color(background))
     for info, x, center_y, label, label_width, value, _value_width in items:
-        value_color = battery_color(info.percent) if info.percent <= 30 else TEXT
         text(draw, (x, center_y), label, 15, WHITE, anchor="lm")
-        text(draw, (x + label_width, center_y), value, 15, value_color, anchor="lm")
+        _draw_parts(draw, x + label_width, center_y, value, 15, "m")
     return image
 
 

@@ -2825,6 +2825,14 @@ def draw_battery_devices(
             (451, center_y), f"{device.percent}%",
             font=FONTS["small_bold"], fill=color, anchor="rm",
         )
+        dpi = getattr(device, "dpi", None)
+        if dpi is not None and len(devices) < 3:
+            # Rows are 42+ px apart with one or two devices: room for DPI.
+            draw.text(
+                (451, center_y + 15), f"{dpi} DPI", font=FONTS["tiny"],
+                fill=colors["warning"] if getattr(device, "dpi_warning", False) else colors["muted"],
+                anchor="rm",
+            )
         if device.charging:
             draw.polygon(
                 ((364, center_y - 8), (360, center_y), (364, center_y),

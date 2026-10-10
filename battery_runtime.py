@@ -50,10 +50,17 @@ class BatteryDevice:
     percent: int
     kind: str = "other"
     charging: bool = False
+    # Current sensor DPI reported by G HUB (mice only) and whether it does
+    # not match the CS2 per-game profile while CS2 runs.
+    dpi: int | None = None
+    dpi_warning: bool = False
 
     @property
-    def signature(self) -> tuple[str, str, int, str, bool]:
-        return self.stable_id, self.name, self.percent, self.kind, self.charging
+    def signature(self) -> tuple:
+        return (
+            self.stable_id, self.name, self.percent, self.kind, self.charging,
+            self.dpi, self.dpi_warning,
+        )
 
 
 @dataclass(frozen=True)
@@ -295,6 +302,130 @@ def _connect_lghub_websocket(
         raise
 
 
+# ---------------------------------------------------------------------------
+# Mouse DPI (read-only G HUB queries; never changes a G HUB setting)
+# ---------------------------------------------------------------------------
+
+LGHUB_GAME_APP_MARKERS = ("counter-strike",)
+DPI_REFRESH_SECONDS = 2.0
+DPI_PROFILE_REFRESH_SECONDS = 10.0
+
+
+@dataclass(frozen=True)
+class MouseDpiReading:
+    dpi: int | None = None
+    game_running: bool = False
+    game_profile_active: bool | None = None
+    game_expected_dpi: int | None = None
+
+    @property
+    def warning(self) -> bool:
+        if not self.game_running or self.dpi is None:
+            return False
+        if self.game_profile_active is False:
+            return True
+        return self.game_expected_dpi is not None and self.dpi != self.game_expected_dpi
+
+
+def _lghub_get(stream: socket.socket, path: str, payload: dict | None = None,
+               max_messages: int = 40) -> dict | None:
+    """One read-only GET; returns the payload on SUCCESS, else None."""
+    message_id = str(secrets.randbelow(2_000_000_000) + 1)
+    request = {"msgId": message_id, "verb": "GET", "path": path}
+    if payload is not None:
+        request["payload"] = payload
+    _send_websocket_text(stream, json.dumps(request, separators=(",", ":")))
+    for _ in range(max_messages):
+        message = json.loads(_receive_websocket_message(stream))
+        if not isinstance(message, dict) or str(message.get("msgId", "")) != message_id:
+            continue
+        result = message.get("result")
+        code = _clean_name(result.get("code") if isinstance(result, dict) else "").upper()
+        body = message.get("payload")
+        return body if code == "SUCCESS" and isinstance(body, dict) else None
+    return None
+
+
+def parse_lghub_dpi_state(payload: dict | None) -> int | None:
+    try:
+        dpi = int((payload or {}).get("dpi"))
+    except (TypeError, ValueError):
+        return None
+    return dpi if 50 <= dpi <= 100_000 else None
+
+
+def parse_lghub_game_profile(
+    applications: dict | None, profiles: dict | None, active_profile_id: str,
+) -> tuple[bool, bool | None, str]:
+    """(game running, game profile active, game mouse-sensitivity card id)."""
+    game_ids: set[str] = set()
+    running = False
+    for app in (applications or {}).get("applications", []) or []:
+        if not isinstance(app, dict):
+            continue
+        haystack = f"{app.get('name', '')} {app.get('applicationPath', '')}".casefold()
+        if any(marker in haystack for marker in LGHUB_GAME_APP_MARKERS):
+            game_ids.add(str(app.get("applicationId") or app.get("databaseId") or ""))
+            try:
+                running = running or int(app.get("processId") or 0) > 0
+            except (TypeError, ValueError):
+                pass
+    game_ids.discard("")
+    if not game_ids:
+        return running, None, ""
+    active_is_game: bool | None = None
+    card_id = ""
+    for profile in (profiles or {}).get("profiles", []) or []:
+        if not isinstance(profile, dict):
+            continue
+        in_game = str(profile.get("applicationId", "")) in game_ids
+        if str(profile.get("id", "")) == active_profile_id:
+            active_is_game = in_game
+        if in_game and profile.get("activeForApplication") and not card_id:
+            for assignment in profile.get("assignments", []) or []:
+                if str(assignment.get("slotId", "")).endswith("_mouse_sensitivity"):
+                    card_id = str(assignment.get("cardId", ""))
+                    break
+    if active_profile_id and active_is_game is None:
+        active_is_game = False
+    return running, active_is_game, card_id
+
+
+def parse_lghub_expected_dpi(sensitivity_card: dict | None, preset_card: dict | None) -> int | None:
+    try:
+        index = int((sensitivity_card or {})["mouseSensitivity"]["activeDpiIndex"])
+        entry = (preset_card or {})["mouseSettings"]["advancedDpiTable"]["entries"][str(index)]
+        return int(entry["dpi"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def read_lghub_mouse_dpi(
+    device_id: str, cached_profile: tuple | None = None, refresh_profile: bool = True,
+    host: str = LGHUB_HOST, port: int = LGHUB_PORT, timeout: float = 0.75,
+) -> tuple[MouseDpiReading, tuple | None]:
+    """Read the live DPI and the CS2 per-game profile DPI (GET requests only)."""
+    with _connect_lghub_websocket(host, port, timeout) as stream:
+        stream.settimeout(timeout)
+        dpi = parse_lghub_dpi_state(_lghub_get(stream, f"/mouse/{device_id}/dpi"))
+        profile = cached_profile
+        if refresh_profile or profile is None:
+            active = _lghub_get(stream, "/profile/active") or {}
+            running, active_is_game, card_id = parse_lghub_game_profile(
+                _lghub_get(stream, "/applications"), _lghub_get(stream, "/profiles"),
+                str(active.get("id", "")),
+            )
+            expected = None
+            if card_id:
+                card = _lghub_get(stream, "/card", {"id": card_id})
+                preset_id = str(((card or {}).get("mouseSensitivity") or {}).get("presetId", ""))
+                preset = _lghub_get(stream, "/card", {"id": preset_id}) if preset_id else None
+                expected = parse_lghub_expected_dpi(card, preset)
+            profile = (running, active_is_game, expected)
+    running, active_is_game, expected = profile
+    return MouseDpiReading(dpi, running, active_is_game, expected), profile
+
+
 def scan_lghub_connected_slugs(
     host: str = LGHUB_HOST, port: int = LGHUB_PORT, timeout: float = 1.5,
 ) -> set[str]:
@@ -385,6 +516,10 @@ class BatteryDeviceMonitor:
         self._windows_error = ""
         self._refresh = threading.Event()
         self._snapshot = BatterySnapshot()
+        self._dpi_profile: tuple | None = None
+        self._dpi_profile_at = 0.0
+        self._dpi_reading: tuple[str, MouseDpiReading] | None = None
+        self._dpi_at = 0.0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -463,6 +598,42 @@ class BatteryDeviceMonitor:
             return self._lghub_ready, {
                 slug: dict(info) for slug, info in self._lghub_infos.items()
             }
+
+    def _with_mouse_dpi(self, devices: list[BatteryDevice]) -> list[BatteryDevice]:
+        """Attach the live DPI to the connected G HUB mouse (read-only)."""
+        mouse = next((device for device in devices if device.kind == "mouse"), None)
+        if mouse is None:
+            self._dpi_reading = None
+            return devices
+        _ready, infos = self._current_lghub_infos()
+        info = infos.get(mouse.stable_id.removeprefix("lghub:"), {})
+        device_id = info.get("device_id", "")
+        if not device_id:
+            return devices
+        now = time.monotonic()
+        if self._dpi_reading is None or self._dpi_reading[0] != device_id or now - self._dpi_at >= DPI_REFRESH_SECONDS:
+            refresh_profile = now - self._dpi_profile_at >= DPI_PROFILE_REFRESH_SECONDS
+            try:
+                reading, profile = read_lghub_mouse_dpi(
+                    device_id, self._dpi_profile, refresh_profile,
+                )
+                self._dpi_profile = profile
+                if refresh_profile:
+                    self._dpi_profile_at = now
+                self._dpi_reading = (device_id, reading)
+            except (OSError, ConnectionError, TimeoutError, json.JSONDecodeError, ValueError):
+                self._dpi_reading = None
+            self._dpi_at = now
+        if self._dpi_reading is None or self._dpi_reading[1].dpi is None:
+            return devices
+        reading = self._dpi_reading[1]
+        return [
+            BatteryDevice(
+                device.stable_id, device.name, device.percent, device.kind, device.charging,
+                reading.dpi, reading.warning,
+            ) if device is mouse else device
+            for device in devices
+        ]
 
     def _current_windows_devices(self) -> tuple[list[BatteryDevice], str]:
         with self._lock:
@@ -733,6 +904,7 @@ class BatteryDeviceMonitor:
                         device for device in self._last_logitech_devices
                         if device.stable_id.removeprefix("lghub:") in connected_slugs
                     ]
+            logitech_devices = self._with_mouse_dpi(logitech_devices)
             windows_devices, windows_error = self._current_windows_devices()
             self._publish(BatterySnapshot(
                 devices=select_battery_devices(

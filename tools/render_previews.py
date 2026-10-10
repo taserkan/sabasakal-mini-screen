@@ -29,7 +29,7 @@ from weather_runtime import WeatherReading  # noqa: E402
 
 NOW = dt.datetime(2026, 10, 10, 21, 47)
 BATTERIES = (
-    BatteryDevice("m", "PRO X SUPERLIGHT 2", 82, "mouse"),
+    BatteryDevice("m", "PRO X SUPERLIGHT 2", 82, "mouse", dpi=800),
     BatteryDevice("k", "G915", 64, "keyboard"),
     BatteryDevice("h", "PRO X WIRELESS", 18, "headset"),
 )
@@ -132,6 +132,14 @@ DEVICE_SETS = {
 BATTERY_SCREENS = ("main", "cs2-buy", "cs2-live-dark", "cs2-faceit", "msfs-cruise")
 
 
+def dpi_warning_context() -> NewScreenContext:
+    """CS2 running but G HUB still on the desktop profile (1200 DPI)."""
+    context = contexts()["cs2-live-dark"]
+    context.batteries = (BatteryDevice("m", "PRO X SUPERLIGHT 2", 82, "mouse",
+                                       dpi=1200, dpi_warning=True), BATTERIES[2])
+    return context
+
+
 def battery_contexts() -> dict[str, NewScreenContext]:
     """Every screen that shows batteries, with 0/1/2/3 connected devices."""
     result = {}
@@ -141,6 +149,7 @@ def battery_contexts() -> dict[str, NewScreenContext]:
             context = base[name] if count == 0 else contexts()[name]
             context.batteries = devices
             result[f"{name}-bat{count}"] = context
+    result["cs2-dpi-warning"] = dpi_warning_context()
     return result
 
 

@@ -4053,6 +4053,192 @@ class BatteryPresenceAndRamScenarios(unittest.TestCase):
         self.assertEqual(len(list(module.classic_battery_frames())), 4)
 
 
+class MouseDpiScenarios(unittest.TestCase):
+    """G HUB DPI next to the mouse battery: read-only and overlap-free."""
+
+    APPS = {"applications": [
+        {"applicationId": "desk", "name": "APPLICATION_NAME_DESKTOP", "applicationPath": "", "processId": 0},
+        {"applicationId": "cs", "name": "Counter-Strike: Global Offensive",
+         "applicationPath": "C:\\Steam\\steamapps\\common\\Counter-Strike Global Offensive\\",
+         "processId": 10088},
+    ]}
+    PROFILES = {"profiles": [
+        {"id": "p-desk", "applicationId": "desk", "activeForApplication": True,
+         "assignments": [{"slotId": "prox2wirelessmouse_mouse_sensitivity", "cardId": "c-desk"}]},
+        {"id": "p-cs", "applicationId": "cs", "activeForApplication": True,
+         "assignments": [{"slotId": "prox2wirelessmouse_mouse_sensitivity", "cardId": "c-cs"}]},
+    ]}
+    CARDS = {
+        "c-cs": {"mouseSensitivity": {"presetId": "preset-cs", "activeDpiIndex": 1}},
+        "preset-cs": {"mouseSettings": {"advancedDpiTable": {"entries": {
+            "1": {"disabled": False, "dpi": 800}, "2": {"disabled": True, "dpi": 1200},
+        }}}},
+    }
+
+    def fake_lghub(self, dpi: int, active_profile: str, cs_running: bool = True):
+        import battery_runtime as br
+        sent: list[dict] = []
+        replies: list[str] = []
+        apps = json.loads(json.dumps(self.APPS))
+        if not cs_running:
+            apps["applications"][1]["processId"] = 0
+
+        def respond(message: dict) -> dict:
+            path = message["path"]
+            if path.startswith("/mouse/"):
+                return {"dpi": dpi, "dpiIndex": 1}
+            if path == "/profile/active":
+                return {"id": active_profile}
+            if path == "/applications":
+                return apps
+            if path == "/profiles":
+                return self.PROFILES
+            if path == "/card":
+                return self.CARDS.get(message["payload"]["id"])
+            return None
+
+        def send(_stream, text):
+            message = json.loads(text)
+            sent.append(message)
+            payload = respond(message)
+            replies.append(json.dumps({
+                "msgId": message["msgId"],
+                "result": {"code": "SUCCESS" if payload is not None else "NO_SUCH_PATH"},
+                "payload": payload,
+            }))
+
+        class Stream:
+            def __enter__(self): return self  # noqa: E704
+            def __exit__(self, *_a): return False  # noqa: E704
+            def settimeout(self, _t): pass  # noqa: E704
+
+        patches = (
+            patch.object(br, "_connect_lghub_websocket", return_value=Stream()),
+            patch.object(br, "_send_websocket_text", side_effect=send),
+            patch.object(br, "_receive_websocket_message", side_effect=lambda _s: replies.pop(0)),
+        )
+        return patches, sent
+
+    def read(self, dpi, active_profile, cs_running=True):
+        import battery_runtime as br
+        patches, sent = self.fake_lghub(dpi, active_profile, cs_running)
+        with patches[0], patches[1], patches[2]:
+            reading, profile = br.read_lghub_mouse_dpi("dev3")
+        self.assertTrue(sent)
+        self.assertEqual({message["verb"] for message in sent}, {"GET"}, "G HUB access must be read-only")
+        return reading, profile
+
+    def test_cs2_profile_with_matching_dpi_is_not_a_warning(self) -> None:
+        reading, profile = self.read(800, "p-cs")
+        self.assertEqual((reading.dpi, reading.game_running, reading.game_profile_active,
+                          reading.game_expected_dpi), (800, True, True, 800))
+        self.assertFalse(reading.warning)
+        self.assertEqual(profile, (True, True, 800))
+
+    def test_desktop_profile_while_cs2_runs_is_a_warning(self) -> None:
+        reading, _profile = self.read(1200, "p-desk")
+        self.assertFalse(reading.game_profile_active)
+        self.assertTrue(reading.warning)
+
+    def test_dpi_mismatch_inside_cs2_profile_is_a_warning(self) -> None:
+        reading, _profile = self.read(1600, "p-cs")
+        self.assertTrue(reading.warning)
+
+    def test_no_warning_when_cs2_is_not_running(self) -> None:
+        reading, _profile = self.read(1200, "p-desk", cs_running=False)
+        self.assertFalse(reading.game_running)
+        self.assertFalse(reading.warning)
+
+    def test_cached_profile_skips_profile_queries(self) -> None:
+        import battery_runtime as br
+        patches, sent = self.fake_lghub(800, "p-cs")
+        with patches[0], patches[1], patches[2]:
+            reading, _ = br.read_lghub_mouse_dpi("dev3", (True, True, 800), refresh_profile=False)
+        self.assertEqual([message["path"] for message in sent], ["/mouse/dev3/dpi"])
+        self.assertFalse(reading.warning)
+
+    def test_monitor_attaches_dpi_only_to_the_mouse(self) -> None:
+        import battery_runtime as br
+        monitor = br.BatteryDeviceMonitor()
+        monitor._lghub_infos = {"slug-m": {"device_id": "dev3"}}
+        monitor._lghub_ready = True
+        devices = [
+            BatteryDevice("lghub:slug-m", "PRO X", 82, "mouse"),
+            BatteryDevice("lghub:slug-h", "PRO X WIRELESS", 18, "headset"),
+        ]
+        reading = br.MouseDpiReading(1200, True, False, 800)
+        with patch.object(br, "read_lghub_mouse_dpi", return_value=(reading, (True, False, 800))) as read:
+            result = monitor._with_mouse_dpi(devices)
+            again = monitor._with_mouse_dpi(devices)
+        read.assert_called_once()  # second call is within DPI_REFRESH_SECONDS
+        self.assertEqual((result[0].dpi, result[0].dpi_warning), (1200, True))
+        self.assertIsNone(result[1].dpi)
+        self.assertEqual(again[0].dpi, 1200)
+        with patch.object(br, "read_lghub_mouse_dpi", side_effect=ConnectionError("G HUB closed")):
+            monitor._dpi_at = 0.0
+            plain = monitor._with_mouse_dpi(devices)
+        self.assertIsNone(plain[0].dpi)
+
+    def test_dpi_is_drawn_next_to_the_mouse_without_overlap(self) -> None:
+        import screens_new as sn
+        mouse = BatteryDevice("m", "PRO X", 82, "mouse", dpi=12000, dpi_warning=True)
+        others = (BatteryDevice("k", "G915", 64, "keyboard"), BatteryDevice("h", "Head", 18, "headset"))
+        for count in range(1, 4):
+            devices = (mouse, *others[: count - 1])
+            for language in ("tr", "en"):
+                ctx = sn.NewScreenContext(
+                    BatteryPresenceAndRamScenarios.metrics(True), devices, language=language,
+                    fps=999, mode="cs2",
+                )
+                info = sn.present_batteries(devices)[0]
+                self.assertEqual(sn.battery_value_parts(info)[1], (" · 12000", sn.ORANGE))
+                strip = sn.draw_strip(Image.new("RGB", (480, 320)), ctx, "#000", "#FFF")
+                BatteryPresenceAndRamScenarios.assert_disjoint(self, strip, ("strip", count))
+                self.assertIn("battery:mouse", dict(strip))
+                layout = sn.main_layout(ctx)
+                for _info, (left, top, right, _bottom) in layout["batteries"]:
+                    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+                    label = sn._t(ctx, sn.BATTERY_LABELS[_info.kind][0])
+                    needed = (draw.textlength(label, font=sn.font(14))
+                              + sn._parts_width(draw, sn.battery_value_parts(_info), 14) + 20 + 6)
+                    self.assertLessEqual(needed, right - left, (count, language, _info.kind))
+                items = sn.faceit_battery_layout(sn.NewScreenContext({}, devices, language=language))
+                spans = [(item[1], item[1] + item[4] + item[6]) for item in items]
+                for (_l1, r1), (l2, _r2) in zip(spans, spans[1:]):
+                    self.assertLess(r1, l2)
+                self.assertLessEqual(spans[-1][1], 480 - 26 + 0.5)
+        plain = sn.present_batteries((BatteryDevice("m", "PRO X", 82, "mouse", dpi=800),))[0]
+        self.assertEqual(sn.battery_value_parts(plain)[1], (" · 800", sn.TEXT))
+        # DPI is never attached to a non-mouse device.
+        self.assertIsNone(sn.present_batteries((BatteryDevice("h", "H", 50, "headset", dpi=800),))[0].dpi)
+
+    def test_classic_layout_shows_dpi_only_where_it_fits(self) -> None:
+        metrics = {
+            "cpu_load": 24.0, "cpu_temp": 46.0, "cpu_freq": 4.6,
+            "gpu_load": 18.0, "gpu_temp": 42.0, "gpu_memory": 920.0,
+            "ram_load": 52.0, "ram_used": 16.5,
+        }
+        mouse = BatteryDevice("m", "PRO X", 82, "mouse", dpi=800)
+        plain = BatteryDevice("m", "PRO X", 82, "mouse")
+        others = (BatteryDevice("k", "G915", 64, "keyboard"), BatteryDevice("h", "Head", 18, "headset"))
+        for count in (1, 2, 3):
+            with_dpi = screen_app.render_screen(
+                metrics, GameSnapshot(), False, dict(screen_app.COLORS),
+                battery_devices=(mouse, *others[: count - 1]),
+            )
+            without = screen_app.render_screen(
+                metrics, GameSnapshot(), False, dict(screen_app.COLORS),
+                battery_devices=(plain, *others[: count - 1]),
+            )
+            changed = ImageChops.difference(with_dpi, without).getbbox()
+            if count == 3:
+                self.assertIsNone(changed)
+            else:
+                self.assertIsNotNone(changed)
+                self.assertGreaterEqual(changed[0], 338)
+                self.assertLessEqual(changed[2], 456)
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
