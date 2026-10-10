@@ -40,6 +40,7 @@ from media_runtime import (
     AudioSpectrumSnapshot, MediaSnapshot, media_service_name, sanitise_media_text,
 )
 from msfs_runtime import FlightTelemetry
+import thresholds as _thresholds
 from weather_runtime import WeatherReading
 from app_log import log_exception, log_info
 
@@ -118,18 +119,7 @@ COLORS = {
     "danger": "#E36F6F",
 }
 
-# Category-specific visual pressure limits. Load limits describe saturation,
-# not hardware damage. Temperature limits keep headroom below the documented
-# 95°C Ryzen 7 9800X3D Tjmax and 90°C RTX 4070 Ti maximum temperature.
-LOAD_COLOR_LIMITS = {
-    "cpu": (75.0, 92.0, 100.0),
-    "gpu": (70.0, 80.0, 95.0),
-    "ram": (70.0, 85.0, 100.0),
-}
-TEMPERATURE_COLOR_LIMITS = {
-    "cpu": (55.0, 70.0, 85.0, 95.0),
-    "gpu": (50.0, 65.0, 78.0, 90.0),
-}
+# CPU/GPU/RAM colour limits are shared with the Claude design (thresholds.py).
 
 
 def load_font(
@@ -2320,28 +2310,13 @@ def mix_color(first: str, second: str, amount: float) -> str:
     return "#%02x%02x%02x" % rgb
 
 
-def _scale_color(
-    value: float, limits: tuple[float, float, float], colors: dict[str, str],
-) -> str:
-    normal_end, warning_end, critical_end = limits
-    if value <= normal_end:
-        return colors["cpu"]
-    if value <= warning_end:
-        return mix_color(
-            colors["cpu"], colors["warning"],
-            (value - normal_end) / (warning_end - normal_end),
-        )
-    if value <= critical_end:
-        return mix_color(
-            colors["warning"], colors["danger"],
-            (value - warning_end) / (critical_end - warning_end),
-        )
-    return colors["danger"]
+def _level_color(level: int, colors: dict[str, str]) -> str:
+    return (colors["cpu"], colors["warning"], colors["danger"])[level]
 
 
 def load_color(value: float, component: str, colors: dict[str, str]) -> str:
-    """Theme-aware saturation scale with limits appropriate to each resource."""
-    return _scale_color(value, LOAD_COLOR_LIMITS[component], colors)
+    """Theme-aware 3-level scale using the shared thresholds."""
+    return _level_color(_thresholds.level(component, "load", value), colors)
 
 
 def _critical_blink_color(
@@ -2360,9 +2335,8 @@ def load_alert_color(
     colors: dict[str, str],
     animation_time: float | None = None,
 ) -> str | None:
-    """Blink the central load value only after the critical transition starts."""
-    critical_start = LOAD_COLOR_LIMITS[component][1]
-    if value <= critical_start:
+    """Blink the central load value once it reaches the critical level."""
+    if _thresholds.level(component, "load", value) != _thresholds.CRITICAL:
         return None
     return _critical_blink_color(load_color(value, component, colors), colors, animation_time)
 
@@ -2370,25 +2344,11 @@ def load_alert_color(
 def temperature_color(
     value: float | None, component: str, colors: dict[str, str],
 ) -> str:
-    """Thermal scale with a warning plateau before the critical transition."""
-    if value is None:
+    """Theme-aware 3-level thermal scale using the shared thresholds."""
+    lvl = _thresholds.level(component, "temp", value)
+    if lvl is None:
         return colors["dim"]
-    normal_end, warning_end, critical_start, critical_end = TEMPERATURE_COLOR_LIMITS[component]
-    if value <= normal_end:
-        return colors["cpu"]
-    if value <= warning_end:
-        return mix_color(
-            colors["cpu"], colors["warning"],
-            (value - normal_end) / (warning_end - normal_end),
-        )
-    if value <= critical_start:
-        return colors["warning"]
-    if value <= critical_end:
-        return mix_color(
-            colors["warning"], colors["danger"],
-            (value - critical_start) / (critical_end - critical_start),
-        )
-    return colors["danger"]
+    return _level_color(lvl, colors)
 
 
 def temperature_unit_color(
@@ -2401,15 +2361,13 @@ def temperature_unit_color(
     base = temperature_color(value, component, colors)
     if value is None or animation_time is None:
         return base
-
-    normal_end, _warning_end, critical_start, _critical_end = TEMPERATURE_COLOR_LIMITS[component]
-    if value <= normal_end:
+    lvl = _thresholds.level(component, "temp", value)
+    if lvl == _thresholds.NORMAL:
         return base
-    if value <= critical_start:
+    if lvl == _thresholds.WARNING:
         # A slow, soft pulse is noticeable without making the dashboard restless.
         wave = (math.sin((animation_time / 1.6) * math.tau) + 1.0) / 2.0
         return mix_color(colors["dim"], base, 0.42 + (0.58 * wave))
-
     # Critical temperatures use a faster, high-contrast blink.
     return _critical_blink_color(base, colors, animation_time)
 
@@ -2420,11 +2378,10 @@ def temperature_number_color(
     colors: dict[str, str],
     animation_time: float | None = None,
 ) -> str:
-    """Keep the number calm until the critical transition begins."""
+    """Keep the number calm until the critical level is reached."""
     if value is None:
         return colors["dim"]
-    critical_start = TEMPERATURE_COLOR_LIMITS[component][2]
-    if value <= critical_start:
+    if _thresholds.level(component, "temp", value) != _thresholds.CRITICAL:
         return colors["text"]
     return temperature_unit_color(value, component, colors, animation_time)
 

@@ -1660,47 +1660,39 @@ class PerformanceCounterScenarios(unittest.TestCase):
         self.assertEqual(platform_name("chrome.exe"), "Chrome")
         self.assertEqual(platform_name("vlc.exe"), "VLC")
 
-    def test_component_scales_use_separate_limits_and_shared_theme_tokens(self) -> None:
+    def test_component_scales_use_shared_three_level_thresholds(self) -> None:
         colors = {
             "cpu": "#20C080", "warning": "#E0A020",
             "danger": "#E04040", "dim": "#606060",
         }
-        for component, normal_end, warning_end, critical_end in (
-            ("cpu", 75, 92, 100),
-            ("gpu", 70, 80, 95),
-            ("ram", 70, 85, 100),
-        ):
-            self.assertEqual(screen_app.load_color(normal_end, component, colors), colors["cpu"])
-            self.assertEqual(
-                screen_app.load_color(warning_end, component, colors).lower(),
-                colors["warning"].lower(),
-            )
-            self.assertEqual(
-                screen_app.load_color(critical_end, component, colors).lower(),
-                colors["danger"].lower(),
-            )
-        for component, normal_end, warning_end, critical_start, critical_end in (
-            ("cpu", 55, 70, 85, 95),
-            ("gpu", 50, 65, 78, 90),
-        ):
-            self.assertEqual(screen_app.temperature_color(normal_end, component, colors), colors["cpu"])
-            self.assertEqual(
-                screen_app.temperature_color(warning_end, component, colors).lower(),
-                colors["warning"].lower(),
-            )
-            self.assertEqual(
-                screen_app.temperature_color((warning_end + critical_start) / 2, component, colors).lower(),
-                colors["warning"].lower(),
-            )
-            self.assertEqual(
-                screen_app.temperature_color(critical_end, component, colors).lower(),
-                colors["danger"].lower(),
-            )
+        for component, warn, critical in (("cpu", 60, 75), ("gpu", 60, 80), ("ram", 70, 85)):
+            self.assertEqual(screen_app.load_color(warn - 0.1, component, colors), colors["cpu"])
+            self.assertEqual(screen_app.load_color(warn, component, colors), colors["warning"])
+            self.assertEqual(screen_app.load_color(critical - 0.1, component, colors), colors["warning"])
+            self.assertEqual(screen_app.load_color(critical, component, colors), colors["danger"])
+        for component, warn, critical in (("cpu", 60, 75), ("gpu", 55, 65)):
+            self.assertEqual(screen_app.temperature_color(warn - 0.1, component, colors), colors["cpu"])
+            self.assertEqual(screen_app.temperature_color(warn, component, colors), colors["warning"])
+            self.assertEqual(screen_app.temperature_color(critical - 0.1, component, colors), colors["warning"])
+            self.assertEqual(screen_app.temperature_color(critical, component, colors), colors["danger"])
             self.assertEqual(screen_app.temperature_color(None, component, colors), colors["dim"])
-        self.assertNotEqual(
-            screen_app.temperature_color(80, "cpu", colors),
-            screen_app.temperature_color(80, "gpu", colors),
-        )
+
+    def test_both_designs_classify_identical_inputs_identically(self) -> None:
+        import screens_new as sn
+        import thresholds
+        self.assertIs(sn.THRESHOLDS, thresholds.THRESHOLDS)
+        colors = {"cpu": "#20C080", "warning": "#E0A020", "danger": "#E04040", "dim": "#606060"}
+        classic = {colors["cpu"]: 0, colors["warning"]: 1, colors["danger"]: 2}
+        claude = {sn.GREEN: 0, sn.ORANGE: 1, sn.RED: 2}
+        for (component, kind), (warn, critical) in thresholds.THRESHOLDS.items():
+            for value in (0, warn - 0.1, warn, (warn + critical) / 2, critical - 0.1, critical, 100):
+                if kind == "load":
+                    old = screen_app.load_color(value, component, colors)
+                else:
+                    old = screen_app.temperature_color(value, component, colors)
+                new = sn.threshold_color(component, kind, value)
+                self.assertEqual(classic[old], claude[new], (component, kind, value))
+                self.assertEqual(classic[old], thresholds.level(component, kind, value))
 
     def test_temperature_unit_animation_only_activates_when_attention_is_needed(self) -> None:
         colors = {
@@ -1716,20 +1708,20 @@ class PerformanceCounterScenarios(unittest.TestCase):
             screen_app.temperature_unit_color(65, "cpu", colors, 0.4),
         )
         self.assertNotEqual(
-            screen_app.temperature_unit_color(90, "cpu", colors, 0.1),
-            screen_app.temperature_unit_color(90, "cpu", colors, 0.6),
+            screen_app.temperature_unit_color(80, "cpu", colors, 0.1),
+            screen_app.temperature_unit_color(80, "cpu", colors, 0.6),
         )
 
-    def test_load_value_blinks_when_each_component_enters_critical_transition(self) -> None:
+    def test_load_value_blinks_when_each_component_reaches_critical(self) -> None:
         colors = {
             "cpu": "#20C080", "warning": "#E0A020", "danger": "#E04040",
             "dim": "#606060", "bg": "#101010", "text": "#F0F0F0",
         }
-        for component, critical_start in (("cpu", 92), ("gpu", 80), ("ram", 85)):
-            self.assertIsNone(screen_app.load_alert_color(critical_start, component, colors, 0.1))
+        for component, critical in (("cpu", 75), ("gpu", 80), ("ram", 85)):
+            self.assertIsNone(screen_app.load_alert_color(critical - 0.1, component, colors, 0.1))
             self.assertNotEqual(
-                screen_app.load_alert_color(critical_start + 0.1, component, colors, 0.1),
-                screen_app.load_alert_color(critical_start + 0.1, component, colors, 0.6),
+                screen_app.load_alert_color(critical, component, colors, 0.1),
+                screen_app.load_alert_color(critical, component, colors, 0.6),
             )
 
     def test_rendered_load_values_blink_without_animating_below_threshold(self) -> None:
@@ -1743,12 +1735,12 @@ class PerformanceCounterScenarios(unittest.TestCase):
                 screen_app.GameSnapshot(), False, animation_time=animation_time,
             )
 
-        below_visible = frame(92.0, 80.0, 85.0, 0.1)
-        below_dim = frame(92.0, 80.0, 85.0, 0.6)
+        below_visible = frame(74.9, 79.9, 84.9, 0.1)
+        below_dim = frame(74.9, 79.9, 84.9, 0.6)
         self.assertIsNone(ImageChops.difference(below_visible, below_dim).getbbox())
 
-        critical_visible = frame(93.0, 81.0, 86.0, 0.1)
-        critical_dim = frame(93.0, 81.0, 86.0, 0.6)
+        critical_visible = frame(75.0, 80.0, 85.0, 0.1)
+        critical_dim = frame(75.0, 80.0, 85.0, 0.6)
         for box in ((48, 51, 119, 101), (208, 51, 279, 101), (368, 51, 439, 101)):
             self.assertIsNotNone(
                 ImageChops.difference(
@@ -1769,15 +1761,15 @@ class PerformanceCounterScenarios(unittest.TestCase):
             "cpu": "#20C080", "warning": "#E0A020", "danger": "#E04040",
             "dim": "#606060", "bg": "#101010", "text": "#F0F0F0",
         }
-        self.assertEqual(screen_app.temperature_number_color(85, "cpu", colors), colors["text"])
+        self.assertEqual(screen_app.temperature_number_color(74.9, "cpu", colors), colors["text"])
         self.assertNotEqual(
-            screen_app.temperature_number_color(85.1, "cpu", colors, 0.1),
-            screen_app.temperature_number_color(85.1, "cpu", colors, 0.6),
+            screen_app.temperature_number_color(75, "cpu", colors, 0.1),
+            screen_app.temperature_number_color(75, "cpu", colors, 0.6),
         )
-        self.assertEqual(screen_app.temperature_number_color(78, "gpu", colors), colors["text"])
+        self.assertEqual(screen_app.temperature_number_color(64.9, "gpu", colors), colors["text"])
         self.assertNotEqual(
-            screen_app.temperature_number_color(78.1, "gpu", colors, 0.1),
-            screen_app.temperature_number_color(78.1, "gpu", colors, 0.6),
+            screen_app.temperature_number_color(65, "gpu", colors, 0.1),
+            screen_app.temperature_number_color(65, "gpu", colors, 0.6),
         )
 
     def test_hardware_names_are_short_and_portable(self) -> None:

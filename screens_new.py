@@ -25,6 +25,7 @@ from typing import Iterable
 
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 
+import thresholds as _thresholds
 from i18n import normalize_language, translate
 
 WIDTH, HEIGHT = 480, 320
@@ -56,26 +57,16 @@ MODE_MSFS = {
     "landing": ("#0A1F1F", "#103030", "#2DD4BF"),
 }
 
-# Threshold colours used everywhere a CPU/GPU value appears.
-THRESHOLDS = {
-    ("cpu", "temp"): (60.0, 75.0),
-    ("cpu", "load"): (60.0, 75.0),
-    ("gpu", "temp"): (55.0, 65.0),
-    ("gpu", "load"): (60.0, 80.0),
-    ("ram", "load"): (70.0, 85.0),
-}
+# Threshold colours used everywhere a CPU/GPU value appears (shared limits).
+THRESHOLDS = _thresholds.THRESHOLDS
 
 
 def threshold_color(component: str, kind: str, value: float | None) -> str:
     """green below the first limit, orange up to the second, red at/above it."""
-    if value is None:
+    lvl = _thresholds.level(component, kind, value)
+    if lvl is None:
         return WHITE
-    warn, critical = THRESHOLDS[(component, kind)]
-    if value >= critical:
-        return RED
-    if value >= warn:
-        return ORANGE
-    return GREEN
+    return (GREEN, ORANGE, RED)[lvl]
 
 
 def battery_color(percent: int | None) -> str:

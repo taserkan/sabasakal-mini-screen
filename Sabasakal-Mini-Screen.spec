@@ -29,7 +29,7 @@ binaries = [
     ('sensor-helper/publish/SabasakalSensorHost.exe', 'sensor-helper'),
 ]
 hiddenimports = [
-    'serial.tools.list_ports', 'logging.handlers',
+    'serial.tools.list_ports', 'logging.handlers', 'thresholds',
     '_portaudiowpatch', 'winrt._winrt', 'winrt._winrt_windows_foundation',
     'winrt._winrt_windows_foundation_collections', 'winrt._winrt_windows_media',
     'winrt._winrt_windows_media_control', 'winrt._winrt_windows_storage_streams',
