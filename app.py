@@ -1284,10 +1284,15 @@ def run_sensor_bridge(
             }
             line = json.dumps(values) + "\n"
             if cache_path is not None:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = cache_path.with_suffix(".tmp")
-                temporary.write_text(json.dumps(values), encoding="utf-8")
-                os.replace(temporary, cache_path)
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = cache_path.with_suffix(f".{os.getpid()}.tmp")
+                    temporary.write_text(json.dumps(values), encoding="utf-8")
+                    os.replace(temporary, cache_path)
+                except OSError as exc:
+                    # PermissionError while a reader holds the file: keep the
+                    # bridge alive and retry on the next 0.5 s tick.
+                    log_exception("sensor-bridge", "sensor cache write failed", exc)
             elif sys.stdout is not None:
                 sys.stdout.write(line)
                 sys.stdout.flush()
@@ -1297,7 +1302,8 @@ def run_sensor_bridge(
                 handle = ctypes.windll.kernel32.GetStdHandle(-11)
                 ctypes.windll.kernel32.WriteFile(handle, payload, len(payload), ctypes.byref(written), None)
             time.sleep(0.5)
-    except Exception:
+    except Exception as exc:
+        log_exception("sensor-bridge", "sensor bridge stopped", exc, 0)
         return 1
     finally:
         if computer is not None:

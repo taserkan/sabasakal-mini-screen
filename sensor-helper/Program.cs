@@ -103,8 +103,34 @@ internal static class Program
                 : null,
             timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
         });
-        File.WriteAllText(temporary, payload);
-        File.Move(temporary, cachePath, true);
+        try
+        {
+            File.WriteAllText(temporary, payload);
+            File.Move(temporary, cachePath, true);
+        }
+        finally
+        {
+            try { File.Delete(temporary); } catch { /* already moved or locked */ }
+        }
+    }
+
+    private static void AppendErrorLog(string cachePath, Exception exception)
+    {
+        try
+        {
+            string logPath = cachePath + ".error.log";
+            FileInfo info = new(logPath);
+            if (info.Exists && info.Length > 256 * 1024)
+                File.Delete(logPath);
+            File.AppendAllText(
+                logPath,
+                DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+                + " " + exception.GetType().Name + ": " + exception.Message + Environment.NewLine);
+        }
+        catch
+        {
+            // Diagnostics must never create a second failure path.
+        }
     }
 
     [STAThread]
@@ -139,6 +165,7 @@ internal static class Program
         {
             computer.Open();
             UpdateVisitor visitor = new();
+            int consecutiveWriteErrors = 0;
             while (OwnerIsAlive(ownerPath))
             {
                 computer.Accept(visitor);
@@ -162,7 +189,21 @@ internal static class Program
                     cpu, SensorType.Clock,
                     sensor => sensor.Name.StartsWith("CPU Core", StringComparison.OrdinalIgnoreCase));
 
-                WriteCache(cachePath, cpuTemp, cpuClock);
+                try
+                {
+                    WriteCache(cachePath, cpuTemp, cpuClock);
+                    consecutiveWriteErrors = 0;
+                }
+                catch (Exception writeError) when (
+                    writeError is IOException or UnauthorizedAccessException)
+                {
+                    // A reader (antivirus, the UI, a backup tool) can hold the
+                    // cache open without delete sharing for a moment. Keep the
+                    // sensor loop alive and retry on the next tick.
+                    consecutiveWriteErrors++;
+                    if (consecutiveWriteErrors == 1 || consecutiveWriteErrors % 120 == 0)
+                        AppendErrorLog(cachePath, writeError);
+                }
                 await Task.Delay(500);
             }
             return 0;
