@@ -1,5 +1,7 @@
 # Sabasakal Mini Screen 3.5″
 
+Sürüm 1.1.0
+
 Windows üzerinde 480×320 USB mini ekranlar için hazırlanmış modern bir bilgi
 panelidir. İşlemci, harici ekran kartı ve RAM değerlerinin yanında CS2, MSFS
 2024, medya, hava durumu ve kablosuz cihaz pil bilgilerini gösterebilir.
@@ -14,6 +16,16 @@ hatalarını önler.
 CS2 tarafında yalnızca Valve Game State Integration ile oyunun kendi yerel
 konsol/ağ bilgisini kullanır. Oyun belleğine erişme, kod enjekte etme, giriş
 otomasyonu veya paket yakalama yapmaz.
+
+1.1.0 ile gelenler:
+
+- Kontrol panelinden seçilebilen iki ekran tasarımı: **Yeni** (varsayılan) ve
+  **Klasik**.
+- FACEIT güvenlik modu: FACEIT Anti-Cheat çalışırken Game State Integration
+  dinleyicisi kapatılır, yalnızca sistem panelleri gösterilir.
+- Bomba sayacı kaldırıldı.
+
+![Yeni tasarım CS2 paneli](docs/images/new/cs2-live-dark.png)
 
 Ayrıntılı özellikler, kaynak derleme adımları ve lisans bilgileri için
 [İngilizce ana belgeye](README.md) bakabilirsiniz.

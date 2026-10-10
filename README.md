@@ -1,5 +1,7 @@
 # Sabasakal Mini Screen 3.5″
 
+Version 1.1.0
+
 A modern Windows dashboard for 480×320 USB mini displays. It combines live PC
 telemetry, game-aware panels, media animation, weather and wireless-device
 battery information in one compact, themeable interface.
@@ -12,7 +14,12 @@ battery information in one compact, themeable interface.
 - CPU/GPU temperature, CPU clock, VRAM and used-memory readouts
 - Smooth critical alerts for load and temperature
 - CS2 pre-queue Valve/FACEIT ping view using non-invasive public/local data
-- CS2 CT/T bomb timing, competitive/Wingman economy and deathmatch statistics
+- Two screen designs selectable in the control panel: **Yeni** (new, default)
+  and **Klasik** (classic)
+- CS2 competitive/Wingman economy and deathmatch statistics (the bomb timer was
+  removed in 1.1.0)
+- FACEIT safety mode: while FACEIT Anti-Cheat runs, the Game State Integration
+  listener is stopped and only system panels are shown
 - MSFS 2024 altitude, airspeed, vertical speed and heading panels
 - Live media spectrum plus platform/track metadata
 - Automatic Logitech G HUB and Windows battery-device discovery
@@ -26,13 +33,16 @@ battery information in one compact, themeable interface.
 
 ## CS2 previews
 
-### CT bomb panel
+### New design (Yeni)
 
-![CS2 CT bomb panel](docs/images/cs2-ct.png)
+![CS2 live panel, new design](docs/images/new/cs2-live-dark-en.png)
+![CS2 buy panel, new design](docs/images/new/cs2-buy-en.png)
+![MSFS cruise panel, new design](docs/images/new/msfs-cruise-en.png)
 
-### T bomb panel
+### Classic design (Klasik): CT / T panels
 
-![CS2 T bomb panel](docs/images/cs2-t.png)
+![CS2 CT panel](docs/images/cs2-ct.png)
+![CS2 T panel](docs/images/cs2-t.png)
 
 ### Deathmatch panel
 
