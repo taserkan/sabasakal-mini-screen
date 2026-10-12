@@ -825,10 +825,10 @@ def render_cs_death(ctx: NewScreenContext) -> Image.Image:
 
 
 def render_cs_live(ctx: NewScreenContext) -> Image.Image:
-    """Live round: strip + alerts only; otherwise the content stays dark."""
-    background, strip_bg, accent = MODE_CS2
-    image = Image.new("RGB", (WIDTH, HEIGHT), background)
-    draw_strip(image, ctx, strip_bg, accent)
+    """Live round / deathmatch: the desktop view (identical pixels, so a
+    desktop <-> live switch only repaints changed values), plus any hardware
+    alert as an overlay banner."""
+    image = render_main(ctx)
     draw = ImageDraw.Draw(image)
     if ctx.alerts:
         alert = ctx.alerts[0]
@@ -840,7 +840,8 @@ def render_cs_live(ctx: NewScreenContext) -> Image.Image:
         text(draw, (30, 178), alert.title, 40, title_color, condensed=True, anchor="ls")
         text(draw, (30, 202), alert.detail, 14, "#F3D9BF", anchor="ls")
         if len(ctx.alerts) > 1:
-            text(draw, (14, 238), ctx.alerts[1].title + " · " + ctx.alerts[1].detail, 14, WHITE)
+            rounded(draw, (14, 228, WIDTH - 14, 256), 8, "#3A1414")
+            text(draw, (24, 234), ctx.alerts[1].title + " · " + ctx.alerts[1].detail, 14, WHITE)
     return image
 
 

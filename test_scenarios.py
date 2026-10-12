@@ -5441,9 +5441,18 @@ class FixedLayoutAndTearingScenarios(unittest.TestCase):
                     sent.paste(frame.crop(region), region)
             now += 0.5
         self.assertNotIn("wipe", kinds)
-        # Value boxes only: well under 15 % of the bus over the minute.
-        self.assertLess(pixels * 2, 256_000 * 60 * 0.15)
+        # Desktop view (rings + values) with fully random metrics every 0.5 s:
+        # still partial updates only, well under half of the bus.
+        self.assertLess(pixels * 2, 256_000 * 60 * 0.40)
+
+
+class CsLiveDesktopViewTests(unittest.TestCase):
+    def test_cs_live_matches_desktop_without_alerts(self):
+        import screens_new as sn
+        ctx = sn.NewScreenContext(metrics={}, language="en", mode="cs2")
+        self.assertEqual(sn.render_cs_live(ctx).tobytes(), sn.render_main(ctx).tobytes())
 
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
