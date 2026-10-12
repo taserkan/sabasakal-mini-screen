@@ -2456,13 +2456,15 @@ def draw_open_ring(
     )
 
     value_text = f"{int(round(clamped))}"
-    value_width = draw.textlength(value_text, font=FONTS["value"])
+    # Fixed slot sized for "100": the number is right-aligned in it so the
+    # "%" sign never moves when the load goes 9 -> 10 or 99 -> 100.
+    value_width = draw.textlength("100", font=FONTS["value"])
     percent_width = draw.textlength("%", font=FONTS["gauge_unit"])
     value_gap = 4
     value_left = cx - (value_width + value_gap + percent_width) / 2
     draw.text(
-        (value_left + value_width / 2, cy - 6), value_text,
-        font=FONTS["value"], fill=value_color or colors["text"], anchor="mm",
+        (value_left + value_width, cy - 6), value_text,
+        font=FONTS["value"], fill=value_color or colors["text"], anchor="rm",
     )
     draw.text(
         (value_left + value_width + value_gap, cy - 3), "%",
@@ -2481,14 +2483,16 @@ def draw_open_ring(
         (cx, cy - radius - 14), label, font=FONTS["hardware_label"],
         fill=colors["text"], anchor="mm",
     )
-    if sensor_text.endswith("°C"):
+    if sensor_text.startswith("—"):
+        pass  # unavailable sensor: hidden, never a dash placeholder
+    elif sensor_text.endswith("°C"):
         number_text, unit_text = sensor_text[:-2], "°C"
-        number_width = draw.textlength(number_text, font=FONTS["sensor"])
+        number_width = draw.textlength("100", font=FONTS["sensor"])
         unit_width = draw.textlength(unit_text, font=FONTS["sensor"])
         start_x = cx - (number_width + unit_width) / 2
         draw.text(
-            (start_x, cy + 28), number_text, font=FONTS["sensor"],
-            fill=sensor_number_color or colors["text"], anchor="lm",
+            (start_x + number_width, cy + 28), number_text, font=FONTS["sensor"],
+            fill=sensor_number_color or colors["text"], anchor="rm",
         )
         draw.text(
             (start_x + number_width, cy + 28), unit_text, font=FONTS["sensor"],
@@ -3079,7 +3083,10 @@ def draw_msfs_panel(
                 (x, 244), value, font=FONTS["value"],
                 fill=colors["text"], anchor="ls",
             )
-            value_width = draw.textlength(value, font=FONTS["value"])
+            value_width = max(
+                draw.textlength(value, font=FONTS["value"]),
+                draw.textlength("000", font=FONTS["value"]),
+            )
             unit_x = x + value_width + 5
             draw.text(
                 (unit_x, 243), unit, font=FONTS["small_bold"],

@@ -3648,7 +3648,8 @@ class DesignSwitchScenarios(Fix111Base):
                 panel = self.make_panel({"design": "new"})
                 new_calls: list = []
                 classic_calls: list = []
-                self.run_worker(panel, design_renders=new_calls, classic_renders=classic_calls, **kwargs)
+                with patch.object(gui, "DEATH_SCREEN_DELAY", 0.0):
+                    self.run_worker(panel, design_renders=new_calls, classic_renders=classic_calls, **kwargs)
                 self.assertEqual(classic_calls, [])
                 self.assertTrue(new_calls)
                 self.assertEqual(new_calls[-1].mode, mode)
@@ -3964,7 +3965,7 @@ class BatteryPresenceAndRamScenarios(unittest.TestCase):
                     boxes += [(f"battery:{info.kind}", box) for info, box in layout["batteries"]]
                     self.assert_disjoint(boxes, label)
                     self.assertIn("ram", layout, label)
-                    ram_text = "".join(part for part, _ in layout["ram_parts"])
+                    ram_text = "".join(part[0] for part in layout["ram_parts"])
                     self.assertNotIn("…", ram_text)
                     self.assertIn("/", ram_text)
                     if not kinds:
@@ -5269,6 +5270,159 @@ class Audit116Scenarios(unittest.TestCase):
             with self.assertRaises(OSError):
                 session.show_once(Image.new("RGB", (480, 320)))
         reconnect.assert_not_called()
+
+
+class FixedLayoutAndTearingScenarios(unittest.TestCase):
+    """v1.1.8: tabular fixed slots, widget-aligned dirty rects, deathmatch."""
+
+    @staticmethod
+    def metrics(value):
+        return {
+            "cpu_load": value, "cpu_temp": value, "gpu_load": value, "gpu_temp": value,
+            "ram_load": value, "ram_used": value / 10.0, "ram_total_gb": 32.0,
+            "cpu_freq": 4.5, "gpu_memory": 8000.0,
+        }
+
+    @staticmethod
+    def devices(value):
+        return (
+            BatteryDevice("m", "M", min(99, value), "mouse"),
+            BatteryDevice("h", "H", min(99, value), "headset"),
+        )
+
+    def test_strip_positions_do_not_move_with_values(self) -> None:
+        import screens_new as sn
+        for fps in (None, 9, 144):
+            layouts = []
+            for value in (1, 9, 11, 33, 99, 100):
+                ctx = sn.NewScreenContext(self.metrics(value), self.devices(value), fps=fps, mode="cs2")
+                layouts.append(sn.draw_strip(Image.new("RGB", (480, 320)), ctx, "#000", "#FFF"))
+            self.assertTrue(all(layout == layouts[0] for layout in layouts), fps)
+
+    def test_desktop_and_faceit_positions_do_not_move_with_values(self) -> None:
+        import screens_new as sn
+        mains, faceits = [], []
+        for value in (1, 11, 33, 100):
+            ctx = sn.NewScreenContext(self.metrics(value), self.devices(value), mode="desktop")
+            layout = sn.main_layout(ctx)
+            mains.append((layout["clock"], layout["ram"], layout["cpu"], layout["gpu"]))
+            faceits.append([item[1:3] for item in sn.faceit_battery_layout(ctx)])
+        self.assertEqual(len(set(mains)), 1)
+        self.assertTrue(all(f == faceits[0] for f in faceits))
+
+    def test_digits_are_tabular(self) -> None:
+        import screens_new as sn
+        typeface = sn.font(22, True)
+        widths = {sn._tlen(f"{d}{d}%", typeface) for d in "0123456789"}
+        self.assertEqual(len(widths), 1)
+
+    def test_unavailable_fps_and_metrics_are_hidden(self) -> None:
+        import screens_new as sn
+        ctx = sn.NewScreenContext({}, (), fps=None, mode="cs2")
+        layout = sn.draw_strip(Image.new("RGB", (480, 320)), ctx, "#000", "#FFF")
+        self.assertNotIn("fps", dict(layout))
+        seen = []
+        original = ImageDraw.ImageDraw.text
+
+        def capture(draw, xy, value, *args, **kwargs):
+            seen.append(str(value))
+            return original(draw, xy, value, *args, **kwargs)
+
+        with patch.object(ImageDraw.ImageDraw, "text", capture):
+            sn.render_new_screen(sn.NewScreenContext({}, (), mode="desktop"))
+            sn.draw_strip(Image.new("RGB", (480, 320)), ctx, "#000", "#FFF")
+        self.assertFalse([t for t in seen if "—" in t])
+
+    def test_dirty_rects_never_split_a_widget(self) -> None:
+        import screens_new as sn
+        for before, after in ((11, 33), (9, 10), (99, 100), (33, 11)):
+            old_ctx = sn.NewScreenContext(self.metrics(before), self.devices(before), fps=60, mode="cs2")
+            new_ctx = sn.NewScreenContext(self.metrics(after), self.devices(after), fps=61, mode="cs2")
+            old = sn.render_new_screen(old_ctx)
+            new = sn.render_new_screen(new_ctx)
+            kind, regions = gui.plan_new_design_update(new, old, budget=10 ** 9)
+            self.assertEqual(kind, "tiles")
+            # Fake LCD: apply each rect in order; the final frame matches.
+            panel = old.copy()
+            for region in regions:
+                self.assertEqual(region[0] % 2, 0)
+                self.assertEqual((region[2] - region[0]) % 2, 0)
+                panel.paste(new.crop(region), region)
+            self.assertIsNone(ImageChops.difference(panel, new).getbbox())
+            for i, a in enumerate(regions):
+                for b in regions[i + 1:]:
+                    self.assertFalse(gui._near(a, b, 1), (a, b))
+            # Every strip widget lies in at most one rect: never half old/new.
+            for name, box in sn.draw_strip(Image.new("RGB", (480, 320)), new_ctx, "#000", "#FFF"):
+                hits = [r for r in regions
+                        if not (r[2] <= box[0] or box[2] <= r[0] or r[3] <= box[1] or box[3] <= r[1])]
+                self.assertLessEqual(len(hits), 1, (name, hits))
+
+    def test_cycle_budget_defers_whole_widgets(self) -> None:
+        import screens_new as sn
+        old = sn.render_new_screen(sn.NewScreenContext(self.metrics(11), self.devices(11), mode="desktop"))
+        new = sn.render_new_screen(sn.NewScreenContext(self.metrics(88), self.devices(88), mode="desktop"))
+        _kind, all_regions = gui.plan_new_design_update(new, old, budget=10 ** 9)
+        sent = old.copy()
+        for _cycle in range(30):
+            kind, regions = gui.plan_new_design_update(new, sent, budget=2000)
+            if kind == "none":
+                break
+            area = sum(gui._rect_area(r) for r in regions)
+            self.assertTrue(len(regions) == 1 or area <= 2000)
+            for region in regions:
+                self.assertIn(region, all_regions)
+                sent.paste(new.crop(region), region)
+        self.assertIsNone(ImageChops.difference(sent, new).getbbox())
+        self.assertGreater(len(all_regions), 1)
+
+    def test_deathmatch_never_shows_the_death_screen(self) -> None:
+        import screens_new as sn
+        dead = GameSnapshot(connected=True, in_match=True, game_mode="deathmatch", alive=False)
+        self.assertEqual(sn.cs_screen_for(dead), "live")
+        gate = sn.DeathScreenGate(3.0)
+        comp = GameSnapshot(connected=True, in_match=True, game_mode="competitive", alive=False)
+        self.assertEqual(gate.update(sn.cs_screen_for(comp), 0.0), "live")
+        self.assertEqual(gate.update(sn.cs_screen_for(comp), 2.9), "live")
+        self.assertEqual(gate.update(sn.cs_screen_for(comp), 3.1), "death")
+
+    def test_deathmatch_replay_sends_only_small_value_updates(self) -> None:
+        import random
+        import screens_new as sn
+        rng = random.Random(7)
+        stabilizer = sn.ScreenStabilizer()
+        gate = sn.DeathScreenGate(3.0)
+        sent = None
+        pixels = 0
+        kinds = []
+        now, alive, next_toggle = 0.0, True, 4.0
+        while now < 60.0:
+            if now >= next_toggle:
+                alive = not alive
+                next_toggle = now + rng.uniform(3.0, 8.0)
+            game = GameSnapshot(connected=True, in_match=True, game_mode="deathmatch",
+                                alive=alive, round_phase="live")
+            mode, cs_screen, _phase = stabilizer.update(
+                ("cs2", gate.update(sn.cs_screen_for(game), now), ""), now)
+            metrics = {"cpu_load": rng.randint(5, 100), "cpu_temp": rng.randint(50, 90),
+                       "gpu_load": rng.randint(5, 100), "gpu_temp": rng.randint(50, 90),
+                       "ram_load": 60.0}
+            frame = sn.render_new_screen(sn.NewScreenContext(
+                metrics, (), mode=mode, game=game, cs_screen=cs_screen, fps=None,
+                now=__import__("datetime").datetime(2026, 10, 12, 14, 52)))
+            if sent is None:
+                sent = frame.copy()
+            else:
+                kind, regions = gui.plan_new_design_update(frame, sent)
+                kinds.append(kind)
+                for region in regions:
+                    pixels += gui._rect_area(region)
+                    sent.paste(frame.crop(region), region)
+            now += 0.5
+        self.assertNotIn("wipe", kinds)
+        # Value boxes only: well under 15 % of the bus over the minute.
+        self.assertLess(pixels * 2, 256_000 * 60 * 0.15)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

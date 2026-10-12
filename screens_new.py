@@ -158,35 +158,80 @@ def panel_color(background: str, alpha: float = 0.07) -> str:
     return blend(background, "#FFFFFF", alpha)
 
 
+PLACEHOLDER = "—"
+
+
+@functools.lru_cache(maxsize=128)
+def _digit_cell(typeface) -> float:
+    """Width of the widest digit: every digit is drawn in a cell this wide."""
+    return max(typeface.getlength(d) for d in "0123456789")
+
+
+def _tabular(value: str) -> bool:
+    return any(ch.isdigit() for ch in value)
+
+
+def _tlen(value: str, typeface, spacing: float = 0.0) -> float:
+    """Text width with tabular (fixed-cell) digits.
+
+    The UI fonts have proportional figures ("1" is narrower than "0"), which
+    made every neighbour shift when a value changed. Measuring and drawing
+    digits in fixed cells keeps a field's width a function of its *shape*
+    only, never of the digits shown.
+    """
+    if not _tabular(value):
+        return typeface.getlength(value) + spacing * max(0, len(value) - 1)
+    cell = _digit_cell(typeface)
+    width = sum(cell if ch.isdigit() else typeface.getlength(ch) for ch in value)
+    return width + spacing * max(0, len(value) - 1)
+
+
+def slot_width(template: str, size: int, condensed: bool = False) -> float:
+    """Fixed slot for a numeric field, measured from its widest form ("100%")."""
+    return _tlen(template, font(size, condensed))
+
+
 def _text_width(draw: ImageDraw.ImageDraw, text: str, typeface, spacing: float = 0.0) -> float:
-    return draw.textlength(text, font=typeface) + spacing * max(0, len(text) - 1)
+    return _tlen(text, typeface, spacing)
 
 
 def text(draw: ImageDraw.ImageDraw, xy, value: str, size: int, color: str = WHITE,
          condensed: bool = False, anchor: str = "la", spacing: float = 0.0) -> float:
-    """Draw text; returns its width. ``spacing`` emulates CSS letter-spacing."""
+    """Draw text; returns its width. ``spacing`` emulates CSS letter-spacing.
+
+    Digits are tabular. A bare placeholder ("—" / empty) is never drawn: an
+    unavailable metric is hidden, not shown as a dash.
+    """
+    if not value or value.strip() == PLACEHOLDER:
+        return 0.0
     typeface = font(size, condensed)
-    if not spacing:
+    if not spacing and not _tabular(value):
         draw.text(xy, value, font=typeface, fill=color, anchor=anchor)
-        return draw.textlength(value, font=typeface)
-    width = _text_width(draw, value, typeface, spacing)
+        return _tlen(value, typeface)
+    width = _tlen(value, typeface, spacing)
     x, y = xy
     if anchor[0] == "r":
         x -= width
     elif anchor[0] == "m":
         x -= width / 2
     vertical = "l" + anchor[1]
+    cell = _digit_cell(typeface)
     for char in value:
-        draw.text((x, y), char, font=typeface, fill=color, anchor=vertical)
-        x += draw.textlength(char, font=typeface) + spacing
+        if char.isdigit():
+            glyph = typeface.getlength(char)
+            draw.text((x + (cell - glyph) / 2, y), char, font=typeface, fill=color, anchor=vertical)
+            x += cell + spacing
+        else:
+            draw.text((x, y), char, font=typeface, fill=color, anchor=vertical)
+            x += typeface.getlength(char) + spacing
     return width
 
 
 def fit(draw: ImageDraw.ImageDraw, value: str, size: int, max_width: float, condensed=False) -> str:
     typeface = font(size, condensed)
-    if draw.textlength(value, font=typeface) <= max_width:
+    if _tlen(value, typeface) <= max_width:
         return value
-    while value and draw.textlength(value + "…", font=typeface) > max_width:
+    while value and _tlen(value + "…", typeface) > max_width:
         value = value[:-1]
     return value.rstrip() + "…"
 
@@ -233,7 +278,7 @@ def ring(image: Image.Image, center: tuple[int, int], diameter: int, stroke: flo
 
 def chip(draw: ImageDraw.ImageDraw, x: int, y: int, label: str, palette=CHIP_OK, size: int = 14) -> int:
     """Pill chip; returns its right edge."""
-    width = int(draw.textlength(label, font=font(size))) + 18
+    width = int(_tlen(label, font(size))) + 18
     rounded(draw, (x, y, x + width, y + size + 12), 6, palette[0])
     text(draw, (x + 9, y + (size + 12) / 2), label, size, palette[1], anchor="lm")
     return x + width
@@ -318,13 +363,22 @@ def battery_value_parts(info: BatteryInfo) -> list[tuple[str, str]]:
     return parts
 
 
+def _part_slot(value: str) -> str:
+    """Slot template of a part: battery percentages reserve two tabular
+    digits ("00%"); only a full 100% battery takes the wider slot."""
+    if value.endswith("%"):
+        return "100%" if value == "100%" else "00%"
+    return value
+
+
 def _parts_width(draw, parts, size: int) -> float:
-    return sum(draw.textlength(value, font=font(size)) for value, _ in parts)
+    return sum(_tlen(_part_slot(value), font(size)) for value, _ in parts)
 
 
 def _draw_parts(draw, x: float, y: float, parts, size: int, anchor_v: str) -> float:
     for value, color in parts:
-        x += text(draw, (x, y), value, size, color, anchor="l" + anchor_v)
+        x += _tlen(_part_slot(value), font(size))
+        text(draw, (x, y), value, size, color, anchor="r" + anchor_v)
     return x
 
 
@@ -384,58 +438,63 @@ def draw_strip(image: Image.Image, ctx: NewScreenContext, strip_bg: str, accent:
     draw.rectangle((0, STRIP_HEIGHT - 3, WIDTH, STRIP_HEIGHT - 1), fill=accent)
     m = ctx.metrics
     layout: list[tuple[str, tuple[float, float, float, float]]] = []
-    x = 12
+    x = 10
     label_y, value_y = 20, 45
     value_font = font(22, True)
 
+    # Every value sits in a fixed slot measured from its widest form, so a
+    # reading going 9 -> 10 or 99 -> 100 never moves anything else.
     def cell_width(label: str, parts) -> float:
         width = 0.0
-        for index, (value, _color) in enumerate(parts):
+        for index, (_value, _color, template) in enumerate(parts):
             if index:
-                width += draw.textlength(" ", font=value_font)
-            width += draw.textlength(value, font=value_font)
+                width += _tlen(" ", value_font)
+            width += _tlen(template, value_font)
         return max(width, _text_width(draw, label, font(12), 1.0))
 
     def draw_cell(left: float, label: str, parts) -> float:
         text(draw, (left, label_y), label, 12, WHITE, anchor="ls", spacing=1.0)
         cursor = left
-        for index, (value, color) in enumerate(parts):
+        for index, (value, color, template) in enumerate(parts):
             if index:
-                cursor += draw.textlength(" ", font=value_font)
-            cursor += text(draw, (cursor, value_y), value, 22, color, condensed=True, anchor="ls")
+                cursor += _tlen(" ", value_font)
+            cursor += _tlen(template, value_font)
+            text(draw, (cursor, value_y), value, 22, color, condensed=True, anchor="rs")
         return left + cell_width(label, parts)
 
-    cells = (
+    cells = [
         ("CPU", (
-            (_pct(m.get("cpu_load")), threshold_color("cpu", "load", m.get("cpu_load"))),
-            (_deg(m.get("cpu_temp")), threshold_color("cpu", "temp", m.get("cpu_temp"))),
+            (_pct(m.get("cpu_load")), threshold_color("cpu", "load", m.get("cpu_load")), "100%"),
+            (_deg(m.get("cpu_temp")), threshold_color("cpu", "temp", m.get("cpu_temp")), "100°"),
         )),
         ("GPU", (
-            (_pct(m.get("gpu_load")), threshold_color("gpu", "load", m.get("gpu_load"))),
-            (_deg(m.get("gpu_temp")), threshold_color("gpu", "temp", m.get("gpu_temp"))),
+            (_pct(m.get("gpu_load")), threshold_color("gpu", "load", m.get("gpu_load")), "100%"),
+            (_deg(m.get("gpu_temp")), threshold_color("gpu", "temp", m.get("gpu_temp")), "100°"),
         )),
-        ("FPS", ((("—" if ctx.fps is None else str(int(round(ctx.fps)))), TEXT),)),
-    )
+    ]
+    if ctx.fps is not None:
+        # FPS only exists when a source measures it; never reserve its slot.
+        cells.append(("FPS", ((str(int(round(ctx.fps))), TEXT, "999"),)))
     for label, parts in cells:
         end = draw_cell(x, label, parts)
         layout.append((label.lower(), (x, 6, end, value_y + 4)))
-        x = end + 14
+        x = end + 8
 
     # Battery items, right-aligned, measured before anything is drawn.
     small = font(14)
     center_y = (STRIP_HEIGHT - 3) / 2
 
     def plan(infos):
-        right = WIDTH - 12
+        right = WIDTH - 10
         placed = []
         for info in reversed(infos):
             label = _t(ctx, BATTERY_LABELS[info.kind][1]) + " "
             value = battery_value_parts(info)
-            width = draw.textlength(label, font=small) + _parts_width(draw, value, 14)
+            width = _tlen(label, small) + _parts_width(draw, value, 14)
             if right - width < x:
                 break
             placed.append((info, label, value, right - width, right))
-            right -= width + 12
+            right -= width + 6
         return placed
 
     infos = present_batteries(ctx.batteries)
@@ -443,12 +502,12 @@ def draw_strip(image: Image.Image, ctx: NewScreenContext, strip_bg: str, accent:
     if len(planned) < len(infos):
         # Never lose a device for the DPI suffix: drop the DPI first.
         planned = plan([dataclasses.replace(info, dpi=None) for info in infos])
-    battery_left = planned[-1][3] if planned else WIDTH - 12
+    battery_left = planned[-1][3] if planned else WIDTH - 10
 
     if allow_ram:
         load, _used, _total = ram_reading(m)
         if load is not None:
-            parts = ((_pct(load), threshold_color("ram", "load", load)),)
+            parts = ((_pct(load), threshold_color("ram", "load", load), "100%"),)
             width = cell_width("RAM", parts)
             if x + width <= battery_left - 12:
                 end = draw_cell(x, "RAM", parts)
@@ -529,7 +588,7 @@ def _cpu_details(ctx) -> list[str]:
         lines.append(f"{float(m['cpu_freq']):.1f} GHz")
     if m.get("cpu_power"):
         lines.append(f"{int(round(float(m['cpu_power'])))} W")
-    return lines or ["—"]
+    return lines
 
 
 def _gpu_details(ctx, include_fps: bool = False) -> list[str]:
@@ -541,7 +600,7 @@ def _gpu_details(ctx, include_fps: bool = False) -> list[str]:
         lines.append(f"VRAM {float(m['gpu_memory']) / 1024.0:.1f} GB")
     if m.get("gpu_power") and not include_fps:
         lines.append(f"{int(round(float(m['gpu_power'])))} W")
-    return lines or ["—"]
+    return lines
 
 
 def main_layout(ctx: NewScreenContext, draw: ImageDraw.ImageDraw | None = None) -> dict:
@@ -551,17 +610,19 @@ def main_layout(ctx: NewScreenContext, draw: ImageDraw.ImageDraw | None = None) 
     now = ctx.now or dt.datetime.now()
     layout: dict = {}
     clock = now.strftime("%H:%M")
-    clock_width = draw.textlength(clock, font=font(30, True))
+    clock_width = _tlen(clock, font(30, True))
     layout["clock"] = (14, 14, 14 + clock_width, 46)
     cursor = 14 + clock_width + 14
     load, used, total = ram_reading(ctx.metrics)
     if load is not None:
-        parts = [("RAM ", WHITE), (_pct(load), threshold_color("ram", "load", load))]
+        parts = [("RAM ", WHITE, "RAM "), (_pct(load), threshold_color("ram", "load", load), "100%")]
         if used is not None and total:
-            parts.append((f" · {used:.1f}/{total:.0f} GB", WHITE))
+            # Used GB never has more integer digits than the total.
+            used_slot = "0" * max(len(f"{total:.0f}"), len(f"{used:.0f}")) + ".0"
+            parts.append((f" · {used:.1f}/{total:.0f} GB", WHITE, f" · {used_slot}/{total:.0f} GB"))
         elif used is not None:
-            parts.append((f" · {used:.1f} GB", WHITE))
-        width = sum(draw.textlength(value, font=font(14)) for value, _ in parts)
+            parts.append((f" · {used:.1f} GB", WHITE, f" · {max(99.9, used):.1f} GB"))
+        width = sum(_tlen(template, font(14)) for _value, _color, template in parts)
         layout["ram"] = (cursor, 28, cursor + width, 44)
         layout["ram_parts"] = parts
         cursor += width + 14
@@ -575,7 +636,7 @@ def main_layout(ctx: NewScreenContext, draw: ImageDraw.ImageDraw | None = None) 
         available = WIDTH - 14 - cursor
         if available >= 60:
             weather = fit(draw, weather, 14, min(300, available))
-            width = draw.textlength(weather, font=font(14))
+            width = _tlen(weather, font(14))
             layout["weather"] = (WIDTH - 14 - width, 28, WIDTH - 14, 44)
             layout["weather_text"] = weather
     batteries = present_batteries(ctx.batteries)
@@ -600,8 +661,9 @@ def render_main(ctx: NewScreenContext) -> Image.Image:
     text(draw, (14, 44), now.strftime("%H:%M"), 30, TEXT, condensed=True, anchor="ls")
     if "ram" in layout:
         x = layout["ram"][0]
-        for value, color in layout["ram_parts"]:
-            x += text(draw, (x, 42), value, 14, color, anchor="ls")
+        for value, color, template in layout["ram_parts"]:
+            x += _tlen(template, font(14))
+            text(draw, (x, 42), value, 14, color, anchor="rs")
     if "weather" in layout:
         text(draw, (WIDTH - 14, 42), layout["weather_text"], 14, WHITE, anchor="rs")
     _system_panel(image, draw, layout["cpu"], background, "cpu", ctx,
@@ -638,7 +700,7 @@ def faceit_battery_layout(ctx: NewScreenContext, draw: ImageDraw.ImageDraw | Non
     for index, ((left, right), info) in enumerate(zip(slots, batteries)):
         label = _t(ctx, BATTERY_LABELS[info.kind][0]) + " "
         value = battery_value_parts(info)
-        label_width = draw.textlength(label, font=font(15))
+        label_width = _tlen(label, font(15))
         value_width = _parts_width(draw, value, 15)
         total = label_width + value_width
         if len(batteries) == 1 or 0 < index < last:
@@ -694,25 +756,33 @@ def render_cs_death(ctx: NewScreenContext) -> Image.Image:
     game = ctx.game
     text(draw, (14, 70), _t(ctx, "BU ROUND"), 14, WHITE)
     ct, t = _score_text(game)
-    right = WIDTH - 14
-    right -= text(draw, (right, 88), f"{t} T", 26, T_ORANGE, condensed=True, anchor="rs")
-    right -= text(draw, (right, 88), " – ", 26, WHITE, condensed=True, anchor="rs")
-    text(draw, (right, 88), f"CT {ct}", 26, CT_BLUE, condensed=True, anchor="rs")
+    if ct != "—" and t != "—":
+        # Fixed slots: the score never slides when a side reaches 10.
+        score_font = font(26, True)
+        right = WIDTH - 14
+        right -= text(draw, (right, 88), " T", 26, T_ORANGE, condensed=True, anchor="rs")
+        text(draw, (right, 88), t, 26, T_ORANGE, condensed=True, anchor="rs")
+        right -= _tlen("99", score_font)
+        right -= text(draw, (right, 88), " – ", 26, WHITE, condensed=True, anchor="rs")
+        right -= _tlen("99", score_font)
+        text(draw, (right + _tlen("99", score_font), 88), ct, 26, CT_BLUE, condensed=True, anchor="rs")
+        text(draw, (right, 88), "CT ", 26, CT_BLUE, condensed=True, anchor="rs")
     top, bottom = 100, 184
     (l1, r1), (l2, r2) = _columns(14, WIDTH - 14, 2, 10)
     for left, right_edge in ((l1, r1), (l2, r2)):
         rounded(draw, (left, top, right_edge, bottom), 10, panel_color(background))
     text(draw, (l1 + 10, top + 10), _t(ctx, "Kill"), 14, WHITE)
     kills = "—" if game.round_kills is None else str(game.round_kills)
-    width = text(draw, (l1 + 10, bottom - 14), kills, 44, TEXT, condensed=True, anchor="ls")
-    if game.round_headshots is not None:
+    text(draw, (l1 + 10, bottom - 14), kills, 44, TEXT, condensed=True, anchor="ls")
+    width = _tlen("9", font(44, True))
+    if game.round_kills is not None and game.round_headshots is not None:
         text(draw, (l1 + 18 + width, bottom - 16), f"{game.round_headshots} HS", 18, WHITE, anchor="ls")
     text(draw, (l2 + 10, top + 10), _t(ctx, "Hasar"), 14, WHITE)
     damage = "—" if game.round_damage is None else str(game.round_damage)
     text(draw, (l2 + 10, bottom - 14), damage, 44, TEXT, condensed=True, anchor="ls")
 
     def pair(a, b):
-        return f"{'—' if a is None else a} / {'—' if b is None else b}"
+        return "—" if a is None or b is None else f"{a} / {b}"
 
     cells = (
         (_t(ctx, "MAÇ K/D"), pair(game.match_kills, game.match_deaths)),
@@ -721,6 +791,8 @@ def render_cs_death(ctx: NewScreenContext) -> Image.Image:
         (_t(ctx, "Skor"), "—" if game.match_score is None else str(game.match_score)),
     )
     for (left, _right), (label, value) in zip(_columns(14, WIDTH - 14, 4, 8), cells):
+        if value == "—":
+            continue  # unavailable: hide the whole cell
         text(draw, (left, 196), label, 14, WHITE)
         text(draw, (left, 236), value, 20, TEXT, anchor="ls")
     return image
@@ -784,7 +856,7 @@ def render_cs_menu(ctx: NewScreenContext) -> Image.Image:
     color = "#FFB870" if key == "restart" else accent
     now = ctx.now or dt.datetime.now()
     clock = now.strftime("%H:%M")
-    clock_width = draw.textlength(clock, font=font(14))
+    clock_width = _tlen(clock, font(14))
     text(draw, (14, 64), fit(draw, status, 15, WIDTH - 42 - clock_width), 15, color)
     text(draw, (WIDTH - 14, 64), clock, 14, WHITE, anchor="ra")
     track = panel_color(panel_color(background), 0.12)
@@ -802,7 +874,7 @@ def render_cs_menu(ctx: NewScreenContext) -> Image.Image:
             value = f"{int(ms)} ms"
             color_ms = GREEN if ms < 60 else ORANGE if ms < 100 else RED
             label = f"{str(code).upper()[:4]} "
-            width = draw.textlength(label, font=font(14)) + draw.textlength(value, font=font(14))
+            width = _tlen(label, font(14)) + _tlen(value, font(14))
             x = (left + right - width) / 2
             x += text(draw, (x, cy), label, 14, WHITE, anchor="lm")
             text(draw, (x, cy), value, 14, color_ms, anchor="lm")
@@ -1012,7 +1084,7 @@ def render_msfs_landing(ctx: NewScreenContext) -> Image.Image:
     text(draw, (24 + width, 176), "fpm", 26, WHITE, anchor="ls")
     label, fill, ink = LANDING_STYLE[landing.rating]
     label = _t(ctx, label)
-    pill_width = int(draw.textlength(label, font=font(34, True))) + 32
+    pill_width = int(_tlen(label, font(34, True))) + 32
     box = (WIDTH - 14 - pill_width, 116, WIDTH - 14, 170)
     rounded(draw, box, 10, fill)
     text(draw, ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2 + 1), label, 34, ink, condensed=True, anchor="mm")
@@ -1083,10 +1155,31 @@ def cs_screen_for(game) -> str:
     jump between layouts at round start."""
     if game is None:
         return "live"
+    if "deathmatch" in str(getattr(game, "game_mode", "") or "").lower():
+        # Respawn every few seconds: one stable live screen, never a death
+        # screen (v1.1.7 wiped the whole panel death <-> live on each respawn).
+        return "live"
     phase = getattr(game, "round_phase", "")
     if phase == "over" or getattr(game, "alive", None) is False:
         return "death"
     return "live"
+
+
+class DeathScreenGate:
+    """Show the death screen only after ``delay`` s of continuous "death"."""
+
+    def __init__(self, delay: float = 3.0) -> None:
+        self.delay = delay
+        self._since: float | None = None
+
+    def update(self, requested: str, now: float | None = None) -> str:
+        now = time.monotonic() if now is None else now
+        if requested != "death":
+            self._since = None
+            return requested
+        if self._since is None:
+            self._since = now
+        return "death" if now - self._since >= self.delay else "live"
 
 
 class ScreenStabilizer:

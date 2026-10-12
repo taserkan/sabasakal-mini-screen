@@ -51,7 +51,7 @@ from msfs_runtime import (
     FlightPhaseState, FlightPhaseTracker, FlightTelemetry, LandingRecord, MSFSTelemetryMonitor,
 )
 from screens_new import (
-    AlertTracker, NewScreenContext, ScreenStabilizer, cs2_menu_status, cs_screen_for,
+    AlertTracker, DeathScreenGate, NewScreenContext, ScreenStabilizer, cs2_menu_status, cs_screen_for,
     new_design_mode, render_new_screen,
 )
 from weather_runtime import (
@@ -64,7 +64,7 @@ from i18n import SUPPORTED_LANGUAGES, normalize_language, translate
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.1.7"
+APP_VERSION = "1.1.8"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -246,18 +246,132 @@ WIPE_STRIPS = tuple((left, 0, left + WIPE_STRIP_WIDTH, 320) for left in range(0,
 WIPE_AREA_FRACTION = 0.45
 
 
+# Dirty-rect planning for the Claude design. v1.1.7 diffed a fixed 120x40
+# grid, so one changing number that crossed a tile edge went out as two or
+# more independent rectangles (and a strip value that shifted width dirtied a
+# whole row of tiles). The Rev-A panel paints each rectangle top-to-bottom as
+# bytes arrive, so the halves of a glyph landed at different moments: visible
+# tearing. Now changed pixels are clustered into whole-widget rectangles
+# (connected 8 px cells), merged when they touch, sent top-to-bottom, and a
+# cycle sends at most DIRTY_CYCLE_PIXELS (~250 ms of bus time); the rest is
+# deferred whole to the next cycle, never split.
+DIRTY_CELL = 8
+DIRTY_MERGE_GAP = 4
+# Fields on one text line (e.g. "33% 61°" of the CPU cell) are one widget.
+DIRTY_MERGE_GAP_X = 40
+# 256 KB/s * 0.25 s / 2 bytes per RGB565 pixel.
+DIRTY_CYCLE_PIXELS = 32_000
+
+
+def _rect_area(rect) -> int:
+    return (rect[2] - rect[0]) * (rect[3] - rect[1])
+
+
+def _near(a, b, gap: int, gap_x: int | None = None) -> bool:
+    gap_x = gap if gap_x is None else gap_x
+    return not (
+        a[2] + gap_x <= b[0] or b[2] + gap_x <= a[0]
+        or a[3] + gap <= b[1] or b[3] + gap <= a[1]
+    )
+
+
+def merge_rects(rects, gap: int = DIRTY_MERGE_GAP,
+                gap_x: int | None = None) -> list[tuple[int, int, int, int]]:
+    """Union rectangles that overlap or lie within ``gap`` px of each other."""
+    rects = [tuple(r) for r in rects]
+    merged = True
+    while merged:
+        merged = False
+        out: list[tuple[int, int, int, int]] = []
+        for rect in rects:
+            for index, other in enumerate(out):
+                if _near(rect, other, gap, gap_x):
+                    out[index] = (
+                        min(rect[0], other[0]), min(rect[1], other[1]),
+                        max(rect[2], other[2]), max(rect[3], other[3]),
+                    )
+                    merged = True
+                    break
+            else:
+                out.append(rect)
+        rects = out
+    return rects
+
+
+def widget_dirty_rects(frame: Image.Image, sent: Image.Image) -> list[tuple[int, int, int, int]]:
+    """Changed areas as whole-widget rectangles (never cut through a glyph)."""
+    # Max over the bands: an "L" conversion would round a 1-level change of
+    # a single channel to 0 and silently leave that pixel stale.
+    red, green, blue = ImageChops.difference(frame.convert("RGB"), sent.convert("RGB")).split()
+    diff = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+    if diff.getbbox() is None:
+        return []
+    width, height = frame.size
+    mask = diff.point(lambda v: 255 if v else 0)
+    cols, rows = -(-width // DIRTY_CELL), -(-height // DIRTY_CELL)
+    # A single changed pixel (255) averages to >= 255/64 ~ 4 over an 8x8
+    # cell, so BOX downsampling never loses a changed cell.
+    cells = mask.resize((cols, rows), Image.Resampling.BOX, reducing_gap=None)
+    data = cells.load()
+    hot = {(cx, cy) for cy in range(rows) for cx in range(cols) if data[cx, cy]}
+    rects = []
+    seen: set = set()
+    for start in sorted(hot):
+        if start in seen:
+            continue
+        stack, component = [start], []
+        seen.add(start)
+        while stack:
+            cx, cy = stack.pop()
+            component.append((cx, cy))
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    nxt = (cx + dx, cy + dy)
+                    if nxt in hot and nxt not in seen:
+                        seen.add(nxt)
+                        stack.append(nxt)
+        left = min(c[0] for c in component) * DIRTY_CELL
+        top = min(c[1] for c in component) * DIRTY_CELL
+        right = min(width, (max(c[0] for c in component) + 1) * DIRTY_CELL)
+        bottom = min(height, (max(c[1] for c in component) + 1) * DIRTY_CELL)
+        tight = mask.crop((left, top, right, bottom)).getbbox()
+        rects.append((left + tight[0], top + tight[1], left + tight[2], top + tight[3]))
+    aligned = []
+    for left, top, right, bottom in merge_rects(rects, DIRTY_MERGE_GAP, DIRTY_MERGE_GAP_X):
+        # Even x/width: identical boundaries in normal and 180-degree panels.
+        left -= left % 2
+        right = min(width, right + right % 2)
+        aligned.append((left, top, right, bottom))
+    aligned = merge_rects(aligned, 0)
+    return sorted(aligned, key=lambda r: (r[1], r[0]))
+
+
 def plan_new_design_update(
-    frame: Image.Image, sent: Image.Image,
+    frame: Image.Image, sent: Image.Image, budget: int = DIRTY_CYCLE_PIXELS,
 ) -> tuple[str, list[tuple[int, int, int, int]]]:
-    """Return ("none"|"tiles"|"wipe", regions) for a Claude-design frame."""
-    regions = _tight_changed_regions(frame, sent, NEW_DESIGN_TILES)
+    """Return ("none"|"tiles"|"wipe", regions) for a Claude-design frame.
+
+    "tiles" regions are whole-widget rectangles, top-to-bottom, at most
+    ``budget`` pixels per cycle (the first one always goes). Unsent widgets
+    stay different from the sent frame and go out on the next cycle.
+    """
+    regions = widget_dirty_rects(frame, sent)
     if not regions:
         return "none", []
-    area = sum((r[2] - r[0]) * (r[3] - r[1]) for r in regions)
+    area = sum(_rect_area(r) for r in regions)
     if area >= WIPE_AREA_FRACTION * frame.width * frame.height:
         return "wipe", _tight_changed_regions(frame, sent, WIPE_STRIPS)
-    return "tiles", regions
+    chosen, used = [], 0
+    for region in regions:
+        cost = _rect_area(region)
+        if chosen and used + cost > budget:
+            continue
+        chosen.append(region)
+        used += cost
+    return "tiles", chosen
 NEW_DESIGN_WORKER_INTERVAL = 0.5
+# Competitive/casual: the death screen appears only after 3 s dead.
+DEATH_SCREEN_DELAY = 3.0
 NEW_DESIGN_MSFS_INTERVAL = 0.25
 DEFAULT_SETTINGS = {
     "palette": "Kuzey", "colors": PALETTES["Kuzey"], "brightness": 55,
@@ -2774,6 +2888,7 @@ class ControlPanel(QWidget):
         alert_tracker = AlertTracker()
         phase_tracker = FlightPhaseTracker()
         screen_stabilizer = ScreenStabilizer()
+        death_gate = DeathScreenGate(DEATH_SCREEN_DELAY)
         transfer_logs = {"count": 0, "at": -1e9}
 
         def log_transfer(kind: str, seconds: float, regions: int) -> None:
@@ -3122,7 +3237,10 @@ class ControlPanel(QWidget):
                             # MSFS closed: the next session starts clean.
                             phase_tracker.reset()
                             flight_state = None
-                        requested_cs = cs_screen_for(snapshot) if design_mode == "cs2" else ""
+                        requested_cs = (
+                            death_gate.update(cs_screen_for(snapshot), cycle_started)
+                            if design_mode == "cs2" else ""
+                        )
                         requested_phase = getattr(flight_state, "phase", "") if design_mode == "msfs" else ""
                         design_mode, shown_cs, shown_phase = screen_stabilizer.update(
                             (design_mode, requested_cs, requested_phase), cycle_started,
