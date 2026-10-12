@@ -5299,6 +5299,27 @@ class FixedLayoutAndTearingScenarios(unittest.TestCase):
                 layouts.append(sn.draw_strip(Image.new("RGB", (480, 320)), ctx, "#000", "#FFF"))
             self.assertTrue(all(layout == layouts[0] for layout in layouts), fps)
 
+    def test_strip_dividers_fixed_and_never_crossed(self) -> None:
+        import screens_new as sn
+        seen = None
+        for value in (1, 9, 99, 100):
+            ctx = sn.NewScreenContext(self.metrics(value), self.devices(value), fps=144, mode="cs2")
+            layout = sn.draw_strip(Image.new("RGB", (480, 320)), ctx, "#000", "#FFF")
+            rules = [box for name, box in layout if name.startswith("divider:")]
+            texts = [box for name, box in layout if not name.startswith("divider:")]
+            self.assertEqual(len(rules), 4)  # cpu|gpu|fps|ram|batteries
+            seen = seen or rules
+            self.assertEqual(rules, seen)
+            for r in rules:
+                for b in texts:
+                    self.assertTrue(b[2] + sn.STRIP_PAD <= r[0] + 0.5 or r[2] + sn.STRIP_PAD - 0.5 <= b[0], (r, b))
+            # Labels are centred on their value block (both drawn on the box centre).
+            for name, box in layout:
+                if name in ("cpu", "gpu", "fps", "ram"):
+                    label = name.upper()
+                    width = sn._tlen(label, sn.font(12), 1.0)
+                    self.assertLessEqual(width, box[2] - box[0] + 1)
+
     def test_desktop_and_faceit_positions_do_not_move_with_values(self) -> None:
         import screens_new as sn
         mains, faceits = [], []

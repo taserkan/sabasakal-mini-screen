@@ -44,6 +44,9 @@ CHIP_OK = ("#12301C", "#86EFAC")
 CHIP_WARN = ("#3A2410", "#FFB870")
 CHIP_BAD = ("#3A1414", "#FCA5A5")
 STRIP_HEIGHT = 56
+STRIP_PAD = 6  # min gap between strip text and a divider
+STRIP_RULE = 1  # divider width
+STRIP_VALUE_SIZES = (22, 20, 18)
 
 # Mode palettes: (root background, strip background, accent).
 MODE_DESKTOP = ("#0B0F14", "#141B24", "#3FB5FF")
@@ -438,31 +441,11 @@ def draw_strip(image: Image.Image, ctx: NewScreenContext, strip_bg: str, accent:
     draw.rectangle((0, STRIP_HEIGHT - 3, WIDTH, STRIP_HEIGHT - 1), fill=accent)
     m = ctx.metrics
     layout: list[tuple[str, tuple[float, float, float, float]]] = []
-    x = 10
     label_y, value_y = 20, 45
-    value_font = font(22, True)
+    pad, rule = STRIP_PAD, STRIP_RULE
+    divider = blend(strip_bg, WHITE, 0.25)
 
-    # Every value sits in a fixed slot measured from its widest form, so a
-    # reading going 9 -> 10 or 99 -> 100 never moves anything else.
-    def cell_width(label: str, parts) -> float:
-        width = 0.0
-        for index, (_value, _color, template) in enumerate(parts):
-            if index:
-                width += _tlen(" ", value_font)
-            width += _tlen(template, value_font)
-        return max(width, _text_width(draw, label, font(12), 1.0))
-
-    def draw_cell(left: float, label: str, parts) -> float:
-        text(draw, (left, label_y), label, 12, WHITE, anchor="ls", spacing=1.0)
-        cursor = left
-        for index, (value, color, template) in enumerate(parts):
-            if index:
-                cursor += _tlen(" ", value_font)
-            cursor += _tlen(template, value_font)
-            text(draw, (cursor, value_y), value, 22, color, condensed=True, anchor="rs")
-        return left + cell_width(label, parts)
-
-    cells = [
+    base = [
         ("CPU", (
             (_pct(m.get("cpu_load")), threshold_color("cpu", "load", m.get("cpu_load")), "100%"),
             (_deg(m.get("cpu_temp")), threshold_color("cpu", "temp", m.get("cpu_temp")), "100°"),
@@ -474,45 +457,88 @@ def draw_strip(image: Image.Image, ctx: NewScreenContext, strip_bg: str, accent:
     ]
     if ctx.fps is not None:
         # FPS only exists when a source measures it; never reserve its slot.
-        cells.append(("FPS", ((str(int(round(ctx.fps))), TEXT, "999"),)))
-    for label, parts in cells:
-        end = draw_cell(x, label, parts)
-        layout.append((label.lower(), (x, 6, end, value_y + 4)))
-        x = end + 8
+        base.append(("FPS", ((str(int(round(ctx.fps))), TEXT, "999"),)))
+    ram_cell = None
+    if allow_ram:
+        load, _used, _total = ram_reading(m)
+        if load is not None:
+            ram_cell = ("RAM", ((_pct(load), threshold_color("ram", "load", load), "100%"),))
 
-    # Battery items, right-aligned, measured before anything is drawn.
+    # Every value sits in a fixed slot measured from its widest form, so a
+    # reading going 9 -> 10 or 99 -> 100 never moves anything else. Each
+    # group is a column between thin dividers; its label is centred over
+    # the value block, and the value font steps down before anything overlaps.
+    def block_width(parts, size) -> float:
+        face = font(size, True)
+        return sum(_tlen(t, face) for _v, _c, t in parts) + _tlen(" ", face) * (len(parts) - 1)
+
+    def columns(cells, size):
+        placed, x = [], 4 - rule
+        for label, parts in cells:
+            x += rule
+            width = math.ceil(max(block_width(parts, size), _tlen(label, font(12), 1.0)))
+            left = x + pad
+            placed.append((label, parts, left, left + width))
+            x = left + width + pad
+        return placed, x  # x = left edge of the trailing divider
+
     small = font(14)
     center_y = (STRIP_HEIGHT - 3) / 2
 
-    def plan(infos):
+    def plan(infos, start):
         right = WIDTH - 10
         placed = []
         for info in reversed(infos):
             label = _t(ctx, BATTERY_LABELS[info.kind][1]) + " "
             value = battery_value_parts(info)
             width = _tlen(label, small) + _parts_width(draw, value, 14)
-            if right - width < x:
+            if right - width < start:
                 break
             placed.append((info, label, value, right - width, right))
             right -= width + 6
         return placed
 
     infos = present_batteries(ctx.batteries)
-    planned = plan(infos)
-    if len(planned) < len(infos):
-        # Never lose a device for the DPI suffix: drop the DPI first.
-        planned = plan([dataclasses.replace(info, dpi=None) for info in infos])
-    battery_left = planned[-1][3] if planned else WIDTH - 10
-
-    if allow_ram:
-        load, _used, _total = ram_reading(m)
-        if load is not None:
-            parts = ((_pct(load), threshold_color("ram", "load", load), "100%"),)
-            width = cell_width("RAM", parts)
-            if x + width <= battery_left - 12:
-                end = draw_cell(x, "RAM", parts)
-                layout.append(("ram", (x, 6, end, value_y + 4)))
-                x = end + 14
+    choice = None
+    attempts = [(cells, size) for cells in ((base + [ram_cell],) if ram_cell else ()) + (base,)
+                for size in STRIP_VALUE_SIZES]
+    for cells, size in attempts:
+        cols, end = columns(cells, size)
+        start = end + rule + pad
+        if end > WIDTH - 4:
+            continue
+        planned = plan(infos, start)
+        if len(planned) < len(infos):
+            # Never lose a device for the DPI suffix: drop the DPI first.
+            planned = plan([dataclasses.replace(info, dpi=None) for info in infos], start)
+        if len(planned) == len(infos):
+            choice = (cols, end, size, planned)
+            break
+    if choice is None:
+        cols, end = columns(base, STRIP_VALUE_SIZES[-1])
+        size = STRIP_VALUE_SIZES[-1]
+        planned = plan([dataclasses.replace(info, dpi=None) for info in infos], end + rule + pad)
+        choice = (cols, end, size, planned)
+    cols, end, size, planned = choice
+    value_font = font(size, True)
+    space = _tlen(" ", value_font)
+    top, bottom = 8, STRIP_HEIGHT - 4 - 8
+    rules = []
+    for index, (label, parts, left, right) in enumerate(cols):
+        middle = (left + right) / 2
+        text(draw, (middle, label_y), label, 12, WHITE, anchor="ms", spacing=1.0)
+        cursor = middle - block_width(parts, size) / 2
+        for i, (value, color, template) in enumerate(parts):
+            if i:
+                cursor += space
+            cursor += _tlen(template, value_font)
+            text(draw, (cursor, value_y), value, size, color, condensed=True, anchor="rs")
+        layout.append((label.lower(), (left, 6, right, value_y + 4)))
+        rx = right + pad
+        if index < len(cols) - 1 or planned:
+            draw.rectangle((round(rx), top, round(rx) + rule - 1, bottom), fill=divider)
+            rules.append((f"divider:{index}", (round(rx), top, round(rx) + rule, bottom)))
+    layout.extend(rules)
 
     for info, label, value, left, item_right in planned:
         label_end = left + text(draw, (left, center_y), label, 14, WHITE, anchor="lm")
