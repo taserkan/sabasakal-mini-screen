@@ -148,9 +148,19 @@ class _WebSocketReader:
     """
 
     def __init__(self, stream: socket.socket) -> None:
-        self.stream = stream
+        # Weak: _READERS is a WeakKeyDictionary keyed by this socket, so a
+        # strong reference here would keep every entry (and its buffers)
+        # alive forever, one per G HUB connection.
+        self._stream_ref = weakref.ref(stream)
         self.buffer = bytearray()
         self.fragments = bytearray()
+
+    @property
+    def stream(self) -> socket.socket:
+        stream = self._stream_ref()
+        if stream is None:
+            raise ConnectionError("G HUB websocket was closed")
+        return stream
 
     def _fill(self) -> None:
         chunk = self.stream.recv(65536)
@@ -239,6 +249,32 @@ def _send_websocket_frame(stream: socket.socket, opcode: int, payload: bytes) ->
         header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, length)
     masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
     stream.sendall(header + mask + masked)
+
+
+def _device_property(properties: object, key: str) -> object:
+    """Read one key without materialising the whole WinRT property map.
+
+    ``dict(device.properties)`` leaks ~3 KB of native memory per device with
+    pywinrt 3.2.1; over a full PnP scan every 2 s that grew the process by
+    ~1 MB/s (tens of GB per day). ``has_key``/``lookup`` does not leak.
+    """
+    if isinstance(properties, dict):
+        return properties.get(key)
+    if properties is None or not properties.has_key(key):
+        return None
+    return properties.lookup(key)
+
+
+def _battery_properties(properties: object) -> dict | None:
+    """Return the BATTERY_PROPERTIES values, or None when there is no battery."""
+    if _device_property(properties, "System.Devices.BatteryLife") is None:
+        return None
+    values = {}
+    for key in BATTERY_PROPERTIES:
+        value = _device_property(properties, key)
+        if value is not None:
+            values[key] = value
+    return values
 
 
 def windows_device_connected(properties: dict) -> bool:
@@ -514,6 +550,9 @@ def probe_lghub_input_batteries(
 
 WINDOWS_SCAN_KEEP_FAILURES = 3
 WINDOWS_SCAN_MAX_BACKOFF = 120.0
+# A full PnP enumeration lists every device node (~500); battery levels change
+# slowly and G HUB devices are updated live, so do not repeat it every 2 s.
+WINDOWS_SCAN_MIN_INTERVAL = 10.0
 # Cache-backed kinds only; see BatteryDeviceMonitor._scan_windows.
 WINDOWS_SCAN_KINDS = (
     DeviceInformationKind.DEVICE_CONTAINER,
@@ -719,7 +758,8 @@ class BatteryDeviceMonitor:
                 self._windows_error = error
             self._refresh.set()
             elapsed = time.monotonic() - started
-            delay = self.interval * (2 ** min(failures, 4)) if failures else self.interval
+            interval = max(WINDOWS_SCAN_MIN_INTERVAL, self.interval)
+            delay = interval * (2 ** min(failures, 4)) if failures else interval
             self._stop.wait(max(0.5, min(WINDOWS_SCAN_MAX_BACKOFF, delay) - elapsed))
 
     def _listen_lghub(self) -> None:
@@ -804,7 +844,9 @@ class BatteryDeviceMonitor:
                 errors.append(exc)
                 continue
             for device in devices:
-                properties = dict(device.properties)
+                properties = _battery_properties(device.properties)
+                if properties is None:
+                    continue
                 raw_percent = properties.get("System.Devices.BatteryLife")
                 try:
                     percent = int(raw_percent)

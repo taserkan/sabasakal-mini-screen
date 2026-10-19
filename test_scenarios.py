@@ -5021,6 +5021,63 @@ class HeadsetPresence115Tests(unittest.TestCase):
         found = asyncio.run(br.BatteryDeviceMonitor._scan_windows(fake_find, ("k",)))
         self.assertEqual([d.name for d in found], ["BtOn", "On"])
 
+    def test_windows_scan_reads_winrt_map_by_key_not_by_dict_copy(self) -> None:
+        # dict(IMapView) leaks native memory in pywinrt 3.2.1 (~1 MB/s at a
+        # 2 s full PnP scan). The scan must only use has_key/lookup.
+        import asyncio
+        import battery_runtime as br
+
+        class MapView:
+            def __init__(self, values):
+                self._values = values
+
+            def has_key(self, key):
+                return key in self._values
+
+            def lookup(self, key):
+                return self._values[key]
+
+            def __iter__(self):
+                raise AssertionError("WinRT property map must not be copied")
+
+        class Dev:
+            def __init__(self, name, props):
+                self.name, self.id, self.is_enabled = name, "id-" + name, True
+                self.properties = MapView(props)
+
+        devices = [
+            Dev("NoBattery", {"System.Devices.Connected": True}),
+            Dev("Mouse", {
+                "System.Devices.BatteryLife": 77,
+                "System.Devices.Connected": True,
+                "System.Devices.BatteryPlusCharging": True,
+            }),
+        ]
+
+        async def fake_find(aqs, props, kind):
+            return devices
+
+        found = asyncio.run(br.BatteryDeviceMonitor._scan_windows(fake_find, ("k",)))
+        self.assertEqual([(d.name, d.percent, d.charging) for d in found], [("Mouse", 77, True)])
+
+    def test_lghub_reader_does_not_keep_closed_sockets_alive(self) -> None:
+        import gc
+        import socket
+        import struct
+        import battery_runtime as br
+
+        for _ in range(5):
+            left, right = socket.socketpair()
+            try:
+                right.sendall(struct.pack("!BB", 0x81, 2) + b"{}")
+                self.assertEqual(br._receive_websocket_message(left), "{}")
+            finally:
+                left.close()
+                right.close()
+            del left, right
+        gc.collect()
+        self.assertEqual(len(br._READERS), 0)
+
 
 class StartupAndQuit115Tests(unittest.TestCase):
     def test_first_watchdog_pass_is_a_normal_start(self) -> None:
