@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Friendly Qt control panel for the 3.5-inch CS2 information screen."""
 
 from __future__ import annotations
@@ -97,12 +97,12 @@ WINDOW_BG, CARD_BG, CARD_2 = "#0D0F13", "#15181E", "#101319"
 EDGE, TEXT, MUTED, ACCENT = "#2B313B", "#F3F5F7", "#9AA4B2", "#79A9F5"
 CONTROL_BG, CONTROL_HOVER, CONTROL_PRESSED = "#20242C", "#2A303A", "#191D24"
 COLOR_IMPACT_COPY = {
-    "cpu": "HalkalarÄ±n normal baÅŸlangÄ±Ã§ rengi",
-    "warning": "YÃ¼k ve sÄ±caklÄ±k yÃ¼kselirken geÃ§iÅŸ",
-    "danger": "Son eÅŸik ve yanÄ±p sÃ¶nme uyarÄ±sÄ±",
-    "bg": "Mini ekranÄ±n ana arka planÄ±",
-    "text": "DonanÄ±m adlarÄ±, deÄŸerler ve ana baÅŸlÄ±klar",
-    "muted": "AÃ§Ä±klamalar ve ikincil bilgi metinleri",
+    "cpu": "Halkaların normal başlangıç rengi",
+    "warning": "Yük ve sıcaklık yükselirken geçiş",
+    "danger": "Son eşik ve yanıp sönme uyarısı",
+    "bg": "Mini ekranın ana arka planı",
+    "text": "Donanım adları, değerler ve ana başlıklar",
+    "muted": "Açıklamalar ve ikincil bilgi metinleri",
 }
 SIMPLE_ACCENT_COLORS = (
     "#F3F5F7", "#A8B2BE", "#79A9F5", "#5F9FE8",
@@ -126,7 +126,7 @@ PALETTES: dict[str, dict[str, str]] = {
         "cpu": "#A98DF2", "gpu": "#F095B4", "ram": "#7BBBEF", "text": "#F6F2FC",
         "muted": "#B7AEC7", "dim": "#7B718E", "track": "#302A41", "warning": "#F0B36F", "danger": "#EF708F",
     },
-    "BakÄ±r": {
+    "Bakır": {
         "bg": "#17120F", "panel": "#241B16", "panel_2": "#1D1612", "edge": "#49362B",
         "cpu": "#D8A15F", "gpu": "#E47552", "ram": "#8CB6AD", "text": "#FAF3EA",
         "muted": "#C0AD9C", "dim": "#806F62", "track": "#3B2B23", "warning": "#E7B65F", "danger": "#E7684D",
@@ -146,7 +146,7 @@ PALETTES: dict[str, dict[str, str]] = {
         "cpu": "#55D6C2", "gpu": "#56A8E8", "ram": "#8AC7FF", "text": "#EFFAFC",
         "muted": "#A1BBC3", "dim": "#617D86", "track": "#19333D", "warning": "#E7BD65", "danger": "#EF6F73",
     },
-    "ZÃ¼mrÃ¼t": {
+    "Zümrüt": {
         "bg": "#08130F", "panel": "#10231A", "panel_2": "#0B1B14", "edge": "#284638",
         "cpu": "#68D391", "gpu": "#B5D66B", "ram": "#66C8B4", "text": "#F1FAF4",
         "muted": "#A6BDAE", "dim": "#697F70", "track": "#1D3528", "warning": "#E4BC63", "danger": "#E66D6D",
@@ -156,7 +156,7 @@ PALETTES: dict[str, dict[str, str]] = {
         "cpu": "#69A7FF", "gpu": "#8C7CF0", "ram": "#5ED3D0", "text": "#F1F5FF",
         "muted": "#A8B5D1", "dim": "#687796", "track": "#1E2B47", "warning": "#F0B96A", "danger": "#EE6F88",
     },
-    "GÃ¼n BatÄ±mÄ±": {
+    "Gün Batımı": {
         "bg": "#1A1012", "panel": "#2A181A", "panel_2": "#201316", "edge": "#503033",
         "cpu": "#F0A36A", "gpu": "#E67B72", "ram": "#C596D9", "text": "#FFF4EE",
         "muted": "#CBB1AA", "dim": "#8D706B", "track": "#402327", "warning": "#F2C15F", "danger": "#EC6262",
@@ -171,7 +171,7 @@ PALETTES: dict[str, dict[str, str]] = {
         "cpu": "#E88AA8", "gpu": "#CB6D92", "ram": "#9E93E7", "text": "#FFF2F7",
         "muted": "#C8AAB5", "dim": "#8A6975", "track": "#3D222C", "warning": "#E7B45E", "danger": "#F05F72",
     },
-    "Kum TaÅŸÄ±": {
+    "Kum Taşı": {
         "bg": "#16130F", "panel": "#262018", "panel_2": "#1D1813", "edge": "#4A4031",
         "cpu": "#D6B878", "gpu": "#C88C62", "ram": "#8CB7A5", "text": "#FAF5E9",
         "muted": "#C1B7A2", "dim": "#827866", "track": "#3A3126", "warning": "#E2B653", "danger": "#D96857",
@@ -181,7 +181,7 @@ PALETTES: dict[str, dict[str, str]] = {
         "cpu": "#7FCB83", "gpu": "#B6C66A", "ram": "#6DB7A0", "text": "#F2F8F3",
         "muted": "#AABAAA", "dim": "#6C7D6D", "track": "#23362A", "warning": "#E0B85F", "danger": "#DC6C65",
     },
-    "Kutup IÅŸÄ±ÄŸÄ±": {
+    "Kutup Işığı": {
         "bg": "#071316", "panel": "#0D2226", "panel_2": "#091A1D", "edge": "#21444A",
         "cpu": "#66E0C1", "gpu": "#A07BEF", "ram": "#63BCEB", "text": "#EFFBFA",
         "muted": "#A1BEBD", "dim": "#617F80", "track": "#18363A", "warning": "#E6C46B", "danger": "#EF728F",
@@ -196,12 +196,12 @@ PALETTES: dict[str, dict[str, str]] = {
         "cpu": "#F08C78", "gpu": "#E8B36A", "ram": "#79BEB1", "text": "#FFF4EF",
         "muted": "#C9B0A8", "dim": "#8A7068", "track": "#3C2924", "warning": "#F2C35E", "danger": "#EF6168",
     },
-    "GÃ¶ktaÅŸÄ±": {
+    "Göktaşı": {
         "bg": "#101214", "panel": "#1A1E22", "panel_2": "#15181B", "edge": "#353B42",
         "cpu": "#A8B2BE", "gpu": "#7FA4C7", "ram": "#9B91B7", "text": "#F4F6F8",
         "muted": "#B0B6BD", "dim": "#747B83", "track": "#292E34", "warning": "#D6B66B", "danger": "#DB6B72",
     },
-    "Neon Åehir": {
+    "Neon Şehir": {
         "bg": "#0C0B15", "panel": "#171327", "panel_2": "#110F1E", "edge": "#352B53",
         "cpu": "#56D6C9", "gpu": "#F06BB1", "ram": "#8F7CF0", "text": "#F8F4FF",
         "muted": "#B8AECE", "dim": "#766B91", "track": "#2A2340", "warning": "#F4C45F", "danger": "#FF5C73",
@@ -209,7 +209,7 @@ PALETTES: dict[str, dict[str, str]] = {
 }
 MSFS_LAYOUTS = {
     "Klasik": "classic",
-    "Kokpit ÅŸeridi": "cockpit",
+    "Kokpit şeridi": "cockpit",
 }
 # Display names are product names and are not translated. Internal keys
 # stay "new"/"classic" so existing settings files keep working.
@@ -257,7 +257,7 @@ WIPE_AREA_FRACTION = 0.45
 # deferred whole to the next cycle, never split.
 DIRTY_CELL = 8
 DIRTY_MERGE_GAP = 4
-# Fields on one text line (e.g. "33% 61Â°" of the CPU cell) are one widget.
+# Fields on one text line (e.g. "33% 61°" of the CPU cell) are one widget.
 DIRTY_MERGE_GAP_X = 40
 # 256 KB/s * 0.25 s / 2 bytes per RGB565 pixel.
 DIRTY_CYCLE_PIXELS = 32_000
@@ -541,8 +541,8 @@ TOP_DIRTY_TILES = tuple(
 )
 _SINGLE_INSTANCE_HANDLE = None
 _RECOVERED_STALE_INSTANCE = False
-APP_DISPLAY_NAME = "Sabasakal Mini Ekran 3,5â€³"
-WINDOW_TITLE = f"{APP_DISPLAY_NAME} Â· Ayarlar"
+APP_DISPLAY_NAME = "Sabasakal Mini Ekran 3,5″"
+WINDOW_TITLE = f"{APP_DISPLAY_NAME} · Ayarlar"
 INSTANCE_HEARTBEAT_INTERVAL_MS = 1000
 INSTANCE_STALE_SECONDS = 30.0
 EXIT_FALLBACK_MS = 5000
@@ -785,7 +785,7 @@ def _activate_existing_window(timeout_seconds: float = 12.0) -> bool:
         window = None
         for candidate in (
             WINDOW_TITLE,
-            f"{translate(APP_DISPLAY_NAME, 'en')} Â· {translate('Ayarlar', 'en')}",
+            f"{translate(APP_DISPLAY_NAME, 'en')} · {translate('Ayarlar', 'en')}",
         ):
             window = user32.FindWindowW(None, candidate)
             if window:
@@ -1101,7 +1101,7 @@ def load_settings() -> dict:
     try:
         saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
         if not isinstance(saved, dict):
-            raise ValueError("Ayar dosyasÄ±nÄ±n kÃ¶kÃ¼ bir nesne olmalÄ±.")
+            raise ValueError("Ayar dosyasının kökü bir nesne olmalı.")
         saved_palettes = saved.get("custom_palettes", {})
         if isinstance(saved_palettes, dict):
             settings["custom_palettes"] = {
@@ -1645,7 +1645,7 @@ class ControlPanel(QWidget):
         return translate(text, self.language, **values)
 
     def _window_title(self) -> str:
-        return f"{self._tr(APP_DISPLAY_NAME)} Â· {self._tr('Ayarlar')}"
+        return f"{self._tr(APP_DISPLAY_NAME)} · {self._tr('Ayarlar')}"
 
     def _rule(self) -> QFrame:
         rule = QFrame()
@@ -1671,7 +1671,7 @@ class ControlPanel(QWidget):
         header_copy.setSpacing(2)
         header_copy.addWidget(self._label(APP_DISPLAY_NAME, "title"))
         header_copy.addWidget(self._label(
-            "Sistem, oyun, medya ve kablosuz cihaz bilgilerini tek yerden yÃ¶netin",
+            "Sistem, oyun, medya ve kablosuz cihaz bilgilerini tek yerden yönetin",
             "subtitle",
         ))
         header.addLayout(header_copy)
@@ -1712,7 +1712,7 @@ class ControlPanel(QWidget):
         quick_layout = QVBoxLayout(self.quick_card)
         quick_layout.setContentsMargins(16, 14, 16, 14)
         quick_layout.setSpacing(9)
-        quick_layout.addWidget(self._label("Ekran ve donanÄ±m", "section"))
+        quick_layout.addWidget(self._label("Ekran ve donanım", "section"))
         quick_columns = QHBoxLayout()
         quick_columns.setSpacing(10)
         quick_layout.addLayout(quick_columns, 1)
@@ -1723,11 +1723,11 @@ class ControlPanel(QWidget):
         screen_form.setSpacing(7)
         screen_form.addWidget(self._label("Ekran", "section"))
         brightness_line = QHBoxLayout()
-        brightness_line.addWidget(self._label("ParlaklÄ±k"))
+        brightness_line.addWidget(self._label("Parlaklık"))
         brightness_line.addStretch()
         self.auto_brightness_check = QCheckBox("Otomatik")
         self.auto_brightness_check.setToolTip(
-            "Saat 07.00â€“19.00 arasÄ±nda %90, diÄŸer saatlerde %30 parlaklÄ±k kullanÄ±r."
+            "Saat 07.00–19.00 arasında %90, diğer saatlerde %30 parlaklık kullanır."
         )
         self.auto_brightness_check.setChecked(bool(self.settings.get("auto_brightness", False)))
         brightness_line.addWidget(self.auto_brightness_check)
@@ -1735,9 +1735,9 @@ class ControlPanel(QWidget):
         self.auto_brightness_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.auto_brightness_info.setFixedSize(16, 16)
         self.auto_brightness_info.setToolTip(
-            "07.00â€“19.00: %90 parlaklÄ±k\n"
-            "19.00â€“07.00: %30 parlaklÄ±k\n"
-            "Otomatik kapalÄ±yken parlaklÄ±ÄŸÄ± sÃ¼rgÃ¼den ayarlayabilirsiniz."
+            "07.00–19.00: %90 parlaklık\n"
+            "19.00–07.00: %30 parlaklık\n"
+            "Otomatik kapalıyken parlaklığı sürgüden ayarlayabilirsiniz."
         )
         self.auto_brightness_info.setStyleSheet(
             "color: #B9C4D2; border: 1px solid #667284; border-radius: 8px; "
@@ -1758,8 +1758,8 @@ class ControlPanel(QWidget):
         # One grid row per selector: label column + combo column. Every row
         # has its own fixed slot, so no control can be drawn over another.
         self.rotation_combo = QComboBox()
-        self.rotation_combo.addItem("0Â°", "normal")
-        self.rotation_combo.addItem("180Â°", "180")
+        self.rotation_combo.addItem("0°", "normal")
+        self.rotation_combo.addItem("180°", "180")
         selected_rotation = "180" if self.settings.get("rotation") == "180" else "normal"
         self.rotation_combo.setCurrentIndex(self.rotation_combo.findData(selected_rotation))
         self.rotation_combo.currentIndexChanged.connect(self._rotation_changed)
@@ -1772,7 +1772,7 @@ class ControlPanel(QWidget):
         )
         self.design_combo.currentIndexChanged.connect(self._design_changed)
         self.design_combo.setToolTip(
-            "Claude: oyuna ve uÃ§uÅŸ evresine gÃ¶re deÄŸiÅŸen sade ekranlar. Codex: Ã¶nceki gÃ¶rÃ¼nÃ¼m."
+            "Claude: oyuna ve uçuş evresine göre değişen sade ekranlar. Codex: önceki görünüm."
         )
         self.edit_controls.append(self.design_combo)
 
@@ -1782,7 +1782,7 @@ class ControlPanel(QWidget):
         current_layout = self.settings.get("msfs_layout", "cockpit")
         self.msfs_layout_combo.setCurrentIndex(self.msfs_layout_combo.findData(current_layout))
         self.msfs_layout_combo.currentIndexChanged.connect(self._msfs_layout_changed)
-        self.msfs_layout_combo.setToolTip("MSFS 2024 alt bÃ¶lÃ¼mÃ¼nde kullanÄ±lacak gÃ¶rÃ¼nÃ¼m.")
+        self.msfs_layout_combo.setToolTip("MSFS 2024 alt bölümünde kullanılacak görünüm.")
         self.edit_controls.append(self.msfs_layout_combo)
 
         selector_grid = QGridLayout()
@@ -1790,8 +1790,8 @@ class ControlPanel(QWidget):
         selector_grid.setVerticalSpacing(5)
         selector_grid.setColumnStretch(1, 1)
         for row, (caption, combo) in enumerate((
-            ("Ekran yÃ¶nÃ¼", self.rotation_combo),
-            ("TasarÄ±m", self.design_combo),
+            ("Ekran yönü", self.rotation_combo),
+            ("Tasarım", self.design_combo),
             ("MSFS", self.msfs_layout_combo),
         )):
             combo.setFixedHeight(34)
@@ -1804,8 +1804,8 @@ class ControlPanel(QWidget):
             selector_grid.addWidget(combo, row, 1)
         screen_form.addLayout(selector_grid)
 
-        self.autostart_check = QCheckBox("Windows aÃ§Ä±ldÄ±ÄŸÄ±nda Ã§alÄ±ÅŸtÄ±r")
-        self.autostart_check.setToolTip("Windows aÃ§Ä±ldÄ±ÄŸÄ±nda uygulamayÄ± ve mini ekranÄ± otomatik baÅŸlatÄ±r.")
+        self.autostart_check = QCheckBox("Windows açıldığında çalıştır")
+        self.autostart_check.setToolTip("Windows açıldığında uygulamayı ve mini ekranı otomatik başlatır.")
         self.autostart_check.setChecked(bool(self.settings["autostart"]))
         screen_form.addWidget(self.autostart_check)
         self.edit_controls.append(self.autostart_check)
@@ -1816,7 +1816,7 @@ class ControlPanel(QWidget):
         hardware_form.setContentsMargins(13, 11, 13, 11)
         hardware_form.setSpacing(6)
         hardware_header = QHBoxLayout()
-        hardware_header.addWidget(self._label("DonanÄ±m adlarÄ±", "section"))
+        hardware_header.addWidget(self._label("Donanım adları", "section"))
         hardware_header.addStretch()
         self.hardware_limit_label = self._label(
             self._tr("En fazla {count} karakter", count=MAX_HARDWARE_LABEL_LENGTH), "device"
@@ -1831,7 +1831,7 @@ class ControlPanel(QWidget):
         hardware_grid.setHorizontalSpacing(8)
         hardware_grid.setVerticalSpacing(5)
         for row, (key, caption) in enumerate((
-            ("cpu", "Ä°ÅŸlemci"), ("gpu", "Ekran kartÄ±"), ("ram", "Bellek"),
+            ("cpu", "İşlemci"), ("gpu", "Ekran kartı"), ("ram", "Bellek"),
         )):
             hardware_grid.addWidget(self._label(caption, "device"), row, 0)
             field = QLineEdit()
@@ -1862,9 +1862,9 @@ class ControlPanel(QWidget):
             city_input.setText(saved_cities[index])
             city_input.setProperty("city_index", index + 1)
             city_input.setPlaceholderText(
-                self._tr("{index}. ÅŸehir", index=index + 1)
+                self._tr("{index}. şehir", index=index + 1)
             )
-            city_input.setToolTip("Hava durumu gÃ¶sterilecek ÅŸehir.")
+            city_input.setToolTip("Hava durumu gösterilecek şehir.")
             city_input.textChanged.connect(self._refresh_preview)
             city_input.editingFinished.connect(
                 lambda field=city_input: self._normalise_city_field(field)
@@ -1883,7 +1883,7 @@ class ControlPanel(QWidget):
         preview_layout = QVBoxLayout(preview_card)
         preview_layout.setContentsMargins(16, 14, 16, 12)
         preview_layout.setSpacing(9)
-        preview_layout.addWidget(self._label("3,5 inÃ§ ekran Ã¶nizlemesi", "section"))
+        preview_layout.addWidget(self._label("3,5 inç ekran önizlemesi", "section"))
         preview_body = QHBoxLayout()
         preview_body.setSpacing(10)
         preview_layout.addLayout(preview_body)
@@ -1893,9 +1893,9 @@ class ControlPanel(QWidget):
         preview_modes = QVBoxLayout()
         preview_modes.setSpacing(5)
         for mode, caption in (
-            ("daily", "GÃ¼nlÃ¼k"), ("cs2_ct", "CS2 Â· CT"),
-            ("cs2_t", "CS2 Â· T"),
-            ("deathmatch", "Ã–lÃ¼m maÃ§Ä±"),
+            ("daily", "Günlük"), ("cs2_ct", "CS2 · CT"),
+            ("cs2_t", "CS2 · T"),
+            ("deathmatch", "Ölüm maçı"),
             ("msfs", "MSFS"), ("weather", "Hava"),
             ("wireless", "Kablosuz"),
         ):
@@ -1923,7 +1923,7 @@ class ControlPanel(QWidget):
         shell_layout.addWidget(self.preview_label)
         preview_body.addWidget(preview_shell)
         preview_body.addStretch()
-        self.preview_context_label = self._label("GÃ¼nlÃ¼k kullanÄ±m Â· medya gÃ¶rÃ¼nÃ¼mÃ¼", "device")
+        self.preview_context_label = self._label("Günlük kullanım · medya görünümü", "device")
         preview_layout.addWidget(self.preview_context_label)
         left_layout.addWidget(preview_card)
         left_layout.addStretch()
@@ -1934,28 +1934,28 @@ class ControlPanel(QWidget):
         settings_layout.setContentsMargins(18, 16, 18, 16)
         settings_layout.setSpacing(10)
         settings_layout.addWidget(self._label("Renkler", "section"))
-        settings_layout.addWidget(self._label("HazÄ±r palet"))
+        settings_layout.addWidget(self._label("Hazır palet"))
         self.palette_combo = QComboBox()
         for name in PALETTES:
             self.palette_combo.addItem(self._tr(name), name)
         for name in sorted(self.settings.get("custom_palettes", {})):
             self.palette_combo.addItem(name, name)
         if self.settings["palette"] not in PALETTES and self.settings["palette"] not in self.settings.get("custom_palettes", {}):
-            self.palette_combo.addItem(self._tr("Ã–zel"), "Ã–zel")
+            self.palette_combo.addItem(self._tr("Özel"), "Özel")
         self.palette_combo.setCurrentIndex(self.palette_combo.findData(self.settings["palette"]))
         self.palette_combo.currentIndexChanged.connect(self._palette_changed)
         settings_layout.addWidget(self.palette_combo)
         self.edit_controls.append(self.palette_combo)
-        settings_layout.addWidget(self._label("DeÄŸiÅŸtirmek istediÄŸiniz alanÄ± seÃ§in", "device"))
+        settings_layout.addWidget(self._label("Değiştirmek istediğiniz alanı seçin", "device"))
 
         color_editor = QHBoxLayout()
         color_editor.setSpacing(10)
         swatch_column = QVBoxLayout()
         swatch_column.setSpacing(8)
         for key, caption in (
-            ("cpu", "Normal"), ("warning", "UyarÄ±"),
+            ("cpu", "Normal"), ("warning", "Uyarı"),
             ("danger", "Kritik"), ("bg", "Zemin"),
-            ("text", "Ana yazÄ±"), ("muted", "Ä°kincil yazÄ±"),
+            ("text", "Ana yazı"), ("muted", "İkincil yazı"),
         ):
             button = QPushButton(caption)
             button.setFixedSize(126, 40)
@@ -1974,12 +1974,12 @@ class ControlPanel(QWidget):
         chooser_layout.setSpacing(8)
         chooser_header = QHBoxLayout()
         chooser_header.setSpacing(8)
-        self.inline_color_title = self._label("Renk seÃ§in", "section")
+        self.inline_color_title = self._label("Renk seçin", "section")
         chooser_header.addWidget(self.inline_color_title)
         chooser_header.addStretch()
         self.selected_color_chip = QLabel()
         self.selected_color_chip.setFixedSize(34, 24)
-        self.selected_color_chip.setToolTip("SeÃ§ili renk")
+        self.selected_color_chip.setToolTip("Seçili renk")
         chooser_header.addWidget(self.selected_color_chip)
         chooser_layout.addLayout(chooser_header)
         color_grid = QGridLayout()
@@ -2000,17 +2000,17 @@ class ControlPanel(QWidget):
         color_editor.addWidget(self.inline_color_panel)
         color_editor.addStretch()
         settings_layout.addLayout(color_editor)
-        self.color_help_label = self._label("Halka, zemin ve yazÄ± renklerinden birini seÃ§in.", "device")
+        self.color_help_label = self._label("Halka, zemin ve yazı renklerinden birini seçin.", "device")
         self.color_help_label.setWordWrap(True)
         settings_layout.addWidget(self.color_help_label)
         self._paint_swatches()
 
         palette_actions = QHBoxLayout()
         self.save_palette_button = QPushButton("Paleti kaydet")
-        self.save_palette_button.setToolTip("GeÃ§erli renkleri yeni bir palet olarak kaydeder.")
+        self.save_palette_button.setToolTip("Geçerli renkleri yeni bir palet olarak kaydeder.")
         self.save_palette_button.clicked.connect(self._save_palette)
         self.delete_palette_button = QPushButton("Sil")
-        self.delete_palette_button.setToolTip("SeÃ§ili Ã¶zel renk paletini siler.")
+        self.delete_palette_button.setToolTip("Seçili özel renk paletini siler.")
         self.delete_palette_button.clicked.connect(self._delete_palette)
         self.edit_controls.extend((self.save_palette_button, self.delete_palette_button))
         palette_actions.addWidget(self.save_palette_button, 1)
@@ -2020,22 +2020,22 @@ class ControlPanel(QWidget):
         self._update_palette_buttons()
         settings_layout.addWidget(self._rule())
         action_line = QHBoxLayout()
-        self.start_button = QPushButton("Kaydet ve baÅŸlat", objectName="accent")
-        self.start_button.setToolTip("AyarlarÄ± kaydeder ve mini ekrana gÃ¶rÃ¼ntÃ¼ gÃ¶ndermeye baÅŸlar.")
+        self.start_button = QPushButton("Kaydet ve başlat", objectName="accent")
+        self.start_button.setToolTip("Ayarları kaydeder ve mini ekrana görüntü göndermeye başlar.")
         self.start_button.clicked.connect(self.start_screen)
         self.edit_controls.append(self.start_button)
         self.stop_button = QPushButton("Durdur")
-        self.stop_button.setToolTip("Veri akÄ±ÅŸÄ±nÄ± durdurur ve mini ekranÄ± temizler.")
+        self.stop_button.setToolTip("Veri akışını durdurur ve mini ekranı temizler.")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_screen)
         action_line.addWidget(self.start_button, 1)
         action_line.addWidget(self.stop_button)
         settings_layout.addLayout(action_line)
         secondary_actions = QHBoxLayout()
-        self.save_button = QPushButton("YalnÄ±zca kaydet")
+        self.save_button = QPushButton("Yalnızca kaydet")
         self.save_button.clicked.connect(self.save_settings)
-        self.reset_button = QPushButton("VarsayÄ±lana dÃ¶n")
-        self.reset_button.setToolTip("Renkleri ve gÃ¶rÃ¼nÃ¼m ayarlarÄ±nÄ± baÅŸlangÄ±Ã§ deÄŸerlerine getirir.")
+        self.reset_button = QPushButton("Varsayılana dön")
+        self.reset_button.setToolTip("Renkleri ve görünüm ayarlarını başlangıç değerlerine getirir.")
         self.reset_button.clicked.connect(self._reset_defaults)
         secondary_actions.addWidget(self.save_button, 1)
         secondary_actions.addWidget(self.reset_button, 1)
@@ -2048,9 +2048,9 @@ class ControlPanel(QWidget):
         status_bar.setMaximumWidth(1126)
         status_layout = QHBoxLayout(status_bar)
         status_layout.setContentsMargins(14, 9, 14, 9)
-        self.status_dot = QLabel("â—")
+        self.status_dot = QLabel("●")
         self.status_dot.setStyleSheet("color: #6F7C90; background: transparent;")
-        self.status_label = self._label("Ekran hazÄ±r", "status")
+        self.status_label = self._label("Ekran hazır", "status")
         status_layout.addWidget(self.status_dot)
         status_layout.addWidget(self.status_label)
         status_layout.addStretch()
@@ -2061,7 +2061,7 @@ class ControlPanel(QWidget):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
 
     # Labels whose text is rewritten at runtime. Restoring their construction
-    # text on a language change would show stale values (e.g. "Ekran hazÄ±r"
+    # text on a language change would show stale values (e.g. "Ekran hazır"
     # while the screen is running, or an old brightness percentage).
     DYNAMIC_LABEL_ATTRIBUTES = ("status_label", "brightness_value")
 
@@ -2117,15 +2117,15 @@ class ControlPanel(QWidget):
         ))
         for field in self.weather_city_inputs:
             field.setPlaceholderText(self._tr(
-                "{index}. ÅŸehir", index=int(field.property("city_index") or 1),
+                "{index}. şehir", index=int(field.property("city_index") or 1),
             ))
         self._retranslate_combo_items()
         if self.tray_icon is not None:
             self.tray_icon.setToolTip(self._tr(APP_DISPLAY_NAME))
-            self.tray_open_action.setText(self._tr("Sabasakal Mini Ekran'Ä± aÃ§"))
-            self.tray_start_action.setText(self._tr("Mini ekranÄ± baÅŸlat"))
-            self.tray_stop_action.setText(self._tr("Mini ekranÄ± durdur"))
-            self.tray_exit_action.setText(self._tr("Ã‡Ä±kÄ±ÅŸ"))
+            self.tray_open_action.setText(self._tr("Sabasakal Mini Ekran'ı aç"))
+            self.tray_start_action.setText(self._tr("Mini ekranı başlat"))
+            self.tray_stop_action.setText(self._tr("Mini ekranı durdur"))
+            self.tray_exit_action.setText(self._tr("Çıkış"))
         if getattr(self, "_active_color_key", None) in self.swatches:
             self._choose_color(self._active_color_key)
         if refresh_preview:
@@ -2152,13 +2152,13 @@ class ControlPanel(QWidget):
         self.tray_icon = QSystemTrayIcon(icon, self)
         self.tray_icon.setToolTip(self._tr(APP_DISPLAY_NAME))
         menu = QMenu(self)
-        self.tray_open_action = QAction(self._tr("Sabasakal Mini Ekran'Ä± aÃ§"), self)
+        self.tray_open_action = QAction(self._tr("Sabasakal Mini Ekran'ı aç"), self)
         self.tray_open_action.triggered.connect(self._show_from_tray)
         menu.addAction(self.tray_open_action)
         menu.addSeparator()
-        self.tray_start_action = QAction(self._tr("Mini ekranÄ± baÅŸlat"), self)
+        self.tray_start_action = QAction(self._tr("Mini ekranı başlat"), self)
         self.tray_start_action.triggered.connect(self.start_screen)
-        self.tray_stop_action = QAction(self._tr("Mini ekranÄ± durdur"), self)
+        self.tray_stop_action = QAction(self._tr("Mini ekranı durdur"), self)
         worker_running = bool(self.worker and self.worker.is_alive())
         self.tray_start_action.setEnabled(not worker_running)
         self.tray_stop_action.setEnabled(worker_running)
@@ -2166,7 +2166,7 @@ class ControlPanel(QWidget):
         menu.addAction(self.tray_start_action)
         menu.addAction(self.tray_stop_action)
         menu.addSeparator()
-        self.tray_exit_action = QAction(self._tr("Ã‡Ä±kÄ±ÅŸ"), self)
+        self.tray_exit_action = QAction(self._tr("Çıkış"), self)
         self.tray_exit_action.triggered.connect(self._exit_application)
         menu.addAction(self.tray_exit_action)
         self.tray_icon.setContextMenu(menu)
@@ -2349,21 +2349,21 @@ class ControlPanel(QWidget):
             index += 1
             suggested = f"{self._tr('Paletim')} {index}"
         name, accepted = QInputDialog.getText(
-            self, self._tr("Renk paletini kaydet"), self._tr("Palet adÄ±:"), text=suggested,
+            self, self._tr("Renk paletini kaydet"), self._tr("Palet adı:"), text=suggested,
         )
         name = name.strip()
         if not accepted or not name:
             return
         if name in PALETTES:
             QMessageBox.warning(
-                self, self._tr("Bu ad kullanÄ±lamaz"),
-                self._tr("HazÄ±r palet adlarÄ± deÄŸiÅŸtirilemez."),
+                self, self._tr("Bu ad kullanılamaz"),
+                self._tr("Hazır palet adları değiştirilemez."),
             )
             return
         if name in custom:
             answer = QMessageBox.question(
-                self, self._tr("Paletin Ã¼zerine yazÄ±lsÄ±n mÄ±?"),
-                self._tr("{name} adlÄ± palet zaten var.", name=name),
+                self, self._tr("Paletin üzerine yazılsın mı?"),
+                self._tr("{name} adlı palet zaten var.", name=name),
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
@@ -2379,7 +2379,7 @@ class ControlPanel(QWidget):
             return
         answer = QMessageBox.question(
             self, self._tr("Palet silinsin mi?"),
-            self._tr("{name} adlÄ± palet silinecek.", name=name),
+            self._tr("{name} adlı palet silinecek.", name=name),
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -2399,7 +2399,7 @@ class ControlPanel(QWidget):
         for name in sorted(self.settings.get("custom_palettes", {})):
             self.palette_combo.addItem(name, name)
         if selected not in PALETTES and selected not in self.settings.get("custom_palettes", {}):
-            self.palette_combo.addItem(self._tr("Ã–zel"), "Ã–zel")
+            self.palette_combo.addItem(self._tr("Özel"), "Özel")
         self.palette_combo.setCurrentIndex(self.palette_combo.findData(selected))
         self.palette_combo.blockSignals(False)
         self._update_palette_buttons()
@@ -2421,7 +2421,7 @@ class ControlPanel(QWidget):
         self._paint_swatches()
         self._refresh_preview()
         self.save_settings(quiet=True)
-        self._set_status(self._tr("VarsayÄ±lan ayarlara dÃ¶nÃ¼ldÃ¼"), ACCENT)
+        self._set_status(self._tr("Varsayılan ayarlara dönüldü"), ACCENT)
 
     def _paint_swatches(self) -> None:
         for key, button in self.swatches.items():
@@ -2461,8 +2461,8 @@ class ControlPanel(QWidget):
             return
         self._active_color_key = key
         captions = {
-            "cpu": "Normal", "warning": "UyarÄ±", "danger": "Kritik", "bg": "Zemin",
-            "text": "Ana yazÄ±", "muted": "Ä°kincil yazÄ±",
+            "cpu": "Normal", "warning": "Uyarı", "danger": "Kritik", "bg": "Zemin",
+            "text": "Ana yazı", "muted": "İkincil yazı",
         }
         self.inline_color_title.setText(
             self._tr("{name} rengi", name=self._tr(captions[key]))
@@ -2489,7 +2489,7 @@ class ControlPanel(QWidget):
             width = 3 if is_selected else 1
             red, green, blue = QColor(color).red(), QColor(color).green(), QColor(color).blue()
             check_color = "#101319" if (red * 299 + green * 587 + blue * 114) > 150000 else "#FFFFFF"
-            button.setText("âœ“" if is_selected else "")
+            button.setText("✓" if is_selected else "")
             button.setToolTip(color)
             button.setStyleSheet(
                 f"background: {color}; border: {width}px solid {border}; "
@@ -2501,7 +2501,7 @@ class ControlPanel(QWidget):
                 "border-radius: 6px;"
             )
             self.selected_color_chip.setToolTip(
-                self._tr("SeÃ§ili renk: {colour}", colour=self.settings['colors'][key].upper())
+                self._tr("Seçili renk: {colour}", colour=self.settings['colors'][key].upper())
             )
 
     def _apply_simple_color(self, option_index: int) -> None:
@@ -2511,10 +2511,10 @@ class ControlPanel(QWidget):
             return
         self.settings["colors"][key] = options[option_index]
         if self._selected_palette_name() not in self.settings.get("custom_palettes", {}):
-            if self.palette_combo.findData("Ã–zel") < 0:
-                self.palette_combo.addItem(self._tr("Ã–zel"), "Ã–zel")
+            if self.palette_combo.findData("Özel") < 0:
+                self.palette_combo.addItem(self._tr("Özel"), "Özel")
             self.palette_combo.blockSignals(True)
-            self.palette_combo.setCurrentIndex(self.palette_combo.findData("Ã–zel"))
+            self.palette_combo.setCurrentIndex(self.palette_combo.findData("Özel"))
             self.palette_combo.blockSignals(False)
         self._paint_swatches()
         self._refresh_preview()
@@ -2536,30 +2536,30 @@ class ControlPanel(QWidget):
             })
             metrics = self._preview_metrics()
             context_labels = {
-                "daily": "GÃ¼nlÃ¼k kullanÄ±m Â· medya gÃ¶rÃ¼nÃ¼mÃ¼",
-                "cs2_ct": "CS2 Â· CT ekonomi gÃ¶rÃ¼nÃ¼mÃ¼",
-                "cs2_t": "CS2 Â· T ekonomi gÃ¶rÃ¼nÃ¼mÃ¼",
-                "deathmatch": "CS2 Â· Ã¶lÃ¼m maÃ§Ä± Ã¶ldÃ¼rme ve kafa vuruÅŸu gÃ¶rÃ¼nÃ¼mÃ¼",
-                "msfs": "MSFS 2024 Â· canlÄ± uÃ§uÅŸ bilgileri",
-                "weather": "BoÅŸta kullanÄ±m Â· seÃ§ili ÅŸehirlerin hava durumu",
-                "wireless": "Kablosuz cihazlar Â· pil durumlarÄ±",
+                "daily": "Günlük kullanım · medya görünümü",
+                "cs2_ct": "CS2 · CT ekonomi görünümü",
+                "cs2_t": "CS2 · T ekonomi görünümü",
+                "deathmatch": "CS2 · ölüm maçı öldürme ve kafa vuruşu görünümü",
+                "msfs": "MSFS 2024 · canlı uçuş bilgileri",
+                "weather": "Boşta kullanım · seçili şehirlerin hava durumu",
+                "wireless": "Kablosuz cihazlar · pil durumları",
             }
             if str(self.design_combo.currentData() or "new") == "new":
                 new_labels = {
-                    "daily": "Yeni tasarÄ±m Â· masaÃ¼stÃ¼", "weather": "Yeni tasarÄ±m Â· masaÃ¼stÃ¼",
-                    "wireless": "Yeni tasarÄ±m Â· masaÃ¼stÃ¼",
-                    "cs2_ct": "Yeni tasarÄ±m Â· CS2 satÄ±n alma",
-                    "cs2_t": "Yeni tasarÄ±m Â· CS2 round sonu",
-                    "deathmatch": "Yeni tasarÄ±m Â· FACEIT (sadece sistem)",
-                    "msfs": "Yeni tasarÄ±m Â· MSFS seyir",
+                    "daily": "Yeni tasarım · masaüstü", "weather": "Yeni tasarım · masaüstü",
+                    "wireless": "Yeni tasarım · masaüstü",
+                    "cs2_ct": "Yeni tasarım · CS2 satın alma",
+                    "cs2_t": "Yeni tasarım · CS2 round sonu",
+                    "deathmatch": "Yeni tasarım · FACEIT (sadece sistem)",
+                    "msfs": "Yeni tasarım · MSFS seyir",
                 }
                 self.preview_context_label.setText(
-                    self._tr(new_labels.get(self.preview_mode, "Ekran Ã¶nizlemesi"))
+                    self._tr(new_labels.get(self.preview_mode, "Ekran önizlemesi"))
                 )
                 self._show_preview(pil_to_qimage(self._new_design_preview(metrics, labels)))
                 return
             self.preview_context_label.setText(
-                self._tr(context_labels.get(self.preview_mode, "Ekran Ã¶nizlemesi"))
+                self._tr(context_labels.get(self.preview_mode, "Ekran önizlemesi"))
             )
             if self.preview_mode == "msfs":
                 frame = render_screen(
@@ -2628,8 +2628,8 @@ class ControlPanel(QWidget):
                     metrics, GameSnapshot(), False, self.settings["colors"],
                     hardware_labels=labels,
                     media_snapshot=MediaSnapshot(
-                        platform="Spotify", title=self._tr("Åu an Ã§alÄ±yor"),
-                        artist=self._tr("MÃ¼zik ve ritim gÃ¶rÃ¼nÃ¼mÃ¼"), status="playing",
+                        platform="Spotify", title=self._tr("Şu an çalıyor"),
+                        artist=self._tr("Müzik ve ritim görünümü"), status="playing",
                     ),
                     audio_spectrum=AudioSpectrumSnapshot(
                         bars=(0.18, 0.34, 0.56, 0.82, 0.64, 0.42, 0.73, 0.91,
@@ -2641,7 +2641,7 @@ class ControlPanel(QWidget):
             self._show_preview(pil_to_qimage(frame))
         except Exception as exc:
             self._set_status(
-                self._tr("Ã–nizleme hazÄ±rlanamadÄ±: {error}", error=exc), "#E87878"
+                self._tr("Önizleme hazırlanamadı: {error}", error=exc), "#E87878"
             )
 
     def _new_design_preview(self, metrics: dict, labels: dict):
@@ -2695,16 +2695,16 @@ class ControlPanel(QWidget):
         except Exception as exc:
             if not quiet:
                 QMessageBox.warning(
-                    self, self._tr("CS2 baÄŸlantÄ±sÄ± kurulamadÄ±"),
+                    self, self._tr("CS2 bağlantısı kurulamadı"),
                     self._tr(
-                        "{error}\n\nUygulamayÄ± yÃ¶netici olarak aÃ§Ä±p yeniden deneyin.", error=exc,
+                        "{error}\n\nUygulamayı yönetici olarak açıp yeniden deneyin.", error=exc,
                     ),
                 )
             return False
         if not quiet:
-            message = self._tr("CS2 baÄŸlantÄ±sÄ± kuruldu.")
+            message = self._tr("CS2 bağlantısı kuruldu.")
             if cs2_is_running():
-                message += self._tr(" Verilerin gelmesi iÃ§in CS2'yi bir kez yeniden baÅŸlatÄ±n.")
+                message += self._tr(" Verilerin gelmesi için CS2'yi bir kez yeniden başlatın.")
             self._set_status(message, ACCENT)
         return True
 
@@ -2752,7 +2752,7 @@ class ControlPanel(QWidget):
         # Allow a retry with the same value on the next save.
         self._applied_autostart = None
         self._set_status(
-            self._tr("Otomatik baÅŸlatma ayarlanamadÄ± Â· {error}", error=error), "#E3B866",
+            self._tr("Otomatik başlatma ayarlanamadı · {error}", error=error), "#E3B866",
         )
 
     def save_settings(self, _checked: bool = False, quiet: bool = False) -> bool:
@@ -2763,7 +2763,7 @@ class ControlPanel(QWidget):
             if quiet:
                 self._set_status(
                     self._tr(
-                        "Ayarlar kaydedilemedi; ekran yine de baÅŸlatÄ±lÄ±yor Â· {error}", error=exc,
+                        "Ayarlar kaydedilemedi; ekran yine de başlatılıyor · {error}", error=exc,
                     ),
                     "#E3B866",
                 )
@@ -2773,7 +2773,7 @@ class ControlPanel(QWidget):
         self._apply_autostart_async(bool(self.settings["autostart"]))
         if not quiet:
             self._set_status(
-                self._tr("Ayarlar kaydedildi ve Ã§alÄ±ÅŸan ekrana uygulanacak"), ACCENT
+                self._tr("Ayarlar kaydedildi ve çalışan ekrana uygulanacak"), ACCENT
             )
         return True
 
@@ -2785,7 +2785,7 @@ class ControlPanel(QWidget):
         _runtime_log("start_screen requested")
         if self.worker and self.worker.is_alive():
             _runtime_log("start_screen ignored; worker already alive")
-            self._set_status(self._tr("Ekran zaten Ã§alÄ±ÅŸÄ±yor"), ACCENT)
+            self._set_status(self._tr("Ekran zaten çalışıyor"), ACCENT)
             return
         try:
             if persist:
@@ -2805,7 +2805,7 @@ class ControlPanel(QWidget):
                 self.tray_stop_action.setEnabled(True)
             self._set_editing_enabled(False)
             self._set_status(
-                self._tr("Ekran baÅŸlatÄ±lÄ±yor Â· ayarlarÄ± deÄŸiÅŸtirmek iÃ§in Durdur"),
+                self._tr("Ekran başlatılıyor · ayarları değiştirmek için Durdur"),
                 "#E3B866",
             )
             _runtime_log("screen worker started")
@@ -2815,7 +2815,7 @@ class ControlPanel(QWidget):
                 self.tray_start_action.setEnabled(True)
                 self.tray_stop_action.setEnabled(False)
             self._set_status(
-                self._tr("Ekran baÅŸlatÄ±lamadÄ± Â· {error}", error=exc), "#E87878"
+                self._tr("Ekran başlatılamadı · {error}", error=exc), "#E87878"
             )
 
     def _restart_worker(self) -> None:
@@ -2827,7 +2827,7 @@ class ControlPanel(QWidget):
     def stop_screen(self) -> None:
         if self.worker and self.worker.is_alive():
             self.stop_event.set()
-            self._set_status(self._tr("Ekran durduruluyorâ€¦"), "#E3B866")
+            self._set_status(self._tr("Ekran durduruluyor…"), "#E3B866")
         else:
             self._screen_stopped()
 
@@ -2954,7 +2954,7 @@ class ControlPanel(QWidget):
                         "(cfg newer than cs2.exe or token rejected); restart CS2 to enable game data"
                     )
                     self.signals.status.emit(translate(
-                        "CS2'yi yeniden baÅŸlatÄ±n: oyun verisi iÃ§in yeni GSI ayarÄ± yÃ¼klenmeli",
+                        "CS2'yi yeniden başlatın: oyun verisi için yeni GSI ayarı yüklenmeli",
                         self.settings.get("language", "tr"),
                     ))
                 gsi_restart_state["needed"] = needed
@@ -3019,14 +3019,14 @@ class ControlPanel(QWidget):
                         last_fast_gauge_refresh = 0.0
                         sent_frame = None
                         self.signals.status.emit(translate(
-                            "Mini ekran baÄŸlandÄ± Â· gÃ¶rÃ¼ntÃ¼ yenileniyor",
+                            "Mini ekran bağlandı · görüntü yenileniyor",
                             current.get("language", "tr"),
                         ))
                     except Exception as exc:
                         self.screen_connected.clear()
                         _runtime_log(f"display connect failed: {type(exc).__name__}: {exc}")
                         self.signals.status.emit(translate(
-                            "Mini ekran bekleniyor Â· {error}",
+                            "Mini ekran bekleniyor · {error}",
                             current.get("language", "tr"), error=exc,
                         ))
                         self.stop_event.wait(2.0)
@@ -3107,7 +3107,7 @@ class ControlPanel(QWidget):
                             ping_summary = ", ".join(
                                 f"{item.name}:{int(round(item.latency_ms))}ms"
                                 for item in matchmaking_pings
-                            ) or "hazÄ±rlanÄ±yor"
+                            ) or "hazırlanıyor"
                             _runtime_log(
                                 "matchmaking pings updated; "
                                 f"source={matchmaking_source}; values={ping_summary}"
@@ -3554,7 +3554,7 @@ class ControlPanel(QWidget):
                     self.screen_connected.clear()
                     _runtime_log(f"display refresh failed: {type(exc).__name__}: {exc}")
                     self.signals.status.emit(translate(
-                        "BaÄŸlantÄ± yenileniyor Â· {error}",
+                        "Bağlantı yenileniyor · {error}",
                         current.get("language", "tr"), error=exc,
                     ))
                     try:
@@ -3587,31 +3587,31 @@ class ControlPanel(QWidget):
                     last_preview_refresh = now
                 if snapshot.in_match:
                     if "deathmatch" in snapshot.game_mode.lower():
-                        status_message = "Ã–lÃ¼m maÃ§Ä± Â· Ã¶ldÃ¼rme ve HS verisi canlÄ±"
+                        status_message = "Ölüm maçı · öldürme ve HS verisi canlı"
                     elif snapshot.next_win_money is not None:
-                        status_message = "CS2 aÃ§Ä±k Â· ekonomi verisi canlÄ±"
+                        status_message = "CS2 açık · ekonomi verisi canlı"
                     else:
-                        status_message = "CS2 maÃ§Ä± aÃ§Ä±k Â· canlÄ± veriler izleniyor"
+                        status_message = "CS2 maçı açık · canlı veriler izleniyor"
                 elif faceit_active:
-                    status_message = "FACEIT AC aÃ§Ä±k Â· FACEIT pingleri yenileniyor"
+                    status_message = "FACEIT AC açık · FACEIT pingleri yenileniyor"
                 elif game_active:
-                    status_message = "CS2 aÃ§Ä±k Â· eÅŸleÅŸtirme pingleri yenileniyor"
+                    status_message = "CS2 açık · eşleştirme pingleri yenileniyor"
                 elif msfs_active:
                     status_message = (
-                        "MSFS 2024 aÃ§Ä±k Â· uÃ§uÅŸ verileri canlÄ±"
+                        "MSFS 2024 açık · uçuş verileri canlı"
                         if flight_telemetry.updated_at
-                        else "MSFS 2024 aÃ§Ä±k Â· kokpit baÄŸlantÄ±sÄ± bekleniyor"
+                        else "MSFS 2024 açık · kokpit bağlantısı bekleniyor"
                     )
                 elif media_mode:
                     label = media_snapshot.platform or translate(
                         "Sistem sesi", current.get("language", "tr"),
                     )
-                    status_message = "{label} Â· ritim gÃ¶rselleÅŸtiriliyor"
+                    status_message = "{label} · ritim görselleştiriliyor"
                 else:
                     status_message = (
-                        "Ekran Ã§alÄ±ÅŸÄ±yor Â· hava durumu gÃ¼ncel"
+                        "Ekran çalışıyor · hava durumu güncel"
                         if weather_snapshot.readings
-                        else "Ekran Ã§alÄ±ÅŸÄ±yor"
+                        else "Ekran çalışıyor"
                     )
                 translated_status = translate(
                     status_message, current.get("language", "tr"),
@@ -3671,11 +3671,11 @@ class ControlPanel(QWidget):
             self.signals.stopped.emit()
 
     def _worker_status(self, message: str) -> None:
-        self._set_status(f"{message} Â· {self._tr('ayarlar kilitli')}", ACCENT)
+        self._set_status(f"{message} · {self._tr('ayarlar kilitli')}", ACCENT)
 
     def _worker_error(self, message: str) -> None:
         self._set_status(
-            self._tr("BaÄŸlantÄ± kurulamadÄ±: {error}", error=message), "#E87878"
+            self._tr("Bağlantı kurulamadı: {error}", error=message), "#E87878"
         )
 
     def _screen_stopped(self) -> None:
@@ -3686,7 +3686,7 @@ class ControlPanel(QWidget):
             self.tray_stop_action.setEnabled(False)
         self._set_editing_enabled(True)
         connection_prefixes = (
-            "BaÄŸlantÄ±", "Connection", "Mini ekran bekleniyor",
+            "Bağlantı", "Connection", "Mini ekran bekleniyor",
             "Refreshing connection", "Waiting for mini display",
         )
         if not self.status_label.text().startswith(connection_prefixes):
@@ -3746,7 +3746,7 @@ class ControlPanel(QWidget):
             if not self._tray_notice_shown:
                 self.tray_icon.showMessage(
                     self._tr(APP_DISPLAY_NAME),
-                    self._tr("Uygulama sistem tepsisinde Ã§alÄ±ÅŸmaya devam ediyor."),
+                    self._tr("Uygulama sistem tepsisinde çalışmaya devam ediyor."),
                     QSystemTrayIcon.MessageIcon.Information,
                     2500,
                 )
@@ -3855,7 +3855,7 @@ def main() -> int:
                 panel.tray_icon.showMessage(
                     panel._tr(APP_DISPLAY_NAME),
                     panel._tr(
-                        "Mini ekran baÄŸlantÄ±sÄ± bekleniyor. AyrÄ±ntÄ±lar iÃ§in simgeye tÄ±klayÄ±n."
+                        "Mini ekran bağlantısı bekleniyor. Ayrıntılar için simgeye tıklayın."
                     ),
                     QSystemTrayIcon.MessageIcon.Warning,
                     4000,
