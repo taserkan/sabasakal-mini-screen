@@ -62,7 +62,7 @@ from i18n import SUPPORTED_LANGUAGES, normalize_language, translate
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.1.11"
+APP_VERSION = "1.1.12"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -677,6 +677,11 @@ def ensure_sensor_host(restart: bool = False) -> bool:
     environment["DOTNET_BUNDLE_EXTRACT_BASE_DIR"] = str(
         APP_DATA / "sensor-host-runtime"
     )
+    # .NET sizes the gen0 budget from the L3 cache (96 MB on X3D CPUs), so the
+    # host ran ~30 min without a single collection and grew to ~60 MB. A 4 MB
+    # budget (hex value) keeps it near its few-MB live set; each gen0
+    # collection of such a small heap takes well under a millisecond.
+    environment["DOTNET_GCgen0size"] = "400000"
     try:
         APP_DATA.mkdir(parents=True, exist_ok=True)
         _SENSOR_HOST_PROCESS = subprocess.Popen(

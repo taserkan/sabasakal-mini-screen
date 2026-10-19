@@ -1665,6 +1665,9 @@ class UiAndConnectionScenarios(unittest.TestCase):
                     popen.call_args.kwargs["env"]["DOTNET_BUNDLE_EXTRACT_BASE_DIR"],
                     str(root / "sensor-host-runtime"),
                 )
+                # Small gen0 budget: without it the host collected nothing for
+                # ~30 min on a 96 MB-L3 CPU and grew to ~60 MB.
+                self.assertEqual(popen.call_args.kwargs["env"]["DOTNET_GCgen0size"], "400000")
             finally:
                 gui._SENSOR_HOST_PROCESS = previous
                 gui._SENSOR_HOST_STARTED_AT = previous_started_at

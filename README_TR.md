@@ -1,6 +1,13 @@
 # Sabasakal Mini Screen 3.5″
 
-Sürüm 1.1.11
+Sürüm 1.1.12
+
+1.1.12 değişiklikleri: CPU sensör yardımcısı birkaç MB'ta kalıyor. .NET,
+çöp toplama eşiğini X3D işlemcilerin 96 MB'lık L3 önbelleğine göre
+ayarladığı için yaklaşık 30 dakika hiç temizlik yapılmıyor ve yardımcı ~60
+MB'a çıkıyordu; artık 4 MB eşikle çalışıyor, CPU sensörlerini her saniye
+yerine dakikada bir buluyor ve LibreHardwareMonitor'ın kullanılmayan 24
+saatlik değer geçmişini tutmuyor.
 
 1.1.11 değişiklikleri: saniyede yaklaşık 1 MB büyüyen bellek sızıntısı
 giderildi (Windows pil taraması her cihazın WinRT özellik tablosunu

@@ -1,6 +1,12 @@
 # Sabasakal Mini Screen 3.5″
 
-Version 1.1.11
+Version 1.1.12
+
+1.1.12 changes: the CPU sensor helper stays at a few MB. .NET sized its gen0
+budget from the 96 MB L3 cache of X3D CPUs, so it collected nothing for about
+30 minutes and grew to ~60 MB; it now runs with a 4 MB gen0 budget, resolves
+the CPU sensors once a minute instead of every second and no longer keeps
+LibreHardwareMonitor's unused 24-hour value history.
 
 1.1.11 changes: fixed a memory leak of about 1 MB/s (the Windows battery scan
 copied every device's WinRT property map, which leaked native memory, so a

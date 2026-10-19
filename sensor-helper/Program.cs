@@ -32,8 +32,24 @@ internal static class Program
                 yield return descendant;
     }
 
-    private static IEnumerable<ISensor> Sensors(Computer computer) =>
-        computer.Hardware.SelectMany(Flatten).SelectMany(hardware => hardware.Sensors);
+    // CPU sensors are resolved once and refreshed every minute (LHM can add
+    // sensors after the first updates) instead of being re-enumerated with
+    // LINQ every second.
+    private const long SensorRefreshMilliseconds = 60_000;
+
+    private static ISensor[] CpuSensors(Computer computer)
+    {
+        ISensor[] cpu = computer.Hardware
+            .SelectMany(Flatten)
+            .Where(hardware => hardware.HardwareType == HardwareType.Cpu)
+            .SelectMany(hardware => hardware.Sensors)
+            .ToArray();
+        // LHM keeps a 24 h value history per sensor by default; only the
+        // current value is used here, so the history would only grow memory.
+        foreach (ISensor sensor in cpu)
+            sensor.ValuesTimeWindow = TimeSpan.Zero;
+        return cpu;
+    }
 
     private static float? FirstValue(
         IEnumerable<ISensor> sensors, SensorType type, params string[] names)
@@ -214,15 +230,19 @@ internal static class Program
             using CancellationTokenSource stop = new();
             Thread sampler = new(() =>
             {
+                ISensor[] cpu = Array.Empty<ISensor>();
+                long sensorsRefreshedAt = long.MinValue;
                 while (!stop.IsCancellationRequested)
                 {
                     try
                     {
                         computer.Accept(visitor);
-                        ISensor[] all = Sensors(computer).ToArray();
-                        ISensor[] cpu = all
-                            .Where(sensor => sensor.Hardware.HardwareType == HardwareType.Cpu)
-                            .ToArray();
+                        long now = Environment.TickCount64;
+                        if (cpu.Length == 0 || now - sensorsRefreshedAt >= SensorRefreshMilliseconds)
+                        {
+                            cpu = CpuSensors(computer);
+                            sensorsRefreshedAt = now;
+                        }
                         float? temp = FirstValue(
                             cpu, SensorType.Temperature,
                             "Tctl/Tdie", "CPU Package", "Core (Tctl/Tdie)",

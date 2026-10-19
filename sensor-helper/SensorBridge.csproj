@@ -8,6 +8,8 @@
     <PublishTrimmed>false</PublishTrimmed>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <DebugType>none</DebugType>
+    <!-- Tiny heap: no background GC thread needed (gen0 budget: see gui.py). -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>SabasakalSensorHost</AssemblyName>
