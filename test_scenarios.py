@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import json
 import os
 import sqlite3
@@ -17,8 +18,8 @@ import numpy as np
 
 # ---------------------------------------------------------------------------
 # Hermetic test environment. This block MUST run before gui/app are imported:
-# every module derives its data paths (settings.json, logs, GSI token,
-# instance.json, sensor cache, deathmatch state ...) from %APPDATA% at import
+# every module derives its data paths (settings.json, logs, instance.json,
+# sensor cache ...) from %APPDATA% at import
 # time. Redirect it to a throw-away directory so no test can ever read or
 # overwrite the real %APPDATA%\CS2Screen of the person running the suite.
 # ---------------------------------------------------------------------------
@@ -85,12 +86,8 @@ from PySide6.QtWidgets import QApplication
 import gui
 import app as screen_app
 
-# No real LCD session may ever be opened by a test, and no test may edit the
-# real CS2/Steam configuration.
+# No real LCD session may ever be opened by a test.
 screen_app._robust_display_class = _blocked("real LCD driver")  # type: ignore[assignment]
-for _name in ("install_gsi_config", "install_cs2_console_log_launch_option", "find_cs2_cfg_dir"):
-    setattr(screen_app, _name, _blocked(f"app.{_name}"))
-gui.install_gsi_config = _blocked("gui.install_gsi_config")  # type: ignore[assignment]
 from battery_runtime import (
     BatteryDevice,
     BatteryDeviceMonitor,
@@ -121,7 +118,7 @@ def default_settings() -> dict:
 
 
 class AntiCheatSafetyScenarios(unittest.TestCase):
-    """Keep the CS2/FACEIT integration inside public, non-invasive APIs."""
+    """The only CS2 touch point is noticing cs2.exe in the process list."""
 
     def test_runtime_has_no_game_memory_injection_or_input_automation_apis(self) -> None:
         source = "\n".join(
@@ -137,11 +134,6 @@ class AntiCheatSafetyScenarios(unittest.TestCase):
         for api in forbidden:
             self.assertNotIn(api, source, api)
 
-    def test_gsi_server_is_loopback_only(self) -> None:
-        source = (Path(__file__).parent / "app.py").read_text(encoding="utf-8")
-        self.assertIn('ThreadingHTTPServer(("127.0.0.1", GSI_PORT)', source)
-        self.assertNotIn('ThreadingHTTPServer(("0.0.0.0", GSI_PORT)', source)
-
     def test_runtime_never_loads_cs2_or_steam_game_libraries(self) -> None:
         source = "\n".join(
             (Path(__file__).parent / name).read_text(encoding="utf-8").lower()
@@ -154,11 +146,36 @@ class AntiCheatSafetyScenarios(unittest.TestCase):
         for marker in forbidden:
             self.assertNotIn(marker, source, marker)
 
-    def test_cs2_integration_requests_only_local_player_state(self) -> None:
-        config = screen_app.gsi_config_text().lower()
-        self.assertIn('"uri" "http://127.0.0.1:', config)
-        self.assertNotIn("allplayers_", config)
-        self.assertLessEqual(screen_app.GSI_MAX_PAYLOAD_BYTES, 1024 * 1024)
+    def test_runtime_opens_no_network_listener_and_never_edits_cs2_config(self) -> None:
+        # The Game State Integration server and the cfg/launch-option writers
+        # are gone: nothing listens on a port and no Steam/CS2 file is edited.
+        source = "\n".join(
+            (Path(__file__).parent / name).read_text(encoding="utf-8").lower()
+            for name in ("app.py", "gui.py", "screens_new.py")
+        )
+        for marker in (
+            "httpserver", "socketserver", ".listen(", "qtcpserver",
+            "gamestate_integration", "localconfig.vdf", "-condebug",
+        ):
+            self.assertNotIn(marker, source, marker)
+        for name in (
+            "GSIServer", "CS2GameState", "install_gsi_config", "find_cs2_cfg_dir",
+            "install_cs2_console_log_launch_option", "FACEIT_PING_MONITOR",
+            "STEAM_PING_MONITOR",
+        ):
+            self.assertFalse(hasattr(screen_app, name), name)
+            self.assertFalse(hasattr(gui, name), name)
+
+    def test_cs2_detection_is_a_process_name_check_only(self) -> None:
+        process = SimpleNamespace(info={"name": "cs2.exe", "create_time": 1.0})
+        scanner = screen_app.ProcessScanner()
+        with patch.object(screen_app.psutil, "process_iter", return_value=[process]), \
+                patch.object(screen_app, "PROCESS_SCANNER", scanner):
+            self.assertTrue(screen_app.cs2_is_running())
+        scanner = screen_app.ProcessScanner()
+        with patch.object(screen_app.psutil, "process_iter", return_value=[]), \
+                patch.object(screen_app, "PROCESS_SCANNER", scanner):
+            self.assertFalse(screen_app.cs2_is_running())
 
     def test_obsolete_valve_probe_scanner_is_not_shipped(self) -> None:
         source = (Path(__file__).parent / "app.py").read_text(encoding="utf-8").lower()
@@ -737,7 +754,7 @@ class PerformanceCounterScenarios(unittest.TestCase):
         media = MediaSnapshot(platform="Chrome", title="Uzun bir medya başlığı", status="playing")
         colors = dict(gui.PALETTES["Kuzey"])
         plain = screen_app.render_screen(
-            self.sample_metrics(), screen_app.GameSnapshot(), False, colors,
+            self.sample_metrics(), colors,
             media_snapshot=media, audio_spectrum=spectrum,
         )
         devices = (
@@ -745,7 +762,7 @@ class PerformanceCounterScenarios(unittest.TestCase):
             BatteryDevice("headset", "PRO X", 18, "headset"),
         )
         with_battery = screen_app.render_screen(
-            self.sample_metrics(), screen_app.GameSnapshot(), False, colors,
+            self.sample_metrics(), colors,
             media_snapshot=media, audio_spectrum=spectrum, battery_devices=devices,
         )
         self.assertIsNotNone(ImageChops.difference(
@@ -766,30 +783,20 @@ class PerformanceCounterScenarios(unittest.TestCase):
 
     def test_battery_panel_remains_visible_in_idle_cs2_and_msfs_modes(self) -> None:
         devices = (BatteryDevice("mouse", "Test Mouse", 72, "mouse"),)
-        game_state = screen_app.GameSnapshot(
-            in_match=True, money=3200, next_win_money=6450,
-            next_loss_money=5100,
-        )
         scenarios = (
-            (screen_app.GameSnapshot(), False, {}),
-            (game_state, True, {}),
-            (
-                screen_app.GameSnapshot(), False,
-                {
-                    "msfs_active": True,
-                    "flight_telemetry": FlightTelemetry(
-                        12500.0, 145.0, 850.0, 278.0, True, 1.0,
-                    ),
-                },
-            ),
+            {},
+            {"cs2_active": True},
+            {
+                "msfs_active": True,
+                "flight_telemetry": FlightTelemetry(
+                    12500.0, 145.0, 850.0, 278.0, True, 1.0,
+                ),
+            },
         )
-        for snapshot, game_active, extras in scenarios:
-            plain = screen_app.render_screen(
-                self.sample_metrics(), snapshot, game_active, **extras,
-            )
+        for extras in scenarios:
+            plain = screen_app.render_screen(self.sample_metrics(), **extras)
             with_battery = screen_app.render_screen(
-                self.sample_metrics(), snapshot, game_active,
-                battery_devices=devices, **extras,
+                self.sample_metrics(), battery_devices=devices, **extras,
             )
             self.assertIsNotNone(ImageChops.difference(
                 plain.crop(gui.BATTERY_PANEL_REGION),
@@ -798,17 +805,17 @@ class PerformanceCounterScenarios(unittest.TestCase):
 
     def test_idle_panel_has_no_cs2_ready_placeholder(self) -> None:
         frame = screen_app.render_screen(
-            self.sample_metrics(), screen_app.GameSnapshot(), False,
+            self.sample_metrics(),
         )
         inner_panel = frame.crop((24, 174, 456, 294))
         self.assertEqual(len(set(inner_panel.get_flattened_data())), 1)
 
     def test_idle_weather_changes_only_the_bottom_panel(self) -> None:
         idle = screen_app.render_screen(
-            self.sample_metrics(), screen_app.GameSnapshot(), False,
+            self.sample_metrics(),
         )
         weather = screen_app.render_screen(
-            self.sample_metrics(), screen_app.GameSnapshot(), False,
+            self.sample_metrics(),
             weather_readings=(
                 WeatherReading("Batman", 24.0, 0),
                 WeatherReading("Muğla", 19.0, 61),
@@ -828,7 +835,7 @@ class PerformanceCounterScenarios(unittest.TestCase):
 
     def test_packaged_icon_set_is_available_for_every_runtime_panel(self) -> None:
         for icon_name in (
-            "bolt-cutter", "dynamite", "mouse", "keyboard", "headphones",
+            "mouse", "keyboard", "headphones",
             "gamepad-2", "sun", "moon", "cloud", "cloud-rain",
             "snowflake", "cloud-lightning", "cloud-fog",
         ):
@@ -853,10 +860,10 @@ class PerformanceCounterScenarios(unittest.TestCase):
             ),
         }
         plain = screen_app.render_screen(
-            self.sample_metrics(), screen_app.GameSnapshot(), False, **extras,
+            self.sample_metrics(), **extras,
         )
         with_media = screen_app.render_screen(
-            self.sample_metrics(), screen_app.GameSnapshot(), False,
+            self.sample_metrics(),
             media_snapshot=MediaSnapshot(
                 platform="Spotify", title="Test", status="playing",
             ),
@@ -878,14 +885,14 @@ class PerformanceCounterScenarios(unittest.TestCase):
                 "battery_devices": battery_devices,
             }
             first = screen_app.render_screen(
-                self.sample_metrics(), screen_app.GameSnapshot(), False,
+                self.sample_metrics(),
                 flight_telemetry=FlightTelemetry(
                     1200.0, 85.0, 300.0, 90.0, True, 1.0,
                 ),
                 **common,
             )
             second = screen_app.render_screen(
-                self.sample_metrics(), screen_app.GameSnapshot(), False,
+                self.sample_metrics(),
                 flight_telemetry=FlightTelemetry(
                     1280.0, 92.0, 450.0, 97.0, True, 2.0,
                 ),
@@ -909,11 +916,11 @@ class PerformanceCounterScenarios(unittest.TestCase):
             ),
         }
         classic = screen_app.render_screen(
-            self.sample_metrics(), screen_app.GameSnapshot(), False,
+            self.sample_metrics(),
             msfs_layout="classic", **common,
         )
         cockpit = screen_app.render_screen(
-            self.sample_metrics(), screen_app.GameSnapshot(), False,
+            self.sample_metrics(),
             msfs_layout="cockpit", **common,
         )
         self.assertIsNotNone(ImageChops.difference(
@@ -927,7 +934,7 @@ class PerformanceCounterScenarios(unittest.TestCase):
 
     def test_msfs_panel_has_theme_aware_aircraft_backdrop(self) -> None:
         frame = screen_app.render_screen(
-            self.sample_metrics(), screen_app.GameSnapshot(), False,
+            self.sample_metrics(),
             msfs_active=True, flight_telemetry=FlightTelemetry(),
             msfs_layout="cockpit",
         )
@@ -943,477 +950,9 @@ class PerformanceCounterScenarios(unittest.TestCase):
             self.assertEqual(screen_app._battery_color(35, colors), colors["warning"], name)
             self.assertEqual(screen_app._battery_color(15, colors), colors["danger"], name)
 
-    def test_competitive_economy_starts_with_the_1900_loss_award(self) -> None:
-        self.assertEqual(
-            screen_app.calculate_economy(
-                800, "CT", {"mode": "competitive", "round_wins": {}}, False,
-            ),
-            (4050, 2700, 1900),
-        )
-
-    def test_economy_win_reduces_loss_counter_instead_of_resetting_it(self) -> None:
-        map_data = {
-            "mode": "competitive",
-            "round_wins": {
-                "1": "t_win_elimination",
-                "2": "t_win_bomb",
-                "3": "ct_win_elimination",
-            },
-        }
-        # Start at one, two losses raise it to three, and the win lowers it to
-        # two: the next loss is therefore $2400, not a reset $1400/$1900.
-        self.assertEqual(
-            screen_app.calculate_economy(3000, "CT", map_data, False),
-            (6250, 5400, 2400),
-        )
-
-    def test_wingman_uses_2v2_awards_and_8000_money_cap(self) -> None:
-        map_data = {
-            "mode": "scrimcomp2v2",
-            "round_wins": {"1": "ct_win_elimination"},
-        }
-        self.assertEqual(
-            screen_app.calculate_economy(7000, "T", map_data, False),
-            (8000, 8000, 2300),
-        )
-        self.assertEqual(
-            screen_app.calculate_economy(4000, "T", map_data, True),
-            (6750, 6900, 2900),
-        )
-
-    def test_wingman_halftime_does_not_mix_old_side_results(self) -> None:
-        map_data = {
-            "mode": "competitive2v2",
-            "round_wins": {
-                **{str(index): "t_win_elimination" for index in range(1, 9)},
-                "9": "ct_win_elimination",
-            },
-        }
-        # At 8 rounds the sides switch. Only round 9 belongs to the current
-        # CT side, so its win keeps the next loss at Wingman's base $2000.
-        self.assertEqual(
-            screen_app.calculate_economy(3000, "CT", map_data, False),
-            (5750, 5000, 2000),
-        )
-
-    def test_economy_is_hidden_in_non_competitive_modes(self) -> None:
-        for mode in ("casual", "deathmatch", "armsrace", "retake"):
-            self.assertEqual(
-                screen_app.calculate_economy(
-                    3000, "CT", {"mode": mode, "round_wins": {}}, False,
-                ),
-                (None, None, None),
-                mode,
-            )
-
-    def test_faceit_custom_server_can_use_competitive_economy_override(self) -> None:
-        map_data = {"mode": "custom", "round_wins": {}}
-        self.assertEqual(
-            screen_app.calculate_economy(3000, "CT", map_data, False),
-            (None, None, None),
-        )
-        self.assertEqual(
-            screen_app.calculate_economy(
-                3000, "CT", map_data, False, force_competitive=True,
-            ),
-            (6250, 4900, 1900),
-        )
-
-    def test_deathmatch_reports_kills_and_headshot_percentage(self) -> None:
-        game_state = screen_app.CS2GameState()
-        game_state.update({
-            "provider": {"steamid": "local-player"},
-            "player": {
-                "steamid": "local-player", "team": "CT", "activity": "playing",
-                "state": {"money": 0, "round_kills": 25, "round_killhs": 10},
-                "match_stats": {"kills": 25},
-            },
-            "map": {"phase": "live", "mode": "deathmatch", "round_wins": {}},
-        })
-        snapshot = game_state.snapshot()
-        self.assertTrue(snapshot.in_match)
-        self.assertEqual(snapshot.kills, 25)
-        self.assertEqual(snapshot.headshot_kills, 10)
-        self.assertEqual(snapshot.headshot_percent, 40)
-        self.assertIsNone(snapshot.next_win_money)
-
-    def test_deathmatch_zero_kills_has_zero_headshot_percentage(self) -> None:
-        game_state = screen_app.CS2GameState()
-        game_state.update({
-            "provider": {"steamid": "local-player"},
-            "player": {
-                "steamid": "local-player", "team": "T", "activity": "playing",
-                "state": {"round_kills": 0, "round_killhs": 0},
-            },
-            "map": {"phase": "live", "mode": "teamdeathmatch", "round_wins": {}},
-        })
-        self.assertEqual(game_state.snapshot().headshot_percent, 0)
-
-    def test_deathmatch_headshot_percentage_matches_cs2_truncation(self) -> None:
-        game_state = screen_app.CS2GameState()
-        game_state.update({
-            "provider": {"steamid": "local-player"},
-            "player": {
-                "steamid": "local-player", "team": "CT", "activity": "playing",
-                "state": {"round_kills": 17, "round_killhs": 12},
-            },
-            "map": {"phase": "live", "mode": "deathmatch", "round_wins": {}},
-        })
-        snapshot = game_state.snapshot()
-        self.assertEqual(snapshot.kills, 17)
-        self.assertEqual(snapshot.headshot_kills, 12)
-        self.assertEqual(snapshot.headshot_percent, 70)
-
-    def test_deathmatch_totals_survive_respawns_and_keep_headshots(self) -> None:
-        game_state = screen_app.CS2GameState()
-
-        def update(kills: int, headshots: int, phase: str = "live") -> None:
-            game_state.update({
-                "provider": {"steamid": "local-player"},
-                "player": {
-                    "steamid": "local-player", "team": "CT", "activity": "playing",
-                    "state": {"round_kills": kills, "round_killhs": headshots},
-                },
-                "map": {"name": "de_dust2", "phase": phase, "mode": "deathmatch"},
-            })
-
-        update(3, 1)
-        self.assertEqual((game_state.snapshot().kills, game_state.snapshot().headshot_kills), (3, 1))
-        update(0, 0)  # death/respawn
-        self.assertEqual((game_state.snapshot().kills, game_state.snapshot().headshot_kills), (3, 1))
-        update(2, 1)  # two kills in the next life
-        snapshot = game_state.snapshot()
-        self.assertEqual((snapshot.kills, snapshot.headshot_kills), (5, 2))
-        self.assertEqual(snapshot.headshot_percent, 40)
-
-    def test_deathmatch_warmup_to_live_resets_totals_once(self) -> None:
-        game_state = screen_app.CS2GameState()
-
-        def update(kills: int, headshots: int, phase: str) -> None:
-            game_state.update({
-                "provider": {"steamid": "local-player"},
-                "player": {
-                    "steamid": "local-player", "team": "T", "activity": "playing",
-                    "state": {"round_kills": kills, "round_killhs": headshots},
-                },
-                "map": {"name": "de_mirage", "phase": phase, "mode": "deathmatch"},
-            })
-
-        update(4, 2, "warmup")
-        self.assertEqual(game_state.snapshot().kills, 4)
-        update(0, 0, "live")
-        self.assertEqual((game_state.snapshot().kills, game_state.snapshot().headshot_kills), (0, 0))
-        update(1, 1, "live")
-        self.assertEqual((game_state.snapshot().kills, game_state.snapshot().headshot_kills), (1, 1))
-        update(0, 0, "live")
-        self.assertEqual((game_state.snapshot().kills, game_state.snapshot().headshot_kills), (1, 1))
-
-    def test_deathmatch_full_clock_jump_ends_warmup_when_map_phase_stays_live(self) -> None:
-        game_state = screen_app.CS2GameState()
-
-        def update(kills: int, headshots: int, seconds: float) -> None:
-            game_state.update({
-                "provider": {"steamid": "local-player"},
-                "player": {
-                    "steamid": "local-player", "team": "CT", "activity": "playing",
-                    "state": {"round_kills": kills, "round_killhs": headshots},
-                },
-                "map": {"name": "de_nuke", "phase": "live", "mode": "deathmatch"},
-                "phase_countdowns": {"phase": "live", "phase_ends_in": str(seconds)},
-            })
-
-        update(5, 2, 7.5)
-        self.assertEqual(game_state.snapshot().kills, 5)
-        update(0, 0, 599.8)
-        self.assertEqual((game_state.snapshot().kills, game_state.snapshot().headshot_kills), (0, 0))
-        update(2, 1, 580.0)
-        self.assertEqual((game_state.snapshot().kills, game_state.snapshot().headshot_kills), (2, 1))
-
-    def test_deathmatch_cumulative_stats_reset_ends_warmup_on_valve_server(self) -> None:
-        game_state = screen_app.CS2GameState()
-
-        def update(
-            life_kills: int, life_headshots: int, match_kills: int, deaths: int,
-        ) -> None:
-            game_state.update({
-                "provider": {"steamid": "local-player"},
-                "player": {
-                    "steamid": "local-player", "team": "CT", "activity": "playing",
-                    "state": {
-                        "round_kills": life_kills, "round_killhs": life_headshots,
-                    },
-                    "match_stats": {
-                        "kills": match_kills, "deaths": deaths, "score": match_kills * 2,
-                    },
-                },
-                # Matches the observed Valve DM payload: the phase stays live
-                # and phase_countdowns is absent on both sides of warm-up.
-                "map": {"name": "de_dust2", "phase": "live", "mode": "deathmatch"},
-            })
-
-        update(2, 1, 2, 1)  # warm-up
-        self.assertEqual(game_state.snapshot().kills, 2)
-        update(0, 0, 0, 0)  # real ten-minute match starts
-        self.assertEqual((game_state.snapshot().kills, game_state.snapshot().headshot_kills), (0, 0))
-        update(1, 1, 1, 0)
-        self.assertEqual((game_state.snapshot().kills, game_state.snapshot().headshot_kills), (1, 1))
-
-    def test_deathmatch_respawn_does_not_look_like_match_reset(self) -> None:
-        game_state = screen_app.CS2GameState()
-
-        def update(
-            life_kills: int, life_hs: int, total_kills: int, deaths: int,
-            health: int,
-        ) -> None:
-            game_state.update({
-                "provider": {"steamid": "local-player"},
-                "player": {
-                    "steamid": "local-player", "team": "T", "activity": "playing",
-                    "state": {
-                        "round_kills": life_kills, "round_killhs": life_hs,
-                        "health": health,
-                    },
-                    "match_stats": {"kills": total_kills, "deaths": deaths, "score": 10},
-                },
-                "map": {"name": "de_inferno", "phase": "live", "mode": "deathmatch"},
-            })
-
-        update(3, 1, 3, 0, 100)
-        update(3, 1, 3, 1, 0)
-        update(0, 0, 3, 1, 100)
-        self.assertEqual((game_state.snapshot().kills, game_state.snapshot().headshot_kills), (3, 1))
-        update(2, 1, 5, 1, 100)
-        self.assertEqual((game_state.snapshot().kills, game_state.snapshot().headshot_kills), (5, 2))
-
-    def test_deathmatch_alive_counter_reset_ends_warmup_when_stats_are_omitted(self) -> None:
-        game_state = screen_app.CS2GameState()
-
-        def update(kills: int, headshots: int, health: int = 100) -> None:
-            game_state.update({
-                "provider": {"steamid": "local-player"},
-                "player": {
-                    "steamid": "local-player", "team": "CT", "activity": "playing",
-                    "state": {
-                        "health": health, "round_kills": kills,
-                        "round_killhs": headshots,
-                    },
-                },
-                "map": {"name": "de_mirage", "phase": "live", "mode": "deathmatch"},
-            })
-
-        update(2, 1)  # warm-up kills
-        self.assertEqual(game_state.snapshot().kills, 2)
-        update(0, 0)  # official match starts while the player remains alive
-        snapshot = game_state.snapshot()
-        self.assertEqual((snapshot.kills, snapshot.headshot_kills), (0, 0))
-        self.assertEqual(game_state._dm_last_reset_reason, "alive-counter-reset")
-
-    def test_deathmatch_final_result_is_held_for_seven_seconds(self) -> None:
-        game_state = screen_app.CS2GameState()
-        live_payload = {
-            "provider": {"steamid": "local-player"},
-            "player": {
-                "steamid": "local-player", "team": "CT", "activity": "playing",
-                "state": {"round_kills": 4, "round_killhs": 2},
-                "match_stats": {"kills": 24, "deaths": 12, "score": 55},
-            },
-            "map": {"name": "de_dust2", "phase": "live", "mode": "deathmatch"},
-        }
-        gameover_payload = {
-            **live_payload,
-            "map": {"name": "de_dust2", "phase": "gameover", "mode": "deathmatch"},
-        }
-        with patch.object(screen_app.time, "monotonic", return_value=100.0):
-            game_state.update(live_payload)
-            self.assertTrue(game_state.snapshot().in_match)
-        with patch.object(screen_app.time, "monotonic", return_value=105.0):
-            game_state.update(gameover_payload)
-        with patch.object(screen_app.time, "monotonic", return_value=111.9):
-            held = game_state.snapshot()
-            self.assertTrue(held.in_match)
-            self.assertEqual(held.kills, 24)
-            self.assertEqual(held.headshot_percent, 8)
-        with patch.object(screen_app.time, "monotonic", return_value=112.1):
-            self.assertFalse(game_state.snapshot().in_match)
-
-    def test_deathmatch_totals_survive_a_quick_application_restart(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            cache_path = Path(directory) / "deathmatch-state.json"
-
-            def update(state: screen_app.CS2GameState, kills: int, headshots: int) -> None:
-                state.update({
-                    "provider": {"steamid": "local-player"},
-                    "player": {
-                        "steamid": "local-player", "team": "CT", "activity": "playing",
-                        "state": {"round_kills": kills, "round_killhs": headshots},
-                    },
-                    "map": {"name": "de_dust2", "phase": "live", "mode": "deathmatch"},
-                })
-
-            first = screen_app.CS2GameState(cache_path)
-            update(first, 7, 3)
-            self.assertTrue(cache_path.exists())
-
-            restarted = screen_app.CS2GameState(cache_path)
-            # The player died while the app was restarting, then collected
-            # two kills (one headshot) in the new life.
-            update(restarted, 2, 1)
-            snapshot = restarted.snapshot()
-            self.assertEqual((snapshot.kills, snapshot.headshot_kills), (9, 4))
-            self.assertEqual(snapshot.headshot_percent, 44)
-
-    def test_stale_deathmatch_restart_cache_is_ignored(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            cache_path = Path(directory) / "deathmatch-state.json"
-            cache_path.write_text(json.dumps({
-                "saved_at": time.time() - 60,
-                "identity": "deathmatch|de_dust2",
-                "phase": "live",
-                "kills": 40,
-                "headshots": 20,
-                "life_kills": 4,
-                "life_headshots": 2,
-            }), encoding="utf-8")
-            state = screen_app.CS2GameState(cache_path)
-            state.update({
-                "provider": {"steamid": "local-player"},
-                "player": {
-                    "steamid": "local-player", "team": "T", "activity": "playing",
-                    "state": {"round_kills": 1, "round_killhs": 1},
-                },
-                "map": {"name": "de_dust2", "phase": "live", "mode": "deathmatch"},
-            })
-            self.assertEqual((state.snapshot().kills, state.snapshot().headshot_kills), (1, 1))
-
-    def test_game_state_reports_the_local_players_ct_or_t_side(self) -> None:
-        game_state = screen_app.CS2GameState()
-        for team in ("CT", "T"):
-            game_state.update({
-                "provider": {"steamid": "local-player"},
-                "player": {
-                    "steamid": "local-player", "team": team, "activity": "playing",
-                    "state": {"money": 3200, "defusekit": team == "CT"},
-                },
-                "map": {"phase": "live", "round_wins": {}},
-            })
-            snapshot = game_state.snapshot()
-            self.assertEqual(snapshot.team, team)
-            self.assertTrue(snapshot.in_match)
-
-        game_state.update({
-            "provider": {"steamid": "local-player"},
-            "player": {
-                "steamid": "local-player", "team": "T", "activity": "playing",
-                "state": {"money": 3200},
-            },
-            "map": {"phase": "live", "round_wins": {}},
-            "round": {"bomb": "planted"},
-        })
-        self.assertTrue(game_state.snapshot().bomb_planted)
-        self.assertFalse(hasattr(game_state.snapshot(), "bomb_seconds"))
-
-    def test_death_packet_without_player_does_not_flash_back_to_ping_panel(self) -> None:
-        game_state = screen_app.CS2GameState()
-        game_state.update({
-            "provider": {"steamid": "local-player"},
-            "player": {
-                "steamid": "local-player", "team": "T", "activity": "playing",
-                "state": {"money": 2450},
-            },
-            "map": {
-                "phase": "live", "mode": "scrimcomp2v2", "round_wins": {},
-            },
-        })
-        game_state.update({
-            "provider": {"steamid": "local-player"},
-            "player": {},
-            "map": {"phase": "live", "mode": "scrimcomp2v2", "round_wins": {}},
-        })
-        snapshot = game_state.snapshot()
-        self.assertTrue(snapshot.in_match)
-        self.assertEqual(snapshot.team, "T")
-        self.assertEqual(snapshot.money, 2450)
-
-    def test_spectated_player_packet_keeps_local_players_economy(self) -> None:
-        game_state = screen_app.CS2GameState()
-        game_state.update({
-            "provider": {"steamid": "local-player"},
-            "player": {
-                "steamid": "local-player", "team": "CT", "activity": "playing",
-                "state": {"money": 3100, "defusekit": True},
-            },
-            "map": {
-                "phase": "live", "mode": "scrimcomp2v2", "round_wins": {},
-            },
-        })
-        game_state.update({
-            "provider": {"steamid": "local-player"},
-            "player": {
-                "steamid": "teammate", "team": "CT", "activity": "playing",
-                "state": {"money": 700},
-            },
-            "map": {"phase": "live", "mode": "scrimcomp2v2", "round_wins": {}},
-        })
-        snapshot = game_state.snapshot()
-        self.assertTrue(snapshot.in_match)
-        self.assertEqual(snapshot.money, 3100)
-        self.assertTrue(snapshot.has_defuse_kit)
-
     def test_msfs_fast_refresh_budget_is_below_two_tenths(self) -> None:
         self.assertLessEqual(gui.MSFS_TELEMETRY_REFRESH_INTERVAL, 0.15)
         self.assertLessEqual(gui.MSFS_WORKER_INTERVAL, 0.10)
-
-    def test_live_cs2_money_and_deathmatch_stats_refresh_with_gsi(self) -> None:
-        self.assertLessEqual(gui.LIVE_GAME_WORKER_INTERVAL, 0.20)
-        self.assertFalse(hasattr(gui, "BOMB_WORKER_INTERVAL"))
-
-    def test_matchmaking_ping_uses_only_cs2_console_output(self) -> None:
-        self.assertEqual(screen_app.CS2_EXACT_PING_MODE, "console_log")
-        monitor = screen_app.MatchmakingPingMonitor()
-        self.assertFalse(hasattr(monitor, "fallback"))
-
-    def test_cs2_console_ping_parser_reads_game_table_and_excludes_falkenstein(self) -> None:
-        parsed = screen_app.CS2ConsolePingMonitor.parse_ping_text(
-            "vie: 54ms via direct route\n"
-            "fra: 57ms via vie (front=54ms, back=3ms)\n"
-            "ams: 63ms via direct route\n"
-            "fsn: 59ms via dfra (front=57ms, back=2ms)\n"
-        )
-        self.assertEqual(parsed, {"vie": 54, "fra": 57, "ams": 63})
-
-    def test_cs2_console_ping_parser_reads_latest_native_ping_location(self) -> None:
-        parsed = screen_app.CS2ConsolePingMonitor.parse_ping_text(
-            "[SteamNetSockets] Ping location: vie=53+5,dvie=55+5/53+5,"
-            "fra=59+5/60+5,dfra=70+7/60+5,ams=64+6/64+5,waw=78+7/65+5\n"
-        )
-        self.assertEqual(parsed["vie"], 53)
-        self.assertEqual(parsed["fra"], 59)
-        self.assertEqual(parsed["ams"], 64)
-        self.assertNotIn("dvie", parsed)
-
-    def test_matchmaking_monitor_returns_only_cs2_values(self) -> None:
-        exact = [screen_app.RelayPing("vie", "Viyana", "", 54.0)]
-        monitor = screen_app.MatchmakingPingMonitor()
-        monitor.exact = SimpleNamespace(read=lambda: exact, close=lambda: None)
-        self.assertEqual(monitor.read(), exact)
-        monitor.exact = SimpleNamespace(read=lambda: [], close=lambda: None)
-        self.assertEqual(monitor.read(), [])
-
-    def test_cs2_console_log_launch_option_preserves_existing_user_options(self) -> None:
-        original = '''"Software"\n{\n\t"730"\n\t{\n\t\t"LastPlayed" "1"\n\t\t"LaunchOptions" "+exec autoexec.cfg -novid"\n\t\t"cloud" { "state" "ok" }\n\t}\n}\n'''
-        updated, changed = screen_app.add_cs2_console_log_launch_option(original)
-        self.assertTrue(changed)
-        self.assertIn('"LaunchOptions" "+exec autoexec.cfg -novid -condebug"', updated)
-        unchanged, changed_again = screen_app.add_cs2_console_log_launch_option(updated)
-        self.assertFalse(changed_again)
-        self.assertEqual(unchanged, updated)
-
-    def test_cs2_console_log_setup_removes_unsupported_vconsole_switch(self) -> None:
-        original = '''"730" { "LaunchOptions" "-novid -vconsole" }'''
-        updated, changed = screen_app.add_cs2_console_log_launch_option(original)
-        self.assertTrue(changed)
-        self.assertNotIn("-vconsole", updated)
-        self.assertIn("-condebug", updated)
 
     def test_media_updates_stay_within_serial_frame_budget(self) -> None:
         regions = (
@@ -1446,7 +985,6 @@ class PerformanceCounterScenarios(unittest.TestCase):
         with patch.object(screen_app, "draw_open_ring") as ring:
             screen_app.render_screen(
                 self.sample_metrics() | {"ram_used": 27.4},
-                screen_app.GameSnapshot(), False,
             )
         self.assertEqual(ring.call_args_list[2].args[7], "27.4 GB")
 
@@ -1494,10 +1032,10 @@ class PerformanceCounterScenarios(unittest.TestCase):
             100.0, float(old_metrics["cpu_load"]) + 1.0,
         )
         old_frame = screen_app.render_screen(
-            old_metrics, screen_app.GameSnapshot(), False,
+            old_metrics,
         )
         new_frame = screen_app.render_screen(
-            new_metrics, screen_app.GameSnapshot(), False,
+            new_metrics,
         )
         regions = gui._tight_changed_regions(
             new_frame, old_frame, gui.TOP_DIRTY_TILES,
@@ -1517,10 +1055,10 @@ class PerformanceCounterScenarios(unittest.TestCase):
             "ram_load": 88.0, "ram_used": 28.7,
         })
         old_frame = screen_app.render_screen(
-            old_metrics, screen_app.GameSnapshot(), False, animation_time=0.0,
+            old_metrics, animation_time=0.0,
         )
         new_frame = screen_app.render_screen(
-            new_metrics, screen_app.GameSnapshot(), False, animation_time=0.0,
+            new_metrics, animation_time=0.0,
         )
         patched = old_frame.copy()
         regions = gui._tight_changed_regions(
@@ -1537,10 +1075,10 @@ class PerformanceCounterScenarios(unittest.TestCase):
         new_metrics = dict(old_metrics)
         new_metrics.update({"cpu_temp": 45.0, "gpu_temp": 46.0, "ram_used": 27.4})
         old_frame = screen_app.render_screen(
-            old_metrics, screen_app.GameSnapshot(), False,
+            old_metrics,
         )
         new_frame = screen_app.render_screen(
-            new_metrics, screen_app.GameSnapshot(), False,
+            new_metrics,
         )
         patched = old_frame.copy()
         for region in gui.FAST_VALUE_BOXES:
@@ -1555,7 +1093,7 @@ class PerformanceCounterScenarios(unittest.TestCase):
         )
         colors = dict(gui.PALETTES["Kuzey"])
         full = screen_app.render_screen(
-            self.sample_metrics(), screen_app.GameSnapshot(), False, colors,
+            self.sample_metrics(), colors,
             media_snapshot=MediaSnapshot(platform="Chrome", title="Test", status="playing"),
             audio_spectrum=spectrum,
         )
@@ -1635,9 +1173,9 @@ class PerformanceCounterScenarios(unittest.TestCase):
             bars=tuple(index / 15 for index in range(16)), level=0.8,
             active=True, input_latency_ms=23.0, updated_at=1.0,
         )
-        idle = screen_app.render_screen(self.sample_metrics(), screen_app.GameSnapshot(), False)
+        idle = screen_app.render_screen(self.sample_metrics())
         media_frame = screen_app.render_screen(
-            self.sample_metrics(), screen_app.GameSnapshot(), False,
+            self.sample_metrics(),
             media_snapshot=media, audio_spectrum=spectrum,
         )
         self.assertIsNone(
@@ -1647,10 +1185,10 @@ class PerformanceCounterScenarios(unittest.TestCase):
             ImageChops.difference(idle.crop((14, 160, 467, 307)), media_frame.crop((14, 160, 467, 307))).getbbox(),
         )
 
-        game_state = screen_app.GameSnapshot(in_match=True, money=3000, next_win_money=6500)
-        game_plain = screen_app.render_screen(self.sample_metrics(), game_state, True)
+        # While CS2 runs the idle screen (in CS2 colours) stays up.
+        game_plain = screen_app.render_screen(self.sample_metrics(), cs2_active=True)
         game_with_media = screen_app.render_screen(
-            self.sample_metrics(), game_state, True,
+            self.sample_metrics(), cs2_active=True,
             media_snapshot=media, audio_spectrum=spectrum,
         )
         self.assertIsNone(ImageChops.difference(game_plain, game_with_media).getbbox())
@@ -1731,8 +1269,7 @@ class PerformanceCounterScenarios(unittest.TestCase):
                     "cpu_load": cpu, "cpu_temp": 40.0, "cpu_freq": 4.5,
                     "gpu_load": gpu, "gpu_temp": 40.0, "gpu_memory": 800.0,
                     "ram_load": ram, "ram_used": 16.0,
-                },
-                screen_app.GameSnapshot(), False, animation_time=animation_time,
+                }, animation_time=animation_time,
             )
 
         below_visible = frame(74.9, 79.9, 84.9, 0.1)
@@ -1942,9 +1479,7 @@ class LocalizationScenarios(unittest.TestCase):
 
         with patch.object(ImageDraw.ImageDraw, "text", new=capture):
             screen_app.render_screen(
-                self.metrics(), kwargs.pop("snapshot", screen_app.GameSnapshot()),
-                kwargs.pop("panel_active", False), gui.PALETTES["Kuzey"],
-                language="en", **kwargs,
+                self.metrics(), gui.PALETTES["Kuzey"], language="en", **kwargs,
             )
         return set(seen)
 
@@ -1964,37 +1499,22 @@ class LocalizationScenarios(unittest.TestCase):
         self.assertIn("System audio", media)
         self.assertIn("Audio playing", media)
 
-        matchmaking = self.rendered_text(
-            panel_active=True,
-            matchmaking_pings=[
-                screen_app.RelayPing("fra", "Frankfurt", "127.0.0.1", 57.0)
-            ],
+        # The CS2 theme is the idle screen in other colours: same English text.
+        cs2_theme = self.rendered_text(
+            cs2_active=True,
+            weather_readings=(WeatherReading("Ankara", 22.0, 0),),
+            battery_devices=(BatteryDevice("k", "Wireless Keyboard", 73, "keyboard"),),
         )
-        self.assertIn("Before matchmaking", matchmaking)
-        self.assertIn("Valve route", matchmaking)
+        self.assertEqual(cs2_theme, idle)
 
-        economy = self.rendered_text(
-            panel_active=True,
-            snapshot=screen_app.GameSnapshot(
-                connected=True, in_match=True, team="CT", money=4250,
-                next_win_money=7500, next_loss_money=6150, loss_bonus=1900,
+        battery = self.rendered_text(
+            battery_devices=(
+                BatteryDevice("m", "Wireless Mouse", 64, "mouse"),
+                BatteryDevice("h", "Wireless Headset", 18, "headset"),
             ),
         )
-        self.assertIn("Defence economy", economy)
-        self.assertIn("Now", economy)
-        self.assertIn("If you win", economy)
-
-
-        deathmatch = self.rendered_text(
-            panel_active=True,
-            snapshot=screen_app.GameSnapshot(
-                connected=True, in_match=True, game_mode="deathmatch",
-                kills=42, headshot_kills=21, headshot_percent=50,
-            ),
-        )
-        self.assertIn("Deathmatch", deathmatch)
-        self.assertIn("KILLS", deathmatch)
-        self.assertIn("HEADSHOTS", deathmatch)
+        self.assertIn("in use", battery)
+        self.assertFalse(any("kullanımda" in value for value in battery))
 
         flight = FlightTelemetry(
             altitude_ft=12540.0, airspeed_kt=146.0,
@@ -2036,17 +1556,6 @@ class TrackingEvent(FastEvent):
     def set(self) -> None:
         self.set_count += 1
         super().set()
-
-
-class FakeGSI:
-    def __init__(self, _state) -> None:
-        pass
-
-    def start(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
 
 
 class FakeMonitor:
@@ -2406,7 +1915,7 @@ class UiAndConnectionScenarios(unittest.TestCase):
         self.assertEqual(panel.swatches["warning"].text(), "Warning")
         self.assertEqual(panel.swatches["danger"].text(), "Critical")
         self.assertEqual(panel.preview_buttons["daily"].text(), "Daily")
-        self.assertEqual(panel.preview_buttons["deathmatch"].text(), "Deathmatch")
+        self.assertEqual(panel.preview_buttons["cs2"].text(), "CS2 theme")
         self.assertEqual(panel.preview_buttons["wireless"].text(), "Wireless")
         self.assertEqual(panel.palette_combo.currentText(), "North")
         self.assertEqual(panel.palette_combo.currentData(), "Kuzey")
@@ -2495,7 +2004,7 @@ class UiAndConnectionScenarios(unittest.TestCase):
         panel = self.make_panel()
         self.assertEqual(
             set(panel.preview_buttons),
-            {"daily", "cs2_ct", "cs2_t", "deathmatch", "msfs", "weather", "wireless"},
+            {"daily", "cs2", "msfs", "weather", "wireless"},
         )
         for design in ("new", "classic"):
             panel.design_combo.setCurrentIndex(panel.design_combo.findData(design))
@@ -2504,12 +2013,6 @@ class UiAndConnectionScenarios(unittest.TestCase):
                 self.assertEqual(panel.preview_mode, mode)
                 self.assertIsNotNone(panel._preview_image)
         self.assertIn("Kablosuz", panel.preview_context_label.text())
-        panel.close()
-
-    def test_cs2_connection_is_automatic_without_a_manual_button(self) -> None:
-        panel = self.make_panel()
-        self.assertFalse(hasattr(panel, "gsi_button"))
-        self.assertTrue(callable(panel._install_gsi))
         panel.close()
 
     def test_sabasakal_logo_assets_are_valid_for_window_and_exe(self) -> None:
@@ -2739,9 +2242,7 @@ class UiAndConnectionScenarios(unittest.TestCase):
         panel = self.make_panel()
         initial_states = {id(control): control.isEnabled() for control in panel.edit_controls}
         panel._screen_worker = lambda: panel.stop_event.wait(0.2)
-        with patch.object(panel, "save_settings", return_value=True), patch.object(
-            panel, "_install_gsi", return_value=True
-        ):
+        with patch.object(panel, "save_settings", return_value=True):
             panel.start_screen()
         self.assertTrue(all(not control.isEnabled() for control in panel.edit_controls))
         self.assertTrue(panel.stop_button.isEnabled())
@@ -2759,18 +2260,16 @@ class UiAndConnectionScenarios(unittest.TestCase):
 
     def test_start_failure_remains_visible_in_status(self) -> None:
         panel = self.make_panel()
-        with patch.object(panel, "save_settings", return_value=True), patch.object(
-            panel, "_install_gsi", return_value=True
-        ), patch("gui.threading.Thread.start", side_effect=RuntimeError("thread failed")):
+        with patch.object(panel, "save_settings", return_value=True), patch(
+            "gui.threading.Thread.start", side_effect=RuntimeError("thread failed"),
+        ):
             panel.start_screen()
         self.assertIn("başlatılamadı", panel.status_label.text())
         panel.close()
 
     def worker_patches(self):
         return (
-            patch.object(gui, "GSIServer", FakeGSI),
             patch.object(gui, "cs2_is_running", return_value=False),
-            patch.object(gui, "faceit_ac_is_running", return_value=False),
             patch.object(gui, "msfs_session_seconds", return_value=None),
             patch.object(gui, "get_metrics", return_value={}),
             patch.object(gui, "render_screen", return_value=Image.new("RGB", (480, 320))),
@@ -2800,7 +2299,7 @@ class UiAndConnectionScenarios(unittest.TestCase):
             return recovered
 
         patches = self.worker_patches()
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patch.object(
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patch.object(
             gui, "ScreenSession", side_effect=factory
         ):
             panel._screen_worker()
@@ -2822,7 +2321,7 @@ class UiAndConnectionScenarios(unittest.TestCase):
         screens = [broken, recovered]
 
         patches = self.worker_patches()
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patch.object(
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patch.object(
             gui, "ScreenSession", side_effect=lambda *_args: screens.pop(0)
         ):
             panel._screen_worker()
@@ -2840,7 +2339,7 @@ class UiAndConnectionScenarios(unittest.TestCase):
         panel.stop_event = FastEvent()
         screen = FakeScreen(panel.stop_event, fail_power_off=True)
         patches = self.worker_patches()
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patch.object(
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patch.object(
             gui, "ScreenSession", return_value=screen,
         ):
             panel._screen_worker()
@@ -2852,7 +2351,7 @@ class UiAndConnectionScenarios(unittest.TestCase):
 
 
 class RedesignAndFixScenarios(unittest.TestCase):
-    """New design, FACEIT kill switch and robustness fixes."""
+    """New design and robustness fixes."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -2875,22 +2374,30 @@ class RedesignAndFixScenarios(unittest.TestCase):
     def test_screen_stabilizer_dwell_and_debounce(self) -> None:
         import screens_new as sn
         st = sn.ScreenStabilizer(min_dwell=2.5, confirm=0.6)
-        live, death, menu = ("cs2", "live", ""), ("cs2", "death", ""), ("cs2_menu", "", "")
-        self.assertEqual(st.update(live, 0.0), live)  # first screen is immediate
-        self.assertEqual(st.update(death, 1.0), live)  # dwell not reached
-        self.assertEqual(st.update(death, 2.0), live)
-        self.assertEqual(st.update(death, 2.6), death)  # dwell + confirm satisfied
-        # A short GSI flicker never reaches the panel.
-        self.assertEqual(st.update(live, 6.0), death)
-        self.assertEqual(st.update(death, 6.3), death)
-        self.assertEqual(st.update(live, 6.4), death)
-        self.assertEqual(st.update(live, 6.9), death)  # pending restarted at 6.4
-        self.assertEqual(st.update(live, 7.1), live)
+        desktop, cs2 = ("desktop", ""), ("cs2", "")
+        cruise, approach = ("msfs", "cruise"), ("msfs", "approach")
+        self.assertEqual(st.update(desktop, 0.0), desktop)  # first screen is immediate
+        self.assertEqual(st.update(cs2, 1.0), desktop)  # dwell not reached
+        self.assertEqual(st.update(cs2, 2.0), desktop)
+        self.assertEqual(st.update(cs2, 2.6), cs2)  # dwell + confirm satisfied
+        # A short flicker never reaches the panel.
+        self.assertEqual(st.update(desktop, 6.0), cs2)
+        self.assertEqual(st.update(cs2, 6.3), cs2)
+        self.assertEqual(st.update(desktop, 6.4), cs2)
+        self.assertEqual(st.update(desktop, 6.9), cs2)  # pending restarted at 6.4
+        self.assertEqual(st.update(desktop, 7.1), desktop)
         # Flapping between two requests resets confirmation each time.
         for t in (10.0, 10.3, 10.6, 10.9, 11.2):
-            self.assertEqual(st.update(menu if int(t * 10) % 2 == 0 else live, t), live)
-        # FACEIT safety mode is applied at once.
-        self.assertEqual(st.update(("faceit", "", ""), 11.3), ("faceit", "", ""))
+            self.assertEqual(st.update(cs2 if int(t * 10) % 2 == 0 else desktop, t), desktop)
+        # An MSFS phase bouncing at a threshold is debounced the same way.
+        self.assertEqual(st.update(cruise, 20.0), desktop)
+        self.assertEqual(st.update(cruise, 20.7), cruise)
+        self.assertEqual(st.update(approach, 23.5), cruise)
+        self.assertEqual(st.update(cruise, 23.8), cruise)
+        self.assertEqual(st.update(approach, 24.0), cruise)
+        self.assertEqual(st.update(approach, 24.7), approach)
+        # No mode bypasses the hysteresis any more (the FACEIT screen is gone).
+        self.assertEqual(st.update(cs2, 24.8), approach)
 
     def test_large_screen_change_is_sent_as_column_wipe(self) -> None:
         from PIL import Image
@@ -2906,47 +2413,6 @@ class RedesignAndFixScenarios(unittest.TestCase):
         self.assertEqual((kind, regions), ("tiles", [(10, 10, 60, 30)]))
         self.assertEqual(gui.plan_new_design_update(old, old.copy()), ("none", []))
 
-    def test_buy_phase_economy_screen_is_removed(self) -> None:
-        import screens_new as sn
-        for name in ("loss_award", "buy_suggestion", "render_cs_buy", "SUGGESTION_STYLE"):
-            self.assertFalse(hasattr(sn, name), name)
-        ctx = sn.NewScreenContext({}, (), mode="cs2", cs_screen="buy",
-                                  game=screen_app.GameSnapshot(connected=True, in_match=True,
-                                                               round_phase="freezetime", money=4150))
-        self.assertEqual(sn.render_new_screen(ctx).size, (sn.WIDTH, sn.HEIGHT))
-
-    def test_cs_screen_selection_uses_official_round_phase(self) -> None:
-        import screens_new as sn
-        snap = screen_app.GameSnapshot
-        self.assertEqual(sn.cs_screen_for(snap(round_phase="freezetime")), "live")
-        self.assertEqual(sn.cs_screen_for(snap(round_phase="live", alive=False)), "death")
-        self.assertEqual(sn.cs_screen_for(snap(round_phase="over", alive=True)), "death")
-        self.assertEqual(sn.cs_screen_for(snap(round_phase="live", alive=True)), "live")
-
-    def test_gsi_exposes_loss_streak_and_round_stats(self) -> None:
-        state = screen_app.CS2GameState()
-        state.update({
-            "provider": {"steamid": "me"},
-            "map": {"name": "de_mirage", "phase": "live", "mode": "competitive", "round": 13,
-                    "team_ct": {"score": 6, "consecutive_round_losses": 2},
-                    "team_t": {"score": 7, "consecutive_round_losses": 0}},
-            "round": {"phase": "freezetime"},
-            "player": {"steamid": "me", "team": "CT", "activity": "playing",
-                       "state": {"health": 100, "money": 4150, "round_kills": 0,
-                                 "round_killhs": 0, "round_totaldmg": 0},
-                       "match_stats": {"kills": 14, "deaths": 9, "assists": 3, "mvps": 2,
-                                       "score": 33}},
-            "previously": {"player": {"state": {"money": 1}}},
-        })
-        snap = state.snapshot()
-        self.assertEqual((snap.round_number, snap.score_ct, snap.score_t), (14, 6, 7))
-        self.assertEqual(snap.loss_streak, 2)
-        self.assertEqual(snap.round_phase, "freezetime")
-        self.assertEqual((snap.match_kills, snap.match_deaths, snap.match_assists), (14, 9, 3))
-        self.assertNotIn("previously", state._data)
-        state.update({"map": {"name": "de_inferno", "phase": "warmup"}})
-        self.assertNotIn("round", state._data)
-
     def test_no_bomb_timer_feature_remains(self) -> None:
         source = "\n".join(
             (Path(__file__).parent / name).read_text(encoding="utf-8").lower()
@@ -2954,29 +2420,6 @@ class RedesignAndFixScenarios(unittest.TestCase):
         )
         for marker in ("bomb_seconds", "draw_bomb_panel", "bomb_timer", "defuse_duration"):
             self.assertNotIn(marker, source, marker)
-        self.assertNotIn('"bomb" "1"', screen_app.gsi_config_text())
-
-    def test_faceit_disables_gsi_listener_in_the_worker(self) -> None:
-        panel = UiAndConnectionScenarios.make_panel(self)
-        panel.stop_event = FastEvent()
-        panel.screen_connected = TrackingEvent()
-        started: list[object] = []
-
-        class CountingGSI(FakeGSI):
-            def start(self) -> None:
-                started.append(self)
-
-        patches = list(UiAndConnectionScenarios.worker_patches(self))
-        patches[0] = patch.object(gui, "GSIServer", CountingGSI)
-        patches[2] = patch.object(gui, "faceit_ac_is_running", return_value=True)
-        screen = FakeScreen(panel.stop_event)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
-                patches[6], patches[7], patches[8], patches[9], \
-                patch.object(gui, "ScreenSession", return_value=screen):
-            panel._screen_worker()
-        self.assertEqual(started, [])
-        self.assertGreaterEqual(screen.show_count, 1)
-        panel.close()
 
     def test_every_new_screen_renders_in_both_languages(self) -> None:
         import importlib.util
@@ -3023,27 +2466,6 @@ class RedesignAndFixScenarios(unittest.TestCase):
         self.assertEqual(calls[-1], "frame")
         self.assertEqual(session.display.lcd_serial.write_timeout,
                          screen_app.SERIAL_WRITE_TIMEOUT_SECONDS)
-
-    def test_gsi_rejects_browser_origin_and_unknown_token(self) -> None:
-        import http.client
-        state = screen_app.CS2GameState()
-        with patch.object(screen_app, "GSI_PORT", 38797):
-            server = screen_app.GSIServer(state)
-        server.start()
-        try:
-            def post(body, headers=None):
-                connection = http.client.HTTPConnection("127.0.0.1", 38797, timeout=3)
-                connection.request("POST", "/", json.dumps(body), headers or {})
-                return connection.getresponse().status
-
-            token = screen_app.gsi_token()
-            self.assertEqual(post({"auth": {"token": token}}, {"Origin": "https://x"}), 403)
-            post({"auth": {"token": "cs2-screen-local-v1"}, "map": {"phase": "live"}})
-            self.assertEqual(state._data, {})
-            post({"auth": {"token": token}, "map": {"phase": "live"}})
-            self.assertEqual(state._data.get("map"), {"phase": "live"})
-        finally:
-            server.close()
 
     def test_lghub_reader_survives_timeout_mid_frame_and_answers_ping(self) -> None:
         import socket
@@ -3154,7 +2576,6 @@ class RedesignAndFixScenarios(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # v1.1.1 regression scenarios
 # ---------------------------------------------------------------------------
-from app import GameSnapshot  # noqa: E402
 from battery_runtime import BatterySnapshot  # noqa: E402
 
 
@@ -3261,8 +2682,8 @@ class HermeticEnvironmentScenarios(unittest.TestCase):
         root = _TEST_ROOT.resolve()
         for path in (
             gui.APP_DATA, gui.SETTINGS_PATH, gui.RUNTIME_LOG_PATH, gui.INSTANCE_STATE_PATH,
-            gui.STARTUP_TASK_STATE_PATH, screen_app.APP_DATA, screen_app.GSI_TOKEN_PATH,
-            screen_app.SENSOR_CACHE_PATH, screen_app.DEATHMATCH_CACHE_PATH,
+            gui.STARTUP_TASK_STATE_PATH, screen_app.APP_DATA,
+            screen_app.SENSOR_CACHE_PATH,
             app_log.LOG_DIR, msfs_runtime.LANDING_HISTORY_PATH,
         ):
             self.assertTrue(Path(path).resolve().is_relative_to(root), path)
@@ -3285,8 +2706,6 @@ class HermeticEnvironmentScenarios(unittest.TestCase):
             psutil.Process(os.getpid()).terminate()
         with self.assertRaises(HardwareAccessBlocked):
             screen_app.ScreenSession("COM3", 50)
-        with self.assertRaises(HardwareAccessBlocked):
-            gui.install_gsi_config()
 
     def test_set_windows_autostart_cannot_reach_the_real_scheduler(self) -> None:
         with self.assertRaises(Exception):
@@ -3358,13 +2777,9 @@ class Fix111Base(unittest.TestCase):
         self.addCleanup(panel.close)
         return panel
 
-    def worker_patches(self, *, cs2=False, faceit=False, msfs=False, game=None, weather=None):
-        state = SimpleNamespace(snapshot=lambda: game or GameSnapshot())
+    def worker_patches(self, *, cs2=False, msfs=False, weather=None):
         return [
-            patch.object(gui, "GSIServer", FakeGSI),
-            patch.object(gui, "CS2GameState", return_value=state),
             patch.object(gui, "cs2_is_running", return_value=cs2),
-            patch.object(gui, "faceit_ac_is_running", return_value=faceit),
             patch.object(gui, "msfs_session_seconds", return_value=60.0 if msfs else None),
             patch.object(gui, "get_metrics", return_value={}),
             patch.object(gui, "MediaSessionMonitor", side_effect=lambda: FakeMonitor(MediaSnapshot())),
@@ -3375,8 +2790,6 @@ class Fix111Base(unittest.TestCase):
                 gui, "WeatherMonitor",
                 side_effect=weather or (lambda *_a: FakeMonitor(WeatherSnapshot())),
             ),
-            patch.object(gui.FACEIT_PING_MONITOR, "read", return_value=[]),
-            patch.object(gui.STEAM_PING_MONITOR, "read", return_value=[]),
         ]
 
     def run_worker(self, panel, *, cycles=3, hooks=None, design_renders=None, classic_renders=None,
@@ -3584,7 +2997,7 @@ class OrientationScenarios(Fix111Base):
             "gpu_load": 18.0, "gpu_temp": 42.0, "gpu_memory": 920.0,
             "ram_load": 52.0, "ram_used": 16.5,
         }
-        classic = screen_app.render_screen(metrics, GameSnapshot(), False, dict(gui.PALETTES["Kuzey"]))
+        classic = screen_app.render_screen(metrics, dict(gui.PALETTES["Kuzey"]))
         new = screens_new.render_new_screen(screens_new.NewScreenContext({}, (), ()))
         for frame in (classic, new):
             for rotation in screen_app.SUPPORTED_ROTATIONS:
@@ -3617,10 +3030,7 @@ class OrientationScenarios(Fix111Base):
 
 class DesignSwitchScenarios(Fix111Base):
     def test_classic_design_never_uses_the_new_renderer(self) -> None:
-        cases = {
-            "desktop": {}, "cs2": {"cs2": True, "game": GameSnapshot(connected=True, in_match=True)},
-            "faceit": {"faceit": True}, "msfs": {"msfs": True},
-        }
+        cases = {"desktop": {}, "cs2": {"cs2": True}, "msfs": {"msfs": True}}
         for name, kwargs in cases.items():
             with self.subTest(mode=name):
                 panel = self.make_panel({"design": "classic"})
@@ -3629,34 +3039,25 @@ class DesignSwitchScenarios(Fix111Base):
                 self.run_worker(panel, design_renders=new_calls, classic_renders=classic_calls, **kwargs)
                 self.assertEqual(new_calls, [])
                 self.assertTrue(classic_calls)
+                # The classic renderer is told when to use the CS2 colours.
+                self.assertEqual(classic_calls[-1].get("cs2_active"), name == "cs2")
 
     def test_new_design_selects_the_mode_for_every_context(self) -> None:
         cases = {
             "desktop": ({}, "desktop"),
-            "cs2-buy": ({"cs2": True, "game": GameSnapshot(connected=True, in_match=True,
-                                                          round_phase="freezetime")}, "cs2"),
-            "cs2-death": ({"cs2": True, "game": GameSnapshot(connected=True, in_match=True,
-                                                            round_phase="live", alive=False)}, "cs2"),
-            "cs2-live": ({"cs2": True, "game": GameSnapshot(connected=True, in_match=True,
-                                                           round_phase="live", alive=True)}, "cs2"),
-            "faceit": ({"faceit": True, "cs2": True}, "faceit"),
+            "cs2": ({"cs2": True}, "cs2"),
+            "cs2+msfs": ({"cs2": True, "msfs": True}, "cs2"),
             "msfs": ({"msfs": True}, "msfs"),
         }
-        expected_screen = {"cs2-buy": "live", "cs2-death": "death", "cs2-live": "live"}
         for name, (kwargs, mode) in cases.items():
             with self.subTest(case=name):
                 panel = self.make_panel({"design": "new"})
                 new_calls: list = []
                 classic_calls: list = []
-                with patch.object(gui, "DEATH_SCREEN_DELAY", 0.0):
-                    self.run_worker(panel, design_renders=new_calls, classic_renders=classic_calls, **kwargs)
+                self.run_worker(panel, design_renders=new_calls, classic_renders=classic_calls, **kwargs)
                 self.assertEqual(classic_calls, [])
                 self.assertTrue(new_calls)
                 self.assertEqual(new_calls[-1].mode, mode)
-                if name in expected_screen:
-                    self.assertEqual(new_calls[-1].cs_screen, expected_screen[name])
-                if mode == "faceit":
-                    self.assertIsNone(new_calls[-1].game)
                 if mode == "msfs":
                     self.assertIsNotNone(new_calls[-1].flight_state)
 
@@ -3684,9 +3085,7 @@ class DesignSwitchScenarios(Fix111Base):
         panel = self.make_panel({"design": "new"})
         panel.design_combo.setCurrentIndex(panel.design_combo.findData("classic"))
         started: list = []
-        with patch.object(panel, "_install_gsi"), patch.object(
-            gui.threading.Thread, "start", lambda thread: started.append(thread),
-        ):
+        with patch.object(gui.threading.Thread, "start", lambda thread: started.append(thread)):
             panel.start_screen()
         self.assertEqual(panel.settings["design"], "classic")
         self.assertEqual(gui.load_settings()["design"], "classic")
@@ -3783,7 +3182,6 @@ class WorkerLifecycleScenarios(Fix111Base):
             patch.object(gui, "ScreenSession", side_effect=factory),
             patch.object(gui, "render_new_screen", side_effect=_varying_frames()),
             patch.object(gui, "render_screen", side_effect=_varying_frames()),
-            patch.object(panel, "_install_gsi"),
         ]
         for item in patches:
             item.start()
@@ -4011,20 +3409,8 @@ class BatteryPresenceAndRamScenarios(unittest.TestCase):
                 layout = sn.draw_strip(Image.new("RGB", (480, 320)), ctx, "#000", "#FFF")
                 self.assertIn("ram", dict(layout))
 
-    def test_faceit_and_msfs_have_no_ram_and_reflow_batteries(self) -> None:
+    def test_msfs_strip_has_no_ram(self) -> None:
         import screens_new as sn
-        for kinds in self.device_combinations():
-            ctx = sn.NewScreenContext(self.metrics(), self.devices(kinds), mode="faceit")
-            items = sn.faceit_battery_layout(ctx)
-            self.assertEqual([item[0].kind for item in items], list(kinds))
-            spans = [(item[1], item[1] + item[4] + item[6]) for item in items]
-            for left, right in spans:
-                self.assertGreaterEqual(left, 26 - 0.5)
-                self.assertLessEqual(right, 480 - 26 + 0.5)
-            for (_l1, r1), (l2, _r2) in zip(spans, spans[1:]):
-                self.assertLess(r1, l2)
-            frame = sn.render_new_screen(ctx)
-            self.assertEqual(frame.size, (480, 320))
         # The MSFS strip never carries RAM.
         from msfs_runtime import FlightPhaseState
         ctx = sn.NewScreenContext(self.metrics(), (), mode="msfs", flight=FlightTelemetry(),
@@ -4044,10 +3430,9 @@ class BatteryPresenceAndRamScenarios(unittest.TestCase):
             drawn.append(value)
             return original(draw, xy, value, *args, **kwargs)
 
-        for mode in ("desktop", "cs2", "faceit"):
+        for mode in ("desktop", "cs2"):
             drawn.clear()
-            ctx = sn.NewScreenContext(self.metrics(), self.devices(("mouse",)), mode=mode, fps=200,
-                                      game=GameSnapshot(connected=True, in_match=True), cs_screen="live")
+            ctx = sn.NewScreenContext(self.metrics(), self.devices(("mouse",)), mode=mode, fps=200)
             with patch.object(sn, "text", side_effect=capture):
                 sn.render_new_screen(ctx)
             joined = " ".join(drawn)
@@ -4061,11 +3446,11 @@ class BatteryPresenceAndRamScenarios(unittest.TestCase):
             "gpu_load": 18.0, "gpu_temp": 42.0, "gpu_memory": 920.0,
             "ram_load": 52.0, "ram_used": 16.5,
         }
-        empty = screen_app.render_screen(metrics, GameSnapshot(), False, dict(screen_app.COLORS))
+        empty = screen_app.render_screen(metrics, dict(screen_app.COLORS))
         for kinds in self.device_combinations():
             devices = self.devices(kinds)
             frame = screen_app.render_screen(
-                metrics, GameSnapshot(), False, dict(screen_app.COLORS), battery_devices=devices,
+                metrics, dict(screen_app.COLORS), battery_devices=devices,
             )
             self.assertEqual(frame.size, (480, 320))
             changed = ImageChops.difference(frame, empty).getbbox()
@@ -4126,51 +3511,15 @@ class BatteryPresenceAndRamScenarios(unittest.TestCase):
 class MouseDpiScenarios(unittest.TestCase):
     """G HUB DPI next to the mouse battery: read-only and overlap-free."""
 
-    APPS = {"applications": [
-        {"applicationId": "desk", "name": "APPLICATION_NAME_DESKTOP", "applicationPath": "", "processId": 0},
-        {"applicationId": "cs", "name": "Counter-Strike: Global Offensive",
-         "applicationPath": "C:\\Steam\\steamapps\\common\\Counter-Strike Global Offensive\\",
-         "processId": 10088},
-    ]}
-    PROFILES = {"profiles": [
-        {"id": "p-desk", "applicationId": "desk", "activeForApplication": True,
-         "assignments": [{"slotId": "prox2wirelessmouse_mouse_sensitivity", "cardId": "c-desk"}]},
-        {"id": "p-cs", "applicationId": "cs", "activeForApplication": True,
-         "assignments": [{"slotId": "prox2wirelessmouse_mouse_sensitivity", "cardId": "c-cs"}]},
-    ]}
-    CARDS = {
-        "c-cs": {"mouseSensitivity": {"presetId": "preset-cs", "activeDpiIndex": 1}},
-        "preset-cs": {"mouseSettings": {"advancedDpiTable": {"entries": {
-            "1": {"disabled": False, "dpi": 800}, "2": {"disabled": True, "dpi": 1200},
-        }}}},
-    }
-
-    def fake_lghub(self, dpi: int, active_profile: str, cs_running: bool = True):
+    def fake_lghub(self, dpi: int):
         import battery_runtime as br
         sent: list[dict] = []
         replies: list[str] = []
-        apps = json.loads(json.dumps(self.APPS))
-        if not cs_running:
-            apps["applications"][1]["processId"] = 0
-
-        def respond(message: dict) -> dict:
-            path = message["path"]
-            if path.startswith("/mouse/"):
-                return {"dpi": dpi, "dpiIndex": 1}
-            if path == "/profile/active":
-                return {"id": active_profile}
-            if path == "/applications":
-                return apps
-            if path == "/profiles":
-                return self.PROFILES
-            if path == "/card":
-                return self.CARDS.get(message["payload"]["id"])
-            return None
 
         def send(_stream, text):
             message = json.loads(text)
             sent.append(message)
-            payload = respond(message)
+            payload = {"dpi": dpi, "dpiIndex": 1} if message["path"].startswith("/mouse/") else None
             replies.append(json.dumps({
                 "msgId": message["msgId"],
                 "result": {"code": "SUCCESS" if payload is not None else "NO_SUCH_PATH"},
@@ -4189,43 +3538,19 @@ class MouseDpiScenarios(unittest.TestCase):
         )
         return patches, sent
 
-    def read(self, dpi, active_profile, cs_running=True):
+    def test_dpi_read_is_a_single_read_only_request(self) -> None:
         import battery_runtime as br
-        patches, sent = self.fake_lghub(dpi, active_profile, cs_running)
+        patches, sent = self.fake_lghub(800)
         with patches[0], patches[1], patches[2]:
-            reading, profile = br.read_lghub_mouse_dpi("dev3")
-        self.assertTrue(sent)
-        self.assertEqual({message["verb"] for message in sent}, {"GET"}, "G HUB access must be read-only")
-        return reading, profile
+            self.assertEqual(br.read_lghub_mouse_dpi("dev3"), 800)
+        self.assertEqual([(m["verb"], m["path"]) for m in sent], [("GET", "/mouse/dev3/dpi")])
 
-    def test_cs2_profile_with_matching_dpi_is_not_a_warning(self) -> None:
-        reading, profile = self.read(800, "p-cs")
-        self.assertEqual((reading.dpi, reading.game_running, reading.game_profile_active,
-                          reading.game_expected_dpi), (800, True, True, 800))
-        self.assertFalse(reading.warning)
-        self.assertEqual(profile, (True, True, 800))
-
-    def test_desktop_profile_while_cs2_runs_is_a_warning(self) -> None:
-        reading, _profile = self.read(1200, "p-desk")
-        self.assertFalse(reading.game_profile_active)
-        self.assertTrue(reading.warning)
-
-    def test_dpi_mismatch_inside_cs2_profile_is_a_warning(self) -> None:
-        reading, _profile = self.read(1600, "p-cs")
-        self.assertTrue(reading.warning)
-
-    def test_no_warning_when_cs2_is_not_running(self) -> None:
-        reading, _profile = self.read(1200, "p-desk", cs_running=False)
-        self.assertFalse(reading.game_running)
-        self.assertFalse(reading.warning)
-
-    def test_cached_profile_skips_profile_queries(self) -> None:
+    def test_no_game_profile_lookup_remains(self) -> None:
         import battery_runtime as br
-        patches, sent = self.fake_lghub(800, "p-cs")
-        with patches[0], patches[1], patches[2]:
-            reading, _ = br.read_lghub_mouse_dpi("dev3", (True, True, 800), refresh_profile=False)
-        self.assertEqual([message["path"] for message in sent], ["/mouse/dev3/dpi"])
-        self.assertFalse(reading.warning)
+        for name in ("MouseDpiReading", "parse_lghub_game_profile", "parse_lghub_expected_dpi",
+                     "LGHUB_GAME_APP_MARKERS"):
+            self.assertFalse(hasattr(br, name), name)
+        self.assertNotIn("dpi_warning", {f.name for f in dataclasses.fields(BatteryDevice)})
 
     def test_monitor_attaches_dpi_only_to_the_mouse(self) -> None:
         import battery_runtime as br
@@ -4236,12 +3561,11 @@ class MouseDpiScenarios(unittest.TestCase):
             BatteryDevice("lghub:slug-m", "PRO X", 82, "mouse"),
             BatteryDevice("lghub:slug-h", "PRO X WIRELESS", 18, "headset"),
         ]
-        reading = br.MouseDpiReading(1200, True, False, 800)
-        with patch.object(br, "read_lghub_mouse_dpi", return_value=(reading, (True, False, 800))) as read:
+        with patch.object(br, "read_lghub_mouse_dpi", return_value=1200) as read:
             result = monitor._with_mouse_dpi(devices)
             again = monitor._with_mouse_dpi(devices)
         read.assert_called_once()  # second call is within DPI_REFRESH_SECONDS
-        self.assertEqual((result[0].dpi, result[0].dpi_warning), (1200, True))
+        self.assertEqual(result[0].dpi, 1200)
         self.assertIsNone(result[1].dpi)
         self.assertEqual(again[0].dpi, 1200)
         with patch.object(br, "read_lghub_mouse_dpi", side_effect=ConnectionError("G HUB closed")):
@@ -4251,7 +3575,7 @@ class MouseDpiScenarios(unittest.TestCase):
 
     def test_dpi_is_drawn_next_to_the_mouse_without_overlap(self) -> None:
         import screens_new as sn
-        mouse = BatteryDevice("m", "PRO X", 82, "mouse", dpi=12000, dpi_warning=True)
+        mouse = BatteryDevice("m", "PRO X", 82, "mouse", dpi=12000)
         others = (BatteryDevice("k", "G915", 64, "keyboard"), BatteryDevice("h", "Head", 18, "headset"))
         for count in range(1, 4):
             devices = (mouse, *others[: count - 1])
@@ -4261,7 +3585,7 @@ class MouseDpiScenarios(unittest.TestCase):
                     fps=999, mode="cs2",
                 )
                 info = sn.present_batteries(devices)[0]
-                self.assertEqual(sn.battery_value_parts(info)[1], (" · 12000", sn.ORANGE))
+                self.assertEqual(sn.battery_value_parts(info)[1], (" · 12000", sn.TEXT))
                 strip = sn.draw_strip(Image.new("RGB", (480, 320)), ctx, "#000", "#FFF")
                 BatteryPresenceAndRamScenarios.assert_disjoint(self, strip, ("strip", count))
                 self.assertIn("battery:mouse", dict(strip))
@@ -4272,11 +3596,6 @@ class MouseDpiScenarios(unittest.TestCase):
                     needed = (draw.textlength(label, font=sn.font(14))
                               + sn._parts_width(draw, sn.battery_value_parts(_info), 14) + 20 + 6)
                     self.assertLessEqual(needed, right - left, (count, language, _info.kind))
-                items = sn.faceit_battery_layout(sn.NewScreenContext({}, devices, language=language))
-                spans = [(item[1], item[1] + item[4] + item[6]) for item in items]
-                for (_l1, r1), (l2, _r2) in zip(spans, spans[1:]):
-                    self.assertLess(r1, l2)
-                self.assertLessEqual(spans[-1][1], 480 - 26 + 0.5)
         plain = sn.present_batteries((BatteryDevice("m", "PRO X", 82, "mouse", dpi=800),))[0]
         self.assertEqual(sn.battery_value_parts(plain)[1], (" · 800", sn.TEXT))
         # DPI is never attached to a non-mouse device.
@@ -4293,11 +3612,11 @@ class MouseDpiScenarios(unittest.TestCase):
         others = (BatteryDevice("k", "G915", 64, "keyboard"), BatteryDevice("h", "Head", 18, "headset"))
         for count in (1, 2, 3):
             with_dpi = screen_app.render_screen(
-                metrics, GameSnapshot(), False, dict(screen_app.COLORS),
+                metrics, dict(screen_app.COLORS),
                 battery_devices=(mouse, *others[: count - 1]),
             )
             without = screen_app.render_screen(
-                metrics, GameSnapshot(), False, dict(screen_app.COLORS),
+                metrics, dict(screen_app.COLORS),
                 battery_devices=(plain, *others[: count - 1]),
             )
             changed = ImageChops.difference(with_dpi, without).getbbox()
@@ -4334,7 +3653,6 @@ class RealUserInteractionScenarios(unittest.TestCase):
             patch.object(gui, "get_auto_hardware_labels", return_value={"cpu": "", "gpu": "", "ram": ""}),
             patch.object(gui, "get_metrics", return_value={}),
             patch.object(gui.ControlPanel, "_screen_worker", lambda panel: recorder.append(dict(panel.settings))),
-            patch.object(gui.ControlPanel, "_install_gsi", lambda panel, quiet=False: None),
             patch.object(gui.ControlPanel, "_apply_autostart_async", lambda panel, enabled: autostart.append(enabled)),
         )
         for item in patches:
@@ -4580,190 +3898,6 @@ class TaskManagerParity113Tests(unittest.TestCase):
                 screen_app._log_metric_sources_once("cpuX", "gpuX", "NVML", True)
         log.assert_called_once()
         self.assertIn("cpu=cpuX", log.call_args[0][1])
-
-
-class Cs2MenuMode113Tests(unittest.TestCase):
-    """v1.1.3: CS2 running never falls back to the desktop screen."""
-
-    def test_mode_selection(self) -> None:
-        import screens_new as sn
-        self.assertEqual(sn.new_design_mode(False, True, False), "cs2_menu")
-        self.assertEqual(sn.new_design_mode(False, True, True), "cs2")
-        self.assertEqual(sn.new_design_mode(True, True, True), "faceit")
-        self.assertEqual(sn.new_design_mode(True, False, False), "faceit")
-        self.assertEqual(sn.new_design_mode(False, False, False, True), "msfs")
-        self.assertEqual(sn.new_design_mode(False, False, False), "desktop")
-
-    def test_round_screens(self) -> None:
-        import screens_new as sn
-
-        def game(**kw):
-            return screen_app.GameSnapshot(connected=True, in_match=True, **kw)
-
-        self.assertEqual(sn.cs_screen_for(game(round_phase="freezetime", alive=True)), "live")
-        self.assertEqual(sn.cs_screen_for(game(round_phase="live", alive=True)), "live")
-        self.assertEqual(sn.cs_screen_for(game(round_phase="live", alive=False)), "death")
-        self.assertEqual(sn.cs_screen_for(game(round_phase="over", alive=True)), "death")
-        self.assertEqual(sn.cs_screen_for(game(round_phase="", alive=True)), "live")
-
-    def test_menu_status_text(self) -> None:
-        import screens_new as sn
-        self.assertEqual(sn.cs2_menu_status(False, True), "restart")
-        self.assertEqual(sn.cs2_menu_status(False, False), "waiting")
-        self.assertEqual(sn.cs2_menu_status(True, False), "menu")
-
-    def test_menu_screen_renders_cs2_palette_with_pings(self) -> None:
-        import screens_new as sn
-        from i18n import translate
-        metrics = {"cpu_load": 40.0, "gpu_load": 55.0, "cpu_temp": 60.0, "gpu_temp": 65.0,
-                   "ram_load": 40.0}
-        for mode in ("cs2_menu", "cs2"):
-            ctx = sn.NewScreenContext(metrics, mode=mode, status="menu",
-                                      pings=(("FRA", 20.0), ("VIE", 90.0)))
-            frame = sn.render_new_screen(ctx)
-            self.assertEqual(frame.size, (480, 320))
-            self.assertEqual(frame.getpixel((240, 318)), sn._rgb(sn.MODE_CS2[0]))
-            self.assertEqual(frame.getpixel((2, 2)), sn._rgb(sn.MODE_CS2[1]))
-            self.assertIn("pings", sn.cs_menu_layout(ctx))
-        ctx = sn.NewScreenContext(metrics, mode="cs2_menu", status="restart", language="en")
-        sn.render_new_screen(ctx)
-        self.assertNotIn("pings", sn.cs_menu_layout(ctx))
-        self.assertEqual(translate("CS2'yi yeniden başlat · oyun verisi için", "en"),
-                         "Restart CS2 to enable game data")
-
-    def test_restart_needed_when_cfg_newer_than_cs2(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            cfg = Path(directory) / screen_app.GSI_CONFIG_NAME
-            cfg.write_text("x", encoding="utf-8")
-            mtime = cfg.stat().st_mtime
-            with patch.dict(screen_app.GSI_AUTH_STATE, {"rejected_at": None}):
-                self.assertTrue(screen_app.gsi_restart_needed(mtime - 3 * 3600, cfg))
-                self.assertFalse(screen_app.gsi_restart_needed(mtime + 60, cfg))
-                self.assertFalse(screen_app.gsi_restart_needed(mtime - 3600, cfg, connected=True))
-                self.assertFalse(screen_app.gsi_restart_needed(0.0, cfg))
-            with patch.dict(screen_app.GSI_AUTH_STATE, {"rejected_at": 1000.0}):
-                self.assertTrue(screen_app.gsi_restart_needed(mtime + 60, cfg, now=1005.0))
-                self.assertFalse(screen_app.gsi_restart_needed(mtime + 60, cfg, now=1100.0))
-
-    def test_gsi_token_is_stable_across_runs(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "gsi-token.txt"
-            with patch.object(screen_app, "GSI_TOKEN_PATH", path), \
-                    patch.object(screen_app, "_GSI_TOKEN_CACHE", None):
-                first = screen_app.gsi_token()
-            with patch.object(screen_app, "GSI_TOKEN_PATH", path), \
-                    patch.object(screen_app, "_GSI_TOKEN_CACHE", None):
-                second = screen_app.gsi_token()
-            self.assertEqual(first, second)
-            self.assertEqual(path.read_text(encoding="ascii"), first)
-
-
-class GsiReplay113Tests(unittest.TestCase):
-    """Replay real CS2 POSTs with Valve's HTTP client headers."""
-
-    TOKEN = "R524F" + "x" * 38
-
-    def setUp(self) -> None:
-        import http.client
-        self.http_client = http.client
-        self.state = screen_app.CS2GameState()
-        self.server = screen_app.http.server.ThreadingHTTPServer(
-            ("127.0.0.1", 0), screen_app._GSIHandler,
-        )
-        self.server.game_state = self.state
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        patcher = patch.object(screen_app, "_GSI_TOKEN_CACHE", self.TOKEN)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        state_patch = patch.dict(screen_app.GSI_AUTH_STATE, {"rejected_at": None})
-        state_patch.start()
-        self.addCleanup(state_patch.stop)
-
-    def tearDown(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-
-    def post(self, payload: dict, chunked: bool = False, extra: dict | None = None) -> int:
-        body = json.dumps(payload, indent="\t").encode("utf-8")
-        connection = self.http_client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
-        headers = {"User-Agent": "Valve/Steam HTTP Client 1.0", "Content-Type": "application/json",
-                   "Accept": "text/html,*/*;q=0.9", "Accept-Charset": "ISO-8859-1,utf-8,*;q=0.7"}
-        headers.update(extra or {})
-        if chunked:
-            connection.putrequest("POST", "/")
-            for key, value in headers.items():
-                connection.putheader(key, value)
-            connection.putheader("Transfer-Encoding", "chunked")
-            connection.endheaders()
-            connection.send(b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body))
-        else:
-            connection.request("POST", "/", body=body, headers=headers)
-        status = connection.getresponse().status
-        connection.close()
-        return status
-
-    def menu_payload(self, token: str | None = None) -> dict:
-        return {
-            "provider": {"name": "Counter-Strike: Global Offensive", "appid": 730, "version": 14080,
-                         "steamid": "76561198000000001", "timestamp": 1760100000},
-            "player": {"steamid": "76561198000000001", "name": "erkan", "activity": "menu"},
-            "auth": {"token": token or self.TOKEN},
-        }
-
-    def match_payload(self, phase: str = "live", health: int = 100) -> dict:
-        payload = self.menu_payload()
-        payload["map"] = {"mode": "competitive", "name": "de_mirage", "phase": phase, "round": 3,
-                          "team_ct": {"score": 2, "consecutive_round_losses": 0},
-                          "team_t": {"score": 1, "consecutive_round_losses": 1}}
-        payload["round"] = {"phase": "freezetime" if phase == "freeze" else "live"}
-        payload["player"] = {
-            "steamid": "76561198000000001", "name": "erkan", "team": "CT", "activity": "playing",
-            "state": {"health": health, "armor": 100, "money": 3200, "round_kills": 0,
-                      "round_killhs": 0},
-            "match_stats": {"kills": 3, "assists": 1, "deaths": 2, "mvps": 0, "score": 8},
-        }
-        if phase == "freeze":
-            payload["map"]["phase"] = "live"
-        return payload
-
-    def test_menu_payload_is_accepted_and_selects_cs2_menu(self) -> None:
-        import screens_new as sn
-        self.assertEqual(self.post(self.menu_payload()), 200)
-        snapshot = self.state.snapshot()
-        self.assertTrue(snapshot.connected)
-        self.assertFalse(snapshot.in_match)
-        self.assertEqual(screen_app.GSI_AUTH_STATE["last_status"], "accepted")
-        self.assertEqual(sn.new_design_mode(False, True, snapshot.in_match), "cs2_menu")
-        self.assertEqual(sn.cs2_menu_status(snapshot.connected, False), "menu")
-        self.assertIn("last=accepted", screen_app.gsi_request_summary())
-
-    def test_match_payloads_select_round_screens(self) -> None:
-        import screens_new as sn
-        for phase, health, expected in (
-            ("warmup", 100, "live"), ("live", 100, "live"), ("freeze", 100, "live"),
-            ("live", 0, "death"),
-        ):
-            self.assertEqual(self.post(self.match_payload(phase, health)), 200)
-            snapshot = self.state.snapshot()
-            self.assertTrue(snapshot.in_match, phase)
-            self.assertEqual(sn.new_design_mode(False, True, snapshot.in_match), "cs2")
-            self.assertEqual(sn.cs_screen_for(snapshot), expected, phase)
-
-    def test_chunked_body_is_accepted(self) -> None:
-        self.assertEqual(self.post(self.menu_payload(), chunked=True), 200)
-        self.assertTrue(self.state.snapshot().connected)
-
-    def test_old_token_is_rejected_and_triggers_restart_hint(self) -> None:
-        self.assertEqual(self.post(self.menu_payload(token="legacy-fixed-token-value")), 200)
-        self.assertFalse(self.state.snapshot().connected)
-        self.assertEqual(screen_app.GSI_AUTH_STATE["last_reason"], "token mismatch")
-        self.assertTrue(screen_app.gsi_restart_needed(cs2_started_at=0.0))
-
-    def test_browser_origin_is_rejected(self) -> None:
-        status = self.post(self.menu_payload(), extra={"Origin": "https://evil.example"})
-        self.assertEqual(status, 403)
-        self.assertFalse(self.state.snapshot().connected)
 
 
 class BatteryDiscoveryRetry113Tests(unittest.TestCase):
@@ -5211,8 +4345,9 @@ def _test_render_bug_keeps_usb_session(self) -> None:
         return {}
 
     patches = list(self.worker_patches())
-    patches[4] = patch.object(gui, "get_metrics", side_effect=metrics)
-    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6],             patches[7], patches[8], patches[9], patch.object(
+    patches[2] = patch.object(gui, "get_metrics", side_effect=metrics)
+    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], \
+            patches[7], patch.object(
                 gui, "ScreenSession", side_effect=lambda *_a: sessions.append(1) or screen):
         panel._screen_worker()
     self.assertEqual(len(sessions), 1)
@@ -5330,7 +4465,7 @@ class Audit116Scenarios(unittest.TestCase):
 
 
 class FixedLayoutAndTearingScenarios(unittest.TestCase):
-    """v1.1.8: tabular fixed slots, widget-aligned dirty rects, deathmatch."""
+    """v1.1.8: tabular fixed slots and widget-aligned dirty rects."""
 
     @staticmethod
     def metrics(value):
@@ -5377,16 +4512,20 @@ class FixedLayoutAndTearingScenarios(unittest.TestCase):
                     width = sn._tlen(label, sn.font(12), 1.0)
                     self.assertLessEqual(width, box[2] - box[0] + 1)
 
-    def test_desktop_and_faceit_positions_do_not_move_with_values(self) -> None:
+    def test_desktop_and_cs2_positions_do_not_move_with_values(self) -> None:
+        import datetime as dt
         import screens_new as sn
-        mains, faceits = [], []
-        for value in (1, 11, 33, 100):
-            ctx = sn.NewScreenContext(self.metrics(value), self.devices(value), mode="desktop")
-            layout = sn.main_layout(ctx)
-            mains.append((layout["clock"], layout["ram"], layout["cpu"], layout["gpu"]))
-            faceits.append([item[1:3] for item in sn.faceit_battery_layout(ctx)])
+        now = dt.datetime(2026, 10, 19, 21, 45)
+        mains = []
+        for mode in ("desktop", "cs2"):
+            for value in (1, 11, 33, 100):
+                ctx = sn.NewScreenContext(self.metrics(value), self.devices(value), now=now, mode=mode)
+                layout = sn.main_layout(ctx)
+                mains.append((
+                    layout["clock"], layout["ram"], layout["cpu"], layout["gpu"],
+                    tuple(box for _info, box in layout["batteries"]),
+                ))
         self.assertEqual(len(set(mains)), 1)
-        self.assertTrue(all(f == faceits[0] for f in faceits))
 
     def test_digits_are_tabular(self) -> None:
         import screens_new as sn
@@ -5454,60 +4593,129 @@ class FixedLayoutAndTearingScenarios(unittest.TestCase):
         self.assertIsNone(ImageChops.difference(sent, new).getbbox())
         self.assertGreater(len(all_regions), 1)
 
-    def test_deathmatch_never_shows_the_death_screen(self) -> None:
-        import screens_new as sn
-        dead = GameSnapshot(connected=True, in_match=True, game_mode="deathmatch", alive=False)
-        self.assertEqual(sn.cs_screen_for(dead), "live")
-        gate = sn.DeathScreenGate(3.0)
-        comp = GameSnapshot(connected=True, in_match=True, game_mode="competitive", alive=False)
-        self.assertEqual(gate.update(sn.cs_screen_for(comp), 0.0), "live")
-        self.assertEqual(gate.update(sn.cs_screen_for(comp), 2.9), "live")
-        self.assertEqual(gate.update(sn.cs_screen_for(comp), 3.1), "death")
+class Cs2ThemeScenarios(Fix111Base):
+    """CS2 running only recolours the normal desktop screen (orange theme)."""
 
-    def test_deathmatch_replay_sends_only_small_value_updates(self) -> None:
-        import random
-        import screens_new as sn
-        rng = random.Random(7)
-        stabilizer = sn.ScreenStabilizer()
-        gate = sn.DeathScreenGate(3.0)
-        sent = None
-        pixels = 0
-        kinds = []
-        now, alive, next_toggle = 0.0, True, 4.0
-        while now < 60.0:
-            if now >= next_toggle:
-                alive = not alive
-                next_toggle = now + rng.uniform(3.0, 8.0)
-            game = GameSnapshot(connected=True, in_match=True, game_mode="deathmatch",
-                                alive=alive, round_phase="live")
-            mode, cs_screen, _phase = stabilizer.update(
-                ("cs2", gate.update(sn.cs_screen_for(game), now), ""), now)
-            metrics = {"cpu_load": rng.randint(5, 100), "cpu_temp": rng.randint(50, 90),
-                       "gpu_load": rng.randint(5, 100), "gpu_temp": rng.randint(50, 90),
-                       "ram_load": 60.0}
-            frame = sn.render_new_screen(sn.NewScreenContext(
-                metrics, (), mode=mode, game=game, cs_screen=cs_screen, fps=None,
-                now=__import__("datetime").datetime(2026, 10, 12, 14, 52)))
-            if sent is None:
-                sent = frame.copy()
-            else:
-                kind, regions = gui.plan_new_design_update(frame, sent)
-                kinds.append(kind)
-                for region in regions:
-                    pixels += gui._rect_area(region)
-                    sent.paste(frame.crop(region), region)
-            now += 0.5
-        self.assertNotIn("wipe", kinds)
-        # Desktop view (rings + values) with fully random metrics every 0.5 s:
-        # still partial updates only, well under half of the bus.
-        self.assertLess(pixels * 2, 256_000 * 60 * 0.40)
+    @staticmethod
+    def metrics() -> dict:
+        return {
+            "cpu_load": 31.0, "cpu_temp": 52.0, "cpu_freq": 4.7,
+            "gpu_load": 64.0, "gpu_temp": 58.0, "gpu_memory": 6100.0,
+            "ram_load": 48.0, "ram_used": 15.4, "ram_total_gb": 32.0,
+        }
 
-
-class CsLiveDesktopViewTests(unittest.TestCase):
-    def test_cs_live_matches_desktop_without_alerts(self):
+    def test_new_design_mode_maps_cs2_and_msfs(self) -> None:
         import screens_new as sn
-        ctx = sn.NewScreenContext(metrics={}, language="en", mode="cs2")
-        self.assertEqual(sn.render_cs_live(ctx).tobytes(), sn.render_main(ctx).tobytes())
+        self.assertEqual(sn.new_design_mode(False, False), "desktop")
+        self.assertEqual(sn.new_design_mode(True, False), "cs2")
+        self.assertEqual(sn.new_design_mode(False, True), "msfs")
+        # CS2 wins when both run: the desktop screen in CS2 colours.
+        self.assertEqual(sn.new_design_mode(True, True), "cs2")
+        self.assertEqual(sn.new_design_mode(False), "desktop")
+
+    def test_new_design_cs2_mode_is_the_desktop_layout_in_cs2_colours(self) -> None:
+        import datetime as dt
+        import screens_new as sn
+        now = dt.datetime(2026, 10, 19, 21, 45)
+        devices = (BatteryDevice("m", "PRO X", 71, "mouse"), BatteryDevice("h", "Head", 18, "headset"))
+        weather = (WeatherReading("Ankara", 22.0, 0),)
+
+        def context(mode: str):
+            return sn.NewScreenContext(
+                self.metrics(), devices, weather, now=now, language="tr", mode=mode,
+            )
+
+        desktop = sn.render_new_screen(context("desktop"))
+        cs2 = sn.render_new_screen(context("cs2"))
+        self.assertEqual(cs2.size, (480, 320))
+        self.assertIsNotNone(ImageChops.difference(desktop, cs2).getbbox())
+        rgb = ImageColor.getrgb
+        self.assertEqual(desktop.getpixel((0, 0)), rgb(sn.MODE_DESKTOP[0]))
+        self.assertEqual(desktop.getpixel((5, 160)), rgb(sn.MODE_DESKTOP[0]))
+        self.assertEqual(cs2.getpixel((5, 160)), rgb(sn.MODE_CS2[0]))
+        # A 3px orange bar runs along the top edge.
+        for x in (0, 240, 479):
+            for y in (0, 2):
+                self.assertEqual(cs2.getpixel((x, y)), rgb(sn.MODE_CS2[2]), (x, y))
+        self.assertEqual(sn.main_theme("cs2")[0], sn.MODE_CS2[0])
+        self.assertEqual(sn.main_theme("desktop")[0], sn.MODE_DESKTOP[0])
+        # Every value and label sits at exactly the same place in both modes.
+        self.assertEqual(sn.main_layout(context("desktop")), sn.main_layout(context("cs2")))
+        drawn: dict[str, list] = {}
+        original = sn.text
+        for mode in ("desktop", "cs2"):
+            calls: list = []
+
+            def capture(draw, xy, value, *args, **kwargs):
+                calls.append((tuple(xy), value))
+                return original(draw, xy, value, *args, **kwargs)
+
+            with patch.object(sn, "text", side_effect=capture):
+                sn.render_new_screen(context(mode))
+            drawn[mode] = calls
+        self.assertEqual(drawn["desktop"], drawn["cs2"])
+
+    def test_classic_cs2_theme_replaces_the_user_palette_and_hides_media(self) -> None:
+        colors = dict(gui.PALETTES["Kuzey"])
+        weather = (WeatherReading("Ankara", 22.0, 0), WeatherReading("Muğla", 19.0, 61))
+        media = MediaSnapshot(platform="Spotify", title="Test", status="playing")
+        spectrum = AudioSpectrumSnapshot(bars=(0.8,) * 16, level=0.8, active=True)
+        rgb = ImageColor.getrgb
+        normal = screen_app.render_screen(self.metrics(), colors, weather_readings=weather)
+        themed = screen_app.render_screen(
+            self.metrics(), colors, weather_readings=weather, cs2_active=True,
+        )
+        self.assertNotEqual(colors["bg"].upper(), screen_app.CS2_THEME_COLORS["bg"].upper())
+        for xy in ((2, 2), (479, 319), (2, 200)):
+            self.assertEqual(normal.getpixel(xy), rgb(colors["bg"]), xy)
+            self.assertEqual(themed.getpixel(xy), rgb(screen_app.CS2_THEME_COLORS["bg"]), xy)
+        # The user's palette does not leak into the CS2 theme.
+        for name, palette in gui.PALETTES.items():
+            other = screen_app.render_screen(
+                self.metrics(), dict(palette), weather_readings=weather, cs2_active=True,
+            )
+            self.assertIsNone(ImageChops.difference(themed, other).getbbox(), name)
+        # Media playing in the background never replaces the weather panel.
+        with_media = screen_app.render_screen(
+            self.metrics(), colors, weather_readings=weather, cs2_active=True,
+            media_snapshot=media, audio_spectrum=spectrum,
+        )
+        self.assertIsNone(ImageChops.difference(themed, with_media).getbbox())
+        media_normal = screen_app.render_screen(
+            self.metrics(), colors, weather_readings=weather,
+            media_snapshot=media, audio_spectrum=spectrum,
+        )
+        self.assertIsNotNone(ImageChops.difference(normal, media_normal).getbbox())
+
+    def test_worker_draws_cs2_theme_and_enters_performance_mode(self) -> None:
+        import screens_new as sn
+        panel = self.make_panel({"design": "new"})
+        panel.stop_event = CycleEvent(3)
+        panel.screen_connected = TrackingEvent()
+        shown: list[Image.Image] = []
+
+        class ImageRecordingScreen(RecordingScreen):
+            def show(self, image) -> None:
+                super().show(image)
+                shown.append(image.copy())
+
+        priority = Mock(return_value=True)
+        patches = self.worker_patches(cs2=True) + [
+            patch.object(gui, "ScreenSession", side_effect=ImageRecordingScreen),
+            patch.object(gui, "set_process_priority", priority),
+        ]
+        for item in patches:
+            item.start()
+        try:
+            panel._screen_worker()
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        self.assertGreaterEqual(len(shown), 2)  # first frame + blank stop frame
+        first = shown[0]
+        self.assertEqual(first.getpixel((240, 1)), ImageColor.getrgb(sn.MODE_CS2[2]))
+        self.assertEqual(first.getpixel((5, 160)), ImageColor.getrgb(sn.MODE_CS2[0]))
+        priority.assert_any_call(below_normal=True)
 
 
 if __name__ == "__main__":

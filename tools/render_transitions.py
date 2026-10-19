@@ -12,11 +12,11 @@ Default throughput is the value measured on the real Rev-A USBMONITOR_3_5
 panel on 2026-10-10: a full 480x320 RGB565 frame (307 KB) takes 1.20 s, i.e.
 ~256 KB/s regardless of the nominal 115200 baud (USB CDC). A full repaint can
 therefore never finish in 400 ms; only changes up to ~100 KB can. Cross-family
-switches (desktop / CS2 / FACEIT / MSFS) differ in 200-307 KB even with a
-shared background, so they use the column wipe: 8 strips of 60 px, each
-landing in ~150 ms, which reads as a deliberate left-to-right wipe instead of
-a 1.2 s top-to-bottom tear. Within-family changes (live <-> death) stay on the
-tile path (~0.45 s). No crossfade frames are ever sent: each would cost 1.2 s.
+switches (desktop / CS2 theme / MSFS) differ in 200-307 KB even with a
+shared layout, so they use the column wipe: 8 strips of 60 px, each landing
+in ~150 ms, which reads as a deliberate left-to-right wipe instead of a 1.2 s
+top-to-bottom tear. Within-family changes (MSFS phases) stay on the tile path
+(~0.45 s). No crossfade frames are ever sent: each would cost 1.2 s.
 """
 
 from __future__ import annotations
@@ -38,8 +38,8 @@ from screens_new import render_new_screen  # noqa: E402
 MEASURED_BYTES_PER_SECOND = 256_000
 FRAME_MS = 20
 PAIRS = (
-    ("main", "cs2-menu"), ("cs2-menu", "cs2-live-dark"), ("cs2-live-dark", "cs2-death"),
-    ("cs2-death", "cs2-faceit"), ("main", "msfs-cruise"), ("msfs-cruise", "msfs-approach"),
+    ("main", "cs2-theme"), ("cs2-theme", "main"),
+    ("main", "msfs-cruise"), ("msfs-cruise", "msfs-approach"),
 )
 
 

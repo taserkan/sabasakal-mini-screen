@@ -2,16 +2,14 @@
 """The "Yeni" (new) screen design for the 480x320 Turing panel.
 
 Pure PIL rendering of the HTML mockups in the design hand-off:
-desktop (Main), in-game strip (Strip), CS2 buy / death / live, CS2 FACEIT
-(system data only) and the MSFS phase screens (ground, cruise, approach,
-landing, radio). Nothing here reads game memory or sends input; the CS2
-values come exclusively from Valve's official Game State Integration and
-MSFS values from read-only SimConnect variables.
+desktop (Main, also drawn in CS2 orange while CS2 runs), in-game strip
+(Strip) and the MSFS phase screens (ground, cruise, approach, landing,
+radio). Nothing here reads game memory or sends input; MSFS values come
+exclusively from read-only SimConnect variables.
 """
 
 from __future__ import annotations
 
-import collections
 import dataclasses
 import datetime as dt
 import functools
@@ -38,8 +36,6 @@ RED = "#F87171"
 WHITE = "#FFFFFF"
 TEXT = "#E8EDF2"
 TRACK = "#243040"
-CT_BLUE = "#3FB5FF"
-T_ORANGE = "#FF9F43"
 CHIP_OK = ("#12301C", "#86EFAC")
 CHIP_WARN = ("#3A2410", "#FFB870")
 CHIP_BAD = ("#3A1414", "#FCA5A5")
@@ -51,7 +47,6 @@ STRIP_VALUE_SIZES = (22, 20, 18)
 # Mode palettes: (root background, strip background, accent).
 MODE_DESKTOP = ("#0B0F14", "#141B24", "#3FB5FF")
 MODE_CS2 = ("#1C1305", "#2B1D07", "#F5A524")
-MODE_FACEIT = ("#1E0C0C", "#2A1212", "#FF5A4E")
 MODE_MSFS = {
     "ground": ("#0C1A10", "#12281A", "#4ADE80"),
     "cruise": ("#0A1530", "#10224A", "#3FB5FF"),
@@ -113,14 +108,6 @@ class BatteryInfo:
     kind: str
     percent: int | None
     dpi: int | None = None
-    dpi_warning: bool = False
-
-
-@dataclass(frozen=True)
-class Alert:
-    title: str
-    detail: str
-    severity: str = "warn"  # "warn" | "critical"
 
 
 @dataclass
@@ -131,16 +118,10 @@ class NewScreenContext:
     now: dt.datetime | None = None
     language: str = "tr"
     fps: float | None = None
-    mode: str = "desktop"  # desktop | cs2 | cs2_menu | faceit | msfs
-    game: object | None = None  # app.GameSnapshot
-    cs_screen: str = "live"  # death | live
-    alerts: tuple = ()
-    ping_ms: float | None = None
+    mode: str = "desktop"  # desktop | cs2 (desktop in CS2 colours) | msfs
     flight: object | None = None  # msfs_runtime.FlightTelemetry
     flight_state: object | None = None  # msfs_runtime.FlightPhaseState
     hardware_labels: dict = field(default_factory=dict)
-    status: str = ""  # cs2_menu status line (already translated or Turkish source)
-    pings: tuple = ()  # ((region code, ms), ...) Valve matchmaking pings
 
 
 # ---------------------------------------------------------------------------
@@ -322,12 +303,6 @@ def _num(value: float | None, digits: int = 0, language: str = "tr") -> str:
     return rendered
 
 
-def money(value: int | None, language: str = "tr") -> str:
-    if value is None:
-        return "—"
-    return "$" + _num(float(value), 0, language)
-
-
 BATTERY_ORDER = {"mouse": 0, "keyboard": 1, "headset": 2}
 
 
@@ -350,19 +325,16 @@ def present_batteries(devices: Iterable, limit: int = 3) -> list[BatteryInfo]:
             continue
         seen.add(kind)
         dpi = getattr(device, "dpi", None) if kind == "mouse" else None
-        items.append(BatteryInfo(
-            kind, max(0, min(100, int(percent))), dpi,
-            bool(getattr(device, "dpi_warning", False)) and dpi is not None,
-        ))
+        items.append(BatteryInfo(kind, max(0, min(100, int(percent))), dpi))
     items.sort(key=lambda item: BATTERY_ORDER.get(item.kind, 3))
     return items[: max(0, limit)]
 
 
 def battery_value_parts(info: BatteryInfo) -> list[tuple[str, str]]:
-    """``82%`` (+ `` · 1200`` DPI for a G HUB mouse; orange on a CS2 mismatch)."""
+    """``82%`` (+ `` · 1200`` DPI for a G HUB mouse)."""
     parts = [(_pct(info.percent), battery_color(info.percent) if info.percent <= 30 else TEXT)]
     if info.dpi is not None:
-        parts.append((f" · {info.dpi}", ORANGE if info.dpi_warning else TEXT))
+        parts.append((f" · {info.dpi}", TEXT))
     return parts
 
 
@@ -572,7 +544,7 @@ def _columns(left: int, right: int, count: int, gap: int) -> list[tuple[int, int
 
 
 # ---------------------------------------------------------------------------
-# Desktop (Main.dc.html) and FACEIT (CsFaceit.dc.html)
+# Desktop (Main.dc.html)
 # ---------------------------------------------------------------------------
 
 def _system_panel(image, draw, box, background, component: str, ctx, diameter: int,
@@ -617,14 +589,12 @@ def _cpu_details(ctx) -> list[str]:
     return lines
 
 
-def _gpu_details(ctx, include_fps: bool = False) -> list[str]:
+def _gpu_details(ctx) -> list[str]:
     m = ctx.metrics
     lines = []
-    if include_fps and ctx.fps is not None:
-        lines.append(f"{int(round(ctx.fps))} FPS")
     if m.get("gpu_memory"):
         lines.append(f"VRAM {float(m['gpu_memory']) / 1024.0:.1f} GB")
-    if m.get("gpu_power") and not include_fps:
+    if m.get("gpu_power"):
         lines.append(f"{int(round(float(m['gpu_power'])))} W")
     return lines
 
@@ -678,13 +648,27 @@ def main_layout(ctx: NewScreenContext, draw: ImageDraw.ImageDraw | None = None) 
     return layout
 
 
+def main_theme(mode: str) -> tuple[str, str, str]:
+    """(background, ring track, clock colour) of the desktop screen.
+
+    While CS2 runs the same desktop screen is drawn in CS2's orange: during a
+    match nobody reads the panel, so only the colours follow the game.
+    """
+    if mode == "cs2":
+        background, _strip, accent = MODE_CS2
+        return background, blend(background, accent, 0.22), accent
+    return MODE_DESKTOP[0], TRACK, TEXT
+
+
 def render_main(ctx: NewScreenContext) -> Image.Image:
-    background = MODE_DESKTOP[0]
+    background, track, clock_color = main_theme(ctx.mode)
     image = Image.new("RGB", (WIDTH, HEIGHT), background)
     draw = ImageDraw.Draw(image)
+    if ctx.mode == "cs2":
+        draw.rectangle((0, 0, WIDTH, 3), fill=MODE_CS2[2])
     now = ctx.now or dt.datetime.now()
     layout = main_layout(ctx, draw)
-    text(draw, (14, 44), now.strftime("%H:%M"), 30, TEXT, condensed=True, anchor="ls")
+    text(draw, (14, 44), now.strftime("%H:%M"), 30, clock_color, condensed=True, anchor="ls")
     if "ram" in layout:
         x = layout["ram"][0]
         for value, color, template in layout["ram_parts"]:
@@ -693,9 +677,9 @@ def render_main(ctx: NewScreenContext) -> Image.Image:
     if "weather" in layout:
         text(draw, (WIDTH - 14, 42), layout["weather_text"], 14, WHITE, anchor="rs")
     _system_panel(image, draw, layout["cpu"], background, "cpu", ctx,
-                  96, TRACK, _cpu_details(ctx), 30, False)
+                  96, track, _cpu_details(ctx), 30, False)
     _system_panel(image, draw, layout["gpu"], background, "gpu", ctx,
-                  96, TRACK, _gpu_details(ctx), 30, False)
+                  96, track, _gpu_details(ctx), 30, False)
     for info, box in layout["batteries"]:
         left, battery_top, right, _bottom = box
         percent = info.percent
@@ -708,218 +692,14 @@ def render_main(ctx: NewScreenContext) -> Image.Image:
     return image
 
 
-def faceit_battery_layout(ctx: NewScreenContext, draw: ImageDraw.ImageDraw | None = None) -> list:
-    """Placement of the FACEIT battery items; empty when no device is present.
-
-    Each item is ``(info, x, center_y, label, label_width, value, value_width)``.
-    """
-    if draw is None:
-        draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    batteries = present_batteries(ctx.batteries)
-    if not batteries:
-        return []
-    battery_top = HEIGHT - 14 - 39
-    center_y = (battery_top + HEIGHT - 14) / 2
-    items: list = []
-    slots = _columns(26, WIDTH - 26, len(batteries), 10)
-    last = len(batteries) - 1
-    for index, ((left, right), info) in enumerate(zip(slots, batteries)):
-        label = _t(ctx, BATTERY_LABELS[info.kind][0]) + " "
-        value = battery_value_parts(info)
-        label_width = _tlen(label, font(15))
-        value_width = _parts_width(draw, value, 15)
-        total = label_width + value_width
-        if len(batteries) == 1 or 0 < index < last:
-            x = (left + right - total) / 2
-        elif index == 0:
-            x = left
-        else:
-            x = right - total
-        items.append((info, x, center_y, label, label_width, value, value_width))
-    return items
-
-
-def render_faceit(ctx: NewScreenContext) -> Image.Image:
-    background, _strip, accent = MODE_FACEIT
-    image = Image.new("RGB", (WIDTH, HEIGHT), background)
-    draw = ImageDraw.Draw(image)
-    draw.rectangle((0, 0, WIDTH, 3), fill=accent)
-    now = ctx.now or dt.datetime.now()
-    _header(draw, ctx, 18, _t(ctx, "FACEIT · sadece sistem verisi"), now.strftime("%H:%M"))
-    items = faceit_battery_layout(ctx, draw)
-    battery_top = HEIGHT - 14 - 39
-    panels_top = 46
-    panels_bottom = battery_top - 10 if items else HEIGHT - 14
-    (l1, r1), (l2, r2) = _columns(14, WIDTH - 14, 2, 10)
-    track = panel_color(panel_color(background), 0.12)
-    _system_panel(image, draw, (l1, panels_top, r1, panels_bottom), background, "cpu", ctx,
-                  112, track, _cpu_details(ctx)[:1], 40, True)
-    _system_panel(image, draw, (l2, panels_top, r2, panels_bottom), background, "gpu", ctx,
-                  112, track, _gpu_details(ctx, include_fps=True)[:1], 40, True)
-    if items:
-        rounded(draw, (14, battery_top, WIDTH - 14, HEIGHT - 14), 8, panel_color(background))
-    for info, x, center_y, label, label_width, value, _value_width in items:
-        text(draw, (x, center_y), label, 15, WHITE, anchor="lm")
-        _draw_parts(draw, x + label_width, center_y, value, 15, "m")
-    return image
-
-
-# ---------------------------------------------------------------------------
-# CS2 on Valve servers (official GSI only)
-# ---------------------------------------------------------------------------
-
-def _score_text(game) -> tuple[str, str]:
-    ct = "—" if game.score_ct is None else str(game.score_ct)
-    t = "—" if game.score_t is None else str(game.score_t)
-    return ct, t
-
-
-def render_cs_death(ctx: NewScreenContext) -> Image.Image:
-    background, strip_bg, accent = MODE_CS2
-    image = Image.new("RGB", (WIDTH, HEIGHT), background)
-    draw_strip(image, ctx, strip_bg, accent)
-    draw = ImageDraw.Draw(image)
-    game = ctx.game
-    text(draw, (14, 70), _t(ctx, "BU ROUND"), 14, WHITE)
-    ct, t = _score_text(game)
-    if ct != "—" and t != "—":
-        # Fixed slots: the score never slides when a side reaches 10.
-        score_font = font(26, True)
-        right = WIDTH - 14
-        right -= text(draw, (right, 88), " T", 26, T_ORANGE, condensed=True, anchor="rs")
-        text(draw, (right, 88), t, 26, T_ORANGE, condensed=True, anchor="rs")
-        right -= _tlen("99", score_font)
-        right -= text(draw, (right, 88), " – ", 26, WHITE, condensed=True, anchor="rs")
-        right -= _tlen("99", score_font)
-        text(draw, (right + _tlen("99", score_font), 88), ct, 26, CT_BLUE, condensed=True, anchor="rs")
-        text(draw, (right, 88), "CT ", 26, CT_BLUE, condensed=True, anchor="rs")
-    top, bottom = 100, 184
-    (l1, r1), (l2, r2) = _columns(14, WIDTH - 14, 2, 10)
-    for left, right_edge in ((l1, r1), (l2, r2)):
-        rounded(draw, (left, top, right_edge, bottom), 10, panel_color(background))
-    text(draw, (l1 + 10, top + 10), _t(ctx, "Kill"), 14, WHITE)
-    kills = "—" if game.round_kills is None else str(game.round_kills)
-    text(draw, (l1 + 10, bottom - 14), kills, 44, TEXT, condensed=True, anchor="ls")
-    width = _tlen("9", font(44, True))
-    if game.round_kills is not None and game.round_headshots is not None:
-        text(draw, (l1 + 18 + width, bottom - 16), f"{game.round_headshots} HS", 18, WHITE, anchor="ls")
-    text(draw, (l2 + 10, top + 10), _t(ctx, "Hasar"), 14, WHITE)
-    damage = "—" if game.round_damage is None else str(game.round_damage)
-    text(draw, (l2 + 10, bottom - 14), damage, 44, TEXT, condensed=True, anchor="ls")
-
-    def pair(a, b):
-        return "—" if a is None or b is None else f"{a} / {b}"
-
-    cells = (
-        (_t(ctx, "MAÇ K/D"), pair(game.match_kills, game.match_deaths)),
-        (_t(ctx, "Asist"), "—" if game.match_assists is None else str(game.match_assists)),
-        ("MVP", "—" if game.match_mvps is None else str(game.match_mvps)),
-        (_t(ctx, "Skor"), "—" if game.match_score is None else str(game.match_score)),
-    )
-    for (left, _right), (label, value) in zip(_columns(14, WIDTH - 14, 4, 8), cells):
-        if value == "—":
-            continue  # unavailable: hide the whole cell
-        text(draw, (left, 196), label, 14, WHITE)
-        text(draw, (left, 236), value, 20, TEXT, anchor="ls")
-    return image
-
-
-def render_cs_live(ctx: NewScreenContext) -> Image.Image:
-    """Live round / deathmatch: the desktop view (identical pixels, so a
-    desktop <-> live switch only repaints changed values), plus any hardware
-    alert as an overlay banner."""
-    image = render_main(ctx)
-    draw = ImageDraw.Draw(image)
-    if ctx.alerts:
-        alert = ctx.alerts[0]
-        border = RED if alert.severity == "critical" else ORANGE
-        fill = "#3A1414" if alert.severity == "critical" else "#3A2410"
-        title_color = "#FCA5A5" if alert.severity == "critical" else "#FFB870"
-        box = (14, 128, WIDTH - 14, 216)
-        rounded(draw, box, 12, fill, outline=border, width=2)
-        text(draw, (30, 178), alert.title, 40, title_color, condensed=True, anchor="ls")
-        text(draw, (30, 202), alert.detail, 14, "#F3D9BF", anchor="ls")
-        if len(ctx.alerts) > 1:
-            rounded(draw, (14, 228, WIDTH - 14, 256), 8, "#3A1414")
-            text(draw, (24, 234), ctx.alerts[1].title + " · " + ctx.alerts[1].detail, 14, WHITE)
-    return image
-
-
-CS2_MENU_STATUS = {
-    "restart": "CS2'yi yeniden başlat · oyun verisi için",
-    "waiting": "CS2 · Oyun verisi bekleniyor",
-    "menu": "CS2 · Menü",
-}
-
-
-def cs2_menu_status(connected: bool, restart_needed: bool) -> str:
-    if restart_needed:
-        return "restart"
-    return "menu" if connected else "waiting"
-
-
-def cs_menu_layout(ctx: NewScreenContext) -> dict:
-    layout = {"status": (14, 62, WIDTH - 14, 82)}
-    pings = tuple(ctx.pings)[:4]
-    bottom = HEIGHT - 14
-    if pings:
-        layout["pings"] = (14, bottom - 34, WIDTH - 14, bottom)
-        bottom -= 44
-    (l1, r1), (l2, r2) = _columns(14, WIDTH - 14, 2, 10)
-    layout["cpu"] = (l1, 90, r1, bottom)
-    layout["gpu"] = (l2, 90, r2, bottom)
-    return layout
-
-
-def render_cs_menu(ctx: NewScreenContext) -> Image.Image:
-    """CS2 running without live match data (menu, loading, no GSI yet)."""
-    background, strip_bg, accent = MODE_CS2
-    image = Image.new("RGB", (WIDTH, HEIGHT), background)
-    draw_strip(image, ctx, strip_bg, accent)
-    draw = ImageDraw.Draw(image)
-    layout = cs_menu_layout(ctx)
-    key = ctx.status or "waiting"
-    status = _t(ctx, CS2_MENU_STATUS.get(key, key))
-    color = "#FFB870" if key == "restart" else accent
-    now = ctx.now or dt.datetime.now()
-    clock = now.strftime("%H:%M")
-    clock_width = _tlen(clock, font(14))
-    text(draw, (14, 64), fit(draw, status, 15, WIDTH - 42 - clock_width), 15, color)
-    text(draw, (WIDTH - 14, 64), clock, 14, WHITE, anchor="ra")
-    track = panel_color(panel_color(background), 0.12)
-    _system_panel(image, draw, layout["cpu"], background, "cpu", ctx,
-                  96, track, _cpu_details(ctx)[:1], 32, True)
-    _system_panel(image, draw, layout["gpu"], background, "gpu", ctx,
-                  96, track, _gpu_details(ctx)[:1], 32, True)
-    if "pings" in layout:
-        box = layout["pings"]
-        rounded(draw, box, 8, panel_color(background))
-        pings = tuple(ctx.pings)[:4]
-        slots = _columns(box[0] + 10, box[2] - 10, len(pings), 8)
-        cy = (box[1] + box[3]) / 2
-        for (left, right), (code, ms) in zip(slots, pings):
-            value = f"{int(ms)} ms"
-            color_ms = GREEN if ms < 60 else ORANGE if ms < 100 else RED
-            label = f"{str(code).upper()[:4]} "
-            width = _tlen(label, font(14)) + _tlen(value, font(14))
-            x = (left + right - width) / 2
-            x += text(draw, (x, cy), label, 14, WHITE, anchor="lm")
-            text(draw, (x, cy), value, 14, color_ms, anchor="lm")
-    return image
-
-
-def new_design_mode(faceit_active: bool, game_active: bool, in_match: bool,
-                    msfs_active: bool = False) -> str:
+def new_design_mode(game_active: bool, msfs_active: bool = False) -> str:
     """Screen family for the Claude design.
 
-    FACEIT always wins (system data only). CS2 running shows CS2 screens even
-    without GSI data: live match screens when in a match, otherwise the CS2
-    menu screen instead of the desktop.
+    CS2 running shows the desktop screen in the CS2 colours; MSFS has its own
+    flight screens.
     """
-    if faceit_active:
-        return "faceit"
     if game_active:
-        return "cs2" if in_match else "cs2_menu"
+        return "cs2"
     if msfs_active:
         return "msfs"
     return "desktop"
@@ -1175,39 +955,6 @@ MSFS_RENDERERS = {
 # State helpers used by the worker
 # ---------------------------------------------------------------------------
 
-def cs_screen_for(game) -> str:
-    """Pick death / live from official GSI round state.
-
-    Freezetime (buy phase) uses the live-round screen so the display does not
-    jump between layouts at round start."""
-    if game is None:
-        return "live"
-    if "deathmatch" in str(getattr(game, "game_mode", "") or "").lower():
-        # Respawn every few seconds: one stable live screen, never a death
-        # screen (v1.1.7 wiped the whole panel death <-> live on each respawn).
-        return "live"
-    phase = getattr(game, "round_phase", "")
-    if phase == "over" or getattr(game, "alive", None) is False:
-        return "death"
-    return "live"
-
-
-class DeathScreenGate:
-    """Show the death screen only after ``delay`` s of continuous "death"."""
-
-    def __init__(self, delay: float = 3.0) -> None:
-        self.delay = delay
-        self._since: float | None = None
-
-    def update(self, requested: str, now: float | None = None) -> str:
-        now = time.monotonic() if now is None else now
-        if requested != "death":
-            self._since = None
-            return requested
-        if self._since is None:
-            self._since = now
-        return "death" if now - self._since >= self.delay else "live"
-
 
 class ScreenStabilizer:
     """Hysteresis for screen switches so the LCD never flaps between layouts.
@@ -1215,11 +962,9 @@ class ScreenStabilizer:
     A cross-family switch (desktop / CS2 / MSFS) repaints most of the panel
     over serial, so a requested screen must be
 
-    * requested continuously for ``confirm`` seconds (debounces GSI phase
-      flicker such as live -> over -> live on a respawn), and
+    * requested continuously for ``confirm`` seconds (debounces flicker such
+      as an MSFS phase bouncing at a threshold), and
     * the currently shown screen must have been up for ``min_dwell`` seconds.
-
-    FACEIT is a safety mode and is always applied immediately.
     """
 
     def __init__(self, min_dwell: float = 2.5, confirm: float = 0.6) -> None:
@@ -1232,7 +977,7 @@ class ScreenStabilizer:
 
     def update(self, requested: tuple, now: float | None = None) -> tuple:
         now = time.monotonic() if now is None else now
-        if self.shown is None or requested == self.shown or requested[0] == "faceit":
+        if self.shown is None or requested == self.shown:
             if requested != self.shown:
                 self._shown_since = now
             self.shown = requested
@@ -1246,60 +991,8 @@ class ScreenStabilizer:
         return self.shown
 
 
-class AlertTracker:
-    """30 s rolling averages; raise an alert at the red threshold."""
-
-    WINDOW_SECONDS = 30.0
-
-    def __init__(self) -> None:
-        self._samples: dict[str, collections.deque] = {
-            key: collections.deque() for key in ("cpu_temp", "gpu_temp", "ping")
-        }
-
-    def _average(self, key: str, value: float | None, now: float) -> float | None:
-        samples = self._samples[key]
-        if value is not None:
-            samples.append((now, float(value)))
-        while samples and now - samples[0][0] > self.WINDOW_SECONDS:
-            samples.popleft()
-        if not samples:
-            return None
-        return sum(item[1] for item in samples) / len(samples)
-
-    def update(self, metrics: dict, ping_ms: float | None = None, language: str = "tr",
-               now: float | None = None) -> tuple[Alert, ...]:
-        now = time.monotonic() if now is None else now
-        alerts = []
-        for component in ("gpu", "cpu"):
-            current = metrics.get(f"{component}_temp")
-            average = self._average(f"{component}_temp", current, now)
-            limit = THRESHOLDS[(component, "temp")][1]
-            if average is not None and average >= limit and current is not None:
-                alerts.append(Alert(
-                    f"{component.upper()} {int(round(current))}°C",
-                    translate("Sınır {limit}°C · son 30 sn ortalaması {avg}°C", language,
-                              limit=int(limit), avg=int(round(average))),
-                    "critical" if current >= limit + 10 else "warn",
-                ))
-        baseline = self._average("ping", ping_ms, now)
-        if ping_ms is not None and baseline is not None and ping_ms > baseline * 1.5 + 15:
-            alerts.append(Alert(
-                f"Ping {int(round(ping_ms))} ms",
-                translate("Ani ping artışı · ortalama {avg} ms", language, avg=int(round(baseline))),
-            ))
-        return tuple(alerts)
-
-
 def render_new_screen(ctx: NewScreenContext) -> Image.Image:
     ctx.language = normalize_language(ctx.language)
-    if ctx.mode == "faceit":
-        return render_faceit(ctx)
-    if ctx.mode == "cs2" and ctx.game is not None:
-        return {
-            "death": render_cs_death,
-        }.get(ctx.cs_screen, render_cs_live)(ctx)
-    if ctx.mode in ("cs2", "cs2_menu"):
-        return render_cs_menu(ctx)
     if ctx.mode == "msfs":
         phase = getattr(ctx.flight_state, "phase", "ground") or "ground"
         return MSFS_RENDERERS.get(phase, render_msfs_ground)(ctx)
@@ -1307,6 +1000,6 @@ def render_new_screen(ctx: NewScreenContext) -> Image.Image:
 
 
 __all__ = [
-    "AlertTracker", "BatteryInfo", "NewScreenContext", "ScreenStabilizer", "cs_screen_for",
+    "BatteryInfo", "NewScreenContext", "ScreenStabilizer", "main_theme",
     "new_design_mode", "render_new_screen", "threshold_color",
 ]

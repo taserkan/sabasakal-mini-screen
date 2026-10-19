@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Friendly Qt control panel for the 3.5-inch CS2 information screen."""
+"""Friendly Qt control panel for the 3.5-inch system information screen."""
 
 from __future__ import annotations
 
@@ -31,13 +31,12 @@ from PySide6.QtWidgets import (
 )
 
 from app import (
-    COLORS, CS2GameState, FACEIT_PING_MONITOR, GSIServer, GameSnapshot,
+    COLORS,
     HEIGHT,
     MAX_HARDWARE_LABEL_LENGTH, MEDIA_VIS_REGION, MEDIA_VIS_REGION_WITH_BATTERY,
-    RelayPing, SENSOR_CACHE_PATH, SENSOR_MONITOR, ScreenSession,
-    STEAM_PING_MONITOR, cs2_is_running, faceit_ac_is_running,
-    get_auto_hardware_labels, get_metrics, gsi_request_summary, gsi_restart_needed,
-    install_gsi_config,
+    SENSOR_CACHE_PATH, SENSOR_MONITOR, ScreenSession,
+    cs2_is_running,
+    get_auto_hardware_labels, get_metrics,
     normalise_hardware_label,
     msfs_session_seconds, render_media_visual_patch, render_screen,
     resolve_hardware_labels,
@@ -51,8 +50,7 @@ from msfs_runtime import (
     FlightPhaseState, FlightPhaseTracker, FlightTelemetry, LandingRecord, MSFSTelemetryMonitor,
 )
 from screens_new import (
-    AlertTracker, DeathScreenGate, NewScreenContext, ScreenStabilizer, cs2_menu_status, cs_screen_for,
-    new_design_mode, render_new_screen,
+    NewScreenContext, ScreenStabilizer, new_design_mode, render_new_screen,
 )
 from weather_runtime import (
     DEFAULT_WEATHER_CITIES, WeatherMonitor, WeatherReading, format_city_name,
@@ -64,7 +62,7 @@ from i18n import SUPPORTED_LANGUAGES, normalize_language, translate
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.1.10"
+APP_VERSION = "1.1.11"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -370,8 +368,6 @@ def plan_new_design_update(
         used += cost
     return "tiles", chosen
 NEW_DESIGN_WORKER_INTERVAL = 0.5
-# Competitive/casual: the death screen appears only after 3 s dead.
-DEATH_SCREEN_DELAY = 3.0
 NEW_DESIGN_MSFS_INTERVAL = 0.25
 DEFAULT_SETTINGS = {
     "palette": "Kuzey", "colors": PALETTES["Kuzey"], "brightness": 55,
@@ -409,8 +405,7 @@ VALUE_REGIONS = [
     [(360, 49, 448, 123), (337, 126, 466, 158)],
 ]
 BOTTOM_REGION = (14, 160, 467, 307)
-LIVE_GAME_WORKER_INTERVAL = 0.20
-# In-game performance mode (cs2.exe / FACEIT / MSFS running).
+# In-game performance mode (cs2.exe / MSFS running).
 NORMAL_BATTERY_INTERVAL = 2.0
 PERFORMANCE_BATTERY_INTERVAL = 10.0
 BATTERY_PANEL_REGION = (337, 202, 456, 295)
@@ -1893,9 +1888,7 @@ class ControlPanel(QWidget):
         preview_modes = QVBoxLayout()
         preview_modes.setSpacing(5)
         for mode, caption in (
-            ("daily", "Günlük"), ("cs2_ct", "CS2 · CT"),
-            ("cs2_t", "CS2 · T"),
-            ("deathmatch", "Ölüm maçı"),
+            ("daily", "Günlük"), ("cs2", "CS2 teması"),
             ("msfs", "MSFS"), ("weather", "Hava"),
             ("wireless", "Kablosuz"),
         ):
@@ -2330,7 +2323,7 @@ class ControlPanel(QWidget):
         self._refresh_preview()
 
     def _set_preview_mode(self, mode: str) -> None:
-        if mode not in {"daily", "cs2_ct", "cs2_t", "deathmatch", "msfs", "weather", "wireless"}:
+        if mode not in {"daily", "cs2", "msfs", "weather", "wireless"}:
             return
         self.preview_mode = mode
         self._refresh_preview()
@@ -2537,9 +2530,7 @@ class ControlPanel(QWidget):
             metrics = self._preview_metrics()
             context_labels = {
                 "daily": "Günlük kullanım · medya görünümü",
-                "cs2_ct": "CS2 · CT ekonomi görünümü",
-                "cs2_t": "CS2 · T ekonomi görünümü",
-                "deathmatch": "CS2 · ölüm maçı öldürme ve kafa vuruşu görünümü",
+                "cs2": "CS2 açıkken · turuncu tema",
                 "msfs": "MSFS 2024 · canlı uçuş bilgileri",
                 "weather": "Boşta kullanım · seçili şehirlerin hava durumu",
                 "wireless": "Kablosuz cihazlar · pil durumları",
@@ -2548,9 +2539,7 @@ class ControlPanel(QWidget):
                 new_labels = {
                     "daily": "Yeni tasarım · masaüstü", "weather": "Yeni tasarım · masaüstü",
                     "wireless": "Yeni tasarım · masaüstü",
-                    "cs2_ct": "Yeni tasarım · CS2 satın alma",
-                    "cs2_t": "Yeni tasarım · CS2 round sonu",
-                    "deathmatch": "Yeni tasarım · FACEIT (sadece sistem)",
+                    "cs2": "Yeni tasarım · CS2 açıkken turuncu tema",
                     "msfs": "Yeni tasarım · MSFS seyir",
                 }
                 self.preview_context_label.setText(
@@ -2563,7 +2552,7 @@ class ControlPanel(QWidget):
             )
             if self.preview_mode == "msfs":
                 frame = render_screen(
-                    metrics, GameSnapshot(), False, self.settings["colors"],
+                    metrics, self.settings["colors"],
                     hardware_labels=labels,
                     msfs_active=True,
                     flight_telemetry=FlightTelemetry(
@@ -2576,42 +2565,24 @@ class ControlPanel(QWidget):
                 )
                 self._show_preview(pil_to_qimage(frame))
                 return
-            if self.preview_mode in {"cs2_ct", "cs2_t"}:
-                is_ct = self.preview_mode == "cs2_ct"
+            if self.preview_mode == "cs2":
                 frame = render_screen(
-                    metrics,
-                    GameSnapshot(
-                        connected=True, in_match=True, money=4250,
-                        next_win_money=7500, next_loss_money=6150,
-                        loss_bonus=1900, team="CT" if is_ct else "T",
-                        has_defuse_kit=is_ct,
-                    ),
-                    True,
-                    self.settings["colors"],
-                    hardware_labels=labels, language=self.language,
-                )
-            elif self.preview_mode == "deathmatch":
-                frame = render_screen(
-                    metrics,
-                    GameSnapshot(
-                        connected=True, in_match=True, team="CT",
-                        game_mode="deathmatch", kills=42,
-                        headshot_kills=21, headshot_percent=50,
-                    ),
-                    True,
-                    self.settings["colors"],
-                    hardware_labels=labels, language=self.language,
+                    metrics, self.settings["colors"],
+                    hardware_labels=labels,
+                    weather_readings=self._preview_weather_readings(),
+                    language=self.language,
+                    cs2_active=True,
                 )
             elif self.preview_mode == "weather":
                 frame = render_screen(
-                    metrics, GameSnapshot(), False, self.settings["colors"],
+                    metrics, self.settings["colors"],
                     hardware_labels=labels,
                     weather_readings=self._preview_weather_readings(),
                     language=self.language,
                 )
             elif self.preview_mode == "wireless":
                 frame = render_screen(
-                    metrics, GameSnapshot(), False, self.settings["colors"],
+                    metrics, self.settings["colors"],
                     hardware_labels=labels,
                     battery_devices=(
                         BatteryDevice("preview-mouse", "PRO X SUPERLIGHT 2", 85, "mouse"),
@@ -2625,7 +2596,7 @@ class ControlPanel(QWidget):
                 )
             else:
                 frame = render_screen(
-                    metrics, GameSnapshot(), False, self.settings["colors"],
+                    metrics, self.settings["colors"],
                     hardware_labels=labels,
                     media_snapshot=MediaSnapshot(
                         platform="Spotify", title=self._tr("Şu an çalıyor"),
@@ -2655,22 +2626,11 @@ class ControlPanel(QWidget):
             metrics=preview_metrics, batteries=batteries, language=self.language,
             hardware_labels={"cpu": labels.get("cpu", ""), "gpu": labels.get("gpu", "")},
         )
-        round_data = dict(
-            connected=True, in_match=True, team="CT", money=4150, round_number=14,
-            score_ct=6, score_t=7, loss_streak=2, match_kills=14, match_deaths=9,
-            match_assists=3, match_mvps=2, match_score=33,
-        )
         mode = self.preview_mode
-        if mode == "cs2_ct":
-            context = NewScreenContext(**common, mode="cs2", cs_screen="live", fps=287,
-                                       game=GameSnapshot(round_phase="freezetime", **round_data))
-        elif mode == "cs2_t":
-            context = NewScreenContext(**common, mode="cs2", cs_screen="death", fps=287,
-                                       game=GameSnapshot(round_phase="over", alive=False,
-                                                         round_kills=2, round_headshots=1,
-                                                         round_damage=187, **round_data))
-        elif mode == "deathmatch":
-            context = NewScreenContext(**common, mode="faceit", fps=287)
+        if mode == "cs2":
+            context = NewScreenContext(
+                **common, mode="cs2", weather=self._preview_weather_readings(),
+            )
         elif mode == "msfs":
             context = NewScreenContext(
                 **common, mode="msfs",
@@ -2688,25 +2648,6 @@ class ControlPanel(QWidget):
         else:
             context = NewScreenContext(**common, weather=self._preview_weather_readings())
         return render_new_screen(context)
-
-    def _install_gsi(self, _checked: bool = False, quiet: bool = False) -> bool:
-        try:
-            install_gsi_config()
-        except Exception as exc:
-            if not quiet:
-                QMessageBox.warning(
-                    self, self._tr("CS2 bağlantısı kurulamadı"),
-                    self._tr(
-                        "{error}\n\nUygulamayı yönetici olarak açıp yeniden deneyin.", error=exc,
-                    ),
-                )
-            return False
-        if not quiet:
-            message = self._tr("CS2 bağlantısı kuruldu.")
-            if cs2_is_running():
-                message += self._tr(" Verilerin gelmesi için CS2'yi bir kez yeniden başlatın.")
-            self._set_status(message, ACCENT)
-        return True
 
     def _show_preview(self, image: QImage) -> None:
         self._preview_image = image
@@ -2790,7 +2731,6 @@ class ControlPanel(QWidget):
         try:
             if persist:
                 self.save_settings(quiet=True)
-                self._install_gsi(quiet=True)
             self.stop_event.clear()
             self._worker_started_at = time.monotonic()
             self.screen_connected.clear()
@@ -2834,8 +2774,6 @@ class ControlPanel(QWidget):
     def _screen_worker(self) -> None:
         _runtime_log("screen worker entered")
         screen = None
-        game_state = CS2GameState()
-        gsi_server = None
         media_monitor = MediaSessionMonitor()
         audio_monitor = AudioSpectrumMonitor()
         battery_monitor = BatteryDeviceMonitor(interval=NORMAL_BATTERY_INTERVAL, limit=3)
@@ -2843,8 +2781,6 @@ class ControlPanel(QWidget):
         weather_monitor = WeatherMonitor(weather_cities_for_design(self.settings))
         applied_display_settings = None
         last_view_mode: str | None = None
-        last_match_signature = None
-        last_economy_signature = None
         last_media_signature = None
         last_battery_signature = None
         last_battery_layout_signature = None
@@ -2875,20 +2811,13 @@ class ControlPanel(QWidget):
         game_active = False
         msfs_active = False
         msfs_elapsed: float | None = None
-        faceit_active = False
-        panel_active = False
-        snapshot = GameSnapshot()
-        matchmaking_pings = []
-        matchmaking_source = "VALVE"
-        match_signature = None
+        applied_cs2_theme: bool | None = None
         sent_frame = None
         media_base_frame = None
         media_render_future: Future | None = None
         media_render_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media-base-render")
-        alert_tracker = AlertTracker()
         phase_tracker = FlightPhaseTracker()
         screen_stabilizer = ScreenStabilizer()
-        death_gate = DeathScreenGate(DEATH_SCREEN_DELAY)
         transfer_logs = {"count": 0, "at": -1e9}
 
         def log_transfer(kind: str, seconds: float, regions: int) -> None:
@@ -2903,20 +2832,17 @@ class ControlPanel(QWidget):
         applied_design: str | None = None
 
         def build_media_base(
-            render_snapshot, render_panel_active, render_colors, render_pings,
-            render_source, render_labels, render_media, render_audio, render_batteries,
+            render_colors, render_labels, render_media, render_audio, render_batteries,
             render_language,
         ):
             metrics = get_metrics()
             frame = render_screen(
-                metrics, render_snapshot, render_panel_active, render_colors,
-                render_pings, render_source, render_labels,
+                metrics, render_colors, render_labels,
                 animation_time=time.monotonic(), media_snapshot=render_media,
                 audio_spectrum=render_audio, battery_devices=render_batteries,
                 language=render_language,
             )
             return metrics, frame
-        last_gsi_attempt = 0.0
         perf_state: dict = {"state": None}
 
         def apply_performance_mode(enabled: bool, audio_wanted: bool) -> None:
@@ -2934,59 +2860,7 @@ class ControlPanel(QWidget):
                 f"audio_capture={'on' if audio_wanted else 'off'}; "
                 f"battery_interval={battery_monitor.interval:.0f}s"
             )
-        gsi_restart_state = {"checked_at": -1e9, "needed": False}
-
-        def check_gsi_restart(game_running: bool, connected: bool) -> bool:
-            """Throttled check whether CS2 must be restarted to load our cfg."""
-            if not game_running or connected:
-                gsi_restart_state["needed"] = False
-                return False
-            now = time.monotonic()
-            if now - gsi_restart_state["checked_at"] >= 5.0:
-                gsi_restart_state["checked_at"] = now
-                try:
-                    needed = gsi_restart_needed()
-                except Exception:
-                    needed = False
-                if needed and not gsi_restart_state["needed"]:
-                    _runtime_log(
-                        "WARNING: CS2 is running with an outdated GSI cfg/token "
-                        "(cfg newer than cs2.exe or token rejected); restart CS2 to enable game data"
-                    )
-                    self.signals.status.emit(translate(
-                        "CS2'yi yeniden başlatın: oyun verisi için yeni GSI ayarı yüklenmeli",
-                        self.settings.get("language", "tr"),
-                    ))
-                gsi_restart_state["needed"] = needed
-            return bool(gsi_restart_state["needed"])
-
-        def ensure_gsi(faceit_running: bool) -> None:
-            """FACEIT kill switch: no GSI listener while FACEIT AC runs."""
-            nonlocal gsi_server, game_state, last_gsi_attempt
-            if faceit_running:
-                if gsi_server is not None:
-                    try:
-                        gsi_server.close()
-                    except Exception as exc:
-                        _runtime_log(f"GSI listener close failed: {type(exc).__name__}: {exc}")
-                    gsi_server = None
-                    # Forget everything received before FACEIT started.
-                    game_state = CS2GameState()
-                    _runtime_log("FACEIT AC running; CS2 game-data features disabled")
-                return
-            if gsi_server is None and time.monotonic() - last_gsi_attempt >= 10.0:
-                last_gsi_attempt = time.monotonic()
-                try:
-                    gsi_server = GSIServer(game_state)
-                    gsi_server.start()
-                except Exception as exc:
-                    # The screen keeps working even when CS2's local GSI
-                    # listener is temporarily unavailable.
-                    _runtime_log(f"GSI listener unavailable: {type(exc).__name__}: {exc}")
-                    gsi_server = None
-
         try:
-            ensure_gsi(faceit_ac_is_running())
             media_monitor.start()
             battery_monitor.start()
             msfs_monitor.start()
@@ -3009,7 +2883,6 @@ class ControlPanel(QWidget):
                         _runtime_log(f"display connected; port={current['port']}; rotation={current['rotation']}")
                         applied_display_settings = (brightness, current["rotation"])
                         last_view_mode = None
-                        last_match_signature = None
                         last_media_signature = None
                         last_battery_signature = None
                         last_battery_layout_signature = None
@@ -3051,67 +2924,13 @@ class ControlPanel(QWidget):
                             last_view_mode = None
                             sent_frame = None
                         applied_display_settings = display_settings
-                    context_refresh_interval = (
-                        LIVE_GAME_WORKER_INTERVAL if snapshot.in_match else 0.45
-                    )
                     if (
-                        cycle_started - last_context_refresh >= context_refresh_interval
+                        cycle_started - last_context_refresh >= 0.45
                         or last_context_refresh == 0.0
                     ):
                         game_active = cs2_is_running()
                         msfs_elapsed = msfs_session_seconds()
                         msfs_active = msfs_elapsed is not None
-                        faceit_active = faceit_ac_is_running()
-                        ensure_gsi(faceit_active)
-                        snapshot = (
-                            game_state.snapshot()
-                            if game_active and not faceit_active else GameSnapshot()
-                        )
-                        panel_active = game_active or faceit_active
-                        if not snapshot.in_match and faceit_active:
-                            matchmaking_pings, matchmaking_source = FACEIT_PING_MONITOR.read(), "FACEIT"
-                        elif game_active and not snapshot.in_match:
-                            matchmaking_pings, matchmaking_source = STEAM_PING_MONITOR.read(), "VALVE"
-                        else:
-                            matchmaking_pings = []
-                            matchmaking_source = "FACEIT" if faceit_active else "VALVE"
-                        match_signature = (
-                            snapshot.connected, snapshot.in_match, snapshot.money,
-                            snapshot.next_win_money, snapshot.next_loss_money,
-                            snapshot.team, snapshot.bomb_planted,
-                            snapshot.game_mode,
-                            snapshot.kills, snapshot.headshot_kills,
-                            snapshot.headshot_percent,
-                            matchmaking_source,
-                            tuple((item.code, int(round(item.latency_ms))) for item in matchmaking_pings),
-                        )
-                        economy_signature = (
-                            snapshot.in_match, snapshot.game_mode, snapshot.team,
-                            snapshot.money, snapshot.next_win_money,
-                            snapshot.next_loss_money, snapshot.loss_bonus,
-                        )
-                        if not snapshot.in_match:
-                            last_economy_signature = None
-                        if snapshot.in_match and economy_signature != last_economy_signature:
-                            _runtime_log(
-                                "economy updated; "
-                                f"mode={snapshot.game_mode or '-'}; team={snapshot.team or '-'}; "
-                                f"money={snapshot.money}; win={snapshot.next_win_money}; "
-                                f"loss={snapshot.next_loss_money}; bonus={snapshot.loss_bonus}"
-                            )
-                            last_economy_signature = economy_signature
-                        if (
-                            panel_active and not snapshot.in_match
-                            and match_signature != last_match_signature
-                        ):
-                            ping_summary = ", ".join(
-                                f"{item.name}:{int(round(item.latency_ms))}ms"
-                                for item in matchmaking_pings
-                            ) or "hazırlanıyor"
-                            _runtime_log(
-                                "matchmaking pings updated; "
-                                f"source={matchmaking_source}; values={ping_summary}"
-                            )
                         last_context_refresh = cycle_started
 
                     media_snapshot = media_monitor.snapshot()
@@ -3154,26 +2973,17 @@ class ControlPanel(QWidget):
                     last_msfs_error = flight_telemetry.error
                     last_weather_error = weather_snapshot.error
                     media_mode = (
-                        not panel_active and not msfs_active
+                        not game_active and not msfs_active
                         and (media_snapshot.visible or audio_spectrum.active)
                     )
                     view_mode = (
-                        "game" if panel_active else "msfs" if msfs_active
+                        "msfs" if msfs_active and not game_active
                         else "media" if media_mode else "idle"
                     )
                     if view_mode != last_view_mode:
                         _runtime_log(
                             "view mode changed; "
-                            f"mode={view_mode}; game_active={game_active}; "
-                            f"gsi_connected={snapshot.connected}; in_match={snapshot.in_match}; "
-                            f"team={snapshot.team or '-'}; game_mode={snapshot.game_mode or '-'}; "
-                            f"ping_source={matchmaking_source}; ping_count={len(matchmaking_pings)}"
-                        )
-                    if game_active and cycle_started - gsi_restart_state.get("logged_at", -1e9) >= 60.0:
-                        gsi_restart_state["logged_at"] = cycle_started
-                        _runtime_log(
-                            f"GSI status; {gsi_request_summary()}; "
-                            f"gsi_connected={snapshot.connected}; in_match={snapshot.in_match}"
+                            f"mode={view_mode}; cs2_active={game_active}"
                         )
                     media_signature = media_snapshot.signature if media_snapshot.visible else ("Sistem sesi", "", "", "playing")
                     battery_signature = battery_snapshot.signature
@@ -3209,7 +3019,17 @@ class ControlPanel(QWidget):
                             media_render_future.cancel()
                             media_render_future = None
                     new_design_active = design == "new"
-                    performance_mode = game_active or faceit_active or msfs_active
+                    if game_active != applied_cs2_theme:
+                        if applied_cs2_theme is not None:
+                            _runtime_log(f"cs2 theme {'on' if game_active else 'off'}")
+                        applied_cs2_theme = game_active
+                        if not new_design_active:
+                            # The classic palette changes every pixel (margins
+                            # included): resend one clean full frame.
+                            last_view_mode = None
+                            sent_frame = None
+                            media_base_frame = None
+                    performance_mode = game_active or msfs_active
                     # The spectrum is only drawn by the classic media screen.
                     audio_wanted = not performance_mode and not new_design_active
                     if (performance_mode, audio_wanted) != perf_state["state"]:
@@ -3222,56 +3042,28 @@ class ControlPanel(QWidget):
                             cached_metrics = get_metrics()
                             last_metrics_refresh = cycle_started
                         language = current.get("language", "tr")
-                        design_mode = new_design_mode(
-                            faceit_active, game_active, snapshot.in_match, msfs_active,
-                        )
-                        menu_status = ""
-                        if design_mode == "cs2_menu":
-                            menu_status = cs2_menu_status(
-                                snapshot.connected,
-                                check_gsi_restart(game_active, snapshot.connected),
-                            )
+                        design_mode = new_design_mode(game_active, msfs_active)
                         if msfs_active:
                             flight_state = phase_tracker.update(flight_telemetry)
                         else:
                             # MSFS closed: the next session starts clean.
                             phase_tracker.reset()
                             flight_state = None
-                        requested_cs = (
-                            death_gate.update(cs_screen_for(snapshot), cycle_started)
-                            if design_mode == "cs2" else ""
-                        )
                         requested_phase = getattr(flight_state, "phase", "") if design_mode == "msfs" else ""
-                        design_mode, shown_cs, shown_phase = screen_stabilizer.update(
-                            (design_mode, requested_cs, requested_phase), cycle_started,
+                        design_mode, shown_phase = screen_stabilizer.update(
+                            (design_mode, requested_phase), cycle_started,
                         )
-                        if design_mode == "cs2_menu" and not menu_status:
-                            menu_status = cs2_menu_status(
-                                snapshot.connected,
-                                check_gsi_restart(game_active, snapshot.connected),
-                            )
                         if design_mode == "msfs" and flight_state is not None and shown_phase:
                             flight_state = dataclasses.replace(flight_state, phase=shown_phase)
-                        alerts = (
-                            alert_tracker.update(cached_metrics, None, language)
-                            if design_mode == "cs2" else ()
-                        )
                         frame = render_new_screen(NewScreenContext(
                             metrics=cached_metrics,
                             batteries=battery_snapshot.devices,
                             weather=weather_snapshot.readings,
                             language=language,
                             mode=design_mode,
-                            game=snapshot if design_mode == "cs2" else None,
-                            cs_screen=shown_cs or "live",
-                            alerts=alerts,
                             flight=flight_telemetry,
                             flight_state=flight_state,
                             hardware_labels=labels,
-                            status=menu_status,
-                            pings=tuple(
-                                (item.code, item.latency_ms) for item in matchmaking_pings
-                            ) if design_mode == "cs2_menu" else (),
                         ))
                         media_patch = None
                         if last_view_mode is None or sent_frame is None:
@@ -3316,8 +3108,7 @@ class ControlPanel(QWidget):
                             if media_base_frame is None:
                                 cached_metrics = get_metrics()
                                 media_base_frame = render_screen(
-                                    cached_metrics, snapshot, panel_active, current["colors"],
-                                    matchmaking_pings, matchmaking_source, labels,
+                                    cached_metrics, current["colors"], labels,
                                     animation_time=cycle_started, media_snapshot=media_snapshot,
                                     audio_spectrum=audio_spectrum,
                                     battery_devices=battery_snapshot.devices,
@@ -3330,8 +3121,7 @@ class ControlPanel(QWidget):
                             ):
                                 media_render_future = media_render_pool.submit(
                                     build_media_base,
-                                    snapshot, panel_active, dict(current["colors"]),
-                                    list(matchmaking_pings), matchmaking_source, dict(labels),
+                                    dict(current["colors"]), dict(labels),
                                     media_snapshot, audio_spectrum, battery_snapshot.devices,
                                     current.get("language", "tr"),
                                 )
@@ -3344,8 +3134,7 @@ class ControlPanel(QWidget):
                                 cached_metrics = get_metrics()
                                 last_metrics_refresh = cycle_started
                             frame = render_screen(
-                                cached_metrics, snapshot, panel_active, current["colors"],
-                                matchmaking_pings, matchmaking_source, labels,
+                                cached_metrics, current["colors"], labels,
                                 animation_time=cycle_started,
                                 media_snapshot=media_snapshot,
                                 audio_spectrum=audio_spectrum,
@@ -3355,6 +3144,7 @@ class ControlPanel(QWidget):
                                 msfs_layout=current.get("msfs_layout", "cockpit"),
                                 weather_readings=weather_snapshot.readings,
                                 language=current.get("language", "tr"),
+                                cs2_active=game_active,
                             )
                             if view_mode == "media":
                                 media_base_frame = frame
@@ -3422,8 +3212,6 @@ class ControlPanel(QWidget):
                                 last_full_gauge_refresh = now
 
                             bottom_changed = view_mode != last_view_mode
-                            if view_mode == "game" and match_signature != last_match_signature:
-                                bottom_changed = True
                             if view_mode == "media" and media_signature != last_media_signature:
                                 bottom_changed = True
                             msfs_telemetry_refresh_due = (
@@ -3569,7 +3357,6 @@ class ControlPanel(QWidget):
                     continue
                 last_view_mode = view_mode
                 self._screen_progress_at = time.monotonic()
-                last_match_signature = match_signature
                 last_media_signature = media_signature
                 last_battery_signature = battery_signature
                 last_battery_layout_signature = battery_layout_signature
@@ -3585,17 +3372,8 @@ class ControlPanel(QWidget):
                         )
                     self.signals.preview.emit(pil_to_qimage(preview_frame))
                     last_preview_refresh = now
-                if snapshot.in_match:
-                    if "deathmatch" in snapshot.game_mode.lower():
-                        status_message = "Ölüm maçı · öldürme ve HS verisi canlı"
-                    elif snapshot.next_win_money is not None:
-                        status_message = "CS2 açık · ekonomi verisi canlı"
-                    else:
-                        status_message = "CS2 maçı açık · canlı veriler izleniyor"
-                elif faceit_active:
-                    status_message = "FACEIT AC açık · FACEIT pingleri yenileniyor"
-                elif game_active:
-                    status_message = "CS2 açık · eşleştirme pingleri yenileniyor"
+                if game_active:
+                    status_message = "CS2 açık · ekran CS2 renklerinde"
                 elif msfs_active:
                     status_message = (
                         "MSFS 2024 açık · uçuş verileri canlı"
@@ -3624,7 +3402,6 @@ class ControlPanel(QWidget):
                 target_interval = (
                     (NEW_DESIGN_MSFS_INTERVAL if msfs_active else NEW_DESIGN_WORKER_INTERVAL)
                     if new_design_active
-                    else LIVE_GAME_WORKER_INTERVAL if snapshot.in_match
                     else 0.045 if media_mode else MSFS_WORKER_INTERVAL if msfs_active
                     else float(current["interval"])
                 )
@@ -3655,11 +3432,6 @@ class ControlPanel(QWidget):
                     )
                 try:
                     screen.close()
-                except Exception:
-                    pass
-            if gsi_server is not None:
-                try:
-                    gsi_server.close()
                 except Exception:
                     pass
             media_monitor.stop()

@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app import GameSnapshot, RelayPing, render_screen  # noqa: E402
+from app import render_screen  # noqa: E402
 from battery_runtime import BatteryDevice  # noqa: E402
 from gui import PALETTES  # noqa: E402
 from media_runtime import AudioSpectrumSnapshot, MediaSnapshot  # noqa: E402
@@ -25,11 +25,6 @@ METRICS = {
 }
 COLORS = PALETTES["Kuzey"]
 LABELS = {"cpu": "9800X3D", "gpu": "RTX 4070 Ti", "ram": "32 GB RAM"}
-PINGS = [
-    RelayPing("vie", "Vienna", "127.0.0.1", 54.0),
-    RelayPing("fra", "Frankfurt", "127.0.0.1", 57.0),
-    RelayPing("ams", "Amsterdam", "127.0.0.1", 63.0),
-]
 GAME_BATTERIES = (
     BatteryDevice("mouse", "PRO X SUPERLIGHT 2", 75, "mouse"),
     BatteryDevice("headset", "PRO X WIRELESS", 74, "headset"),
@@ -37,11 +32,8 @@ GAME_BATTERIES = (
 )
 
 
-def frame(snapshot: GameSnapshot | None = None, active: bool = False, **kwargs) -> Image.Image:
-    return render_screen(
-        METRICS, snapshot or GameSnapshot(), active, COLORS,
-        hardware_labels=LABELS, language="en", **kwargs,
-    )
+def frame(**kwargs) -> Image.Image:
+    return render_screen(METRICS, COLORS, hardware_labels=LABELS, language="en", **kwargs)
 
 
 def main() -> None:
@@ -58,26 +50,6 @@ def main() -> None:
             audio_spectrum=AudioSpectrumSnapshot(bars=bars, level=0.62, active=True),
             battery_devices=GAME_BATTERIES,
         )),
-        ("Valve ping before queue", frame(
-            active=True, matchmaking_pings=PINGS, matchmaking_source="VALVE",
-            battery_devices=GAME_BATTERIES,
-        )),
-        ("FACEIT ping before queue", frame(
-            active=True, matchmaking_pings=PINGS, matchmaking_source="FACEIT",
-            battery_devices=GAME_BATTERIES,
-        )),
-        ("CS2 · CT", frame(GameSnapshot(
-            connected=True, in_match=True, team="CT", money=4250,
-            next_win_money=7500, next_loss_money=6150, loss_bonus=1900,
-        ), True, battery_devices=GAME_BATTERIES)),
-        ("CS2 · T", frame(GameSnapshot(
-            connected=True, in_match=True, team="T", money=2650,
-            next_win_money=5900, next_loss_money=4550, loss_bonus=1900,
-        ), True, battery_devices=GAME_BATTERIES)),
-        ("CS2 · Deathmatch", frame(GameSnapshot(
-            connected=True, in_match=True, team="CT", game_mode="deathmatch",
-            kills=42, headshot_kills=21, headshot_percent=50,
-        ), True, battery_devices=GAME_BATTERIES)),
         ("MSFS 2024", frame(
             msfs_active=True,
             flight_telemetry=FlightTelemetry(
@@ -96,6 +68,15 @@ def main() -> None:
             ),
             battery_devices=GAME_BATTERIES,
         )),
+        ("CS2 theme", frame(
+            weather_readings=(
+                WeatherReading("London", 17.0, 61),
+                WeatherReading("Berlin", 21.0, 3),
+                WeatherReading("Madrid", 29.0, 0),
+            ),
+            battery_devices=GAME_BATTERIES,
+            cs2_active=True,
+        )),
     ]
 
     try:
@@ -104,7 +85,8 @@ def main() -> None:
         caption_font = ImageFont.load_default()
 
     cell_width, cell_height = 500, 370
-    sheet = Image.new("RGB", (cell_width * 2, cell_height * 4), "#0D0F13")
+    rows = (len(samples) + 1) // 2
+    sheet = Image.new("RGB", (cell_width * 2, cell_height * rows), "#0D0F13")
     draw = ImageDraw.Draw(sheet)
     for index, (caption, rendered) in enumerate(samples):
         row, column = divmod(index, 2)

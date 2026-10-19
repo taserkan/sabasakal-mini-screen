@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Turing 3.5" CS2 network + system monitor prototype.
+"""Turing 3.5" system monitor screen.
 
 Uses the GPL-3.0-or-later display driver from:
 https://github.com/mathoudebine/turing-smart-screen-python
@@ -10,29 +10,23 @@ from __future__ import annotations
 import argparse
 import atexit
 import collections
-import concurrent.futures
 import contextvars
 import ctypes
 import ctypes.wintypes as wintypes
 import functools
-import http.server
 import json
 import math
 import os
 import re
-import hmac
-import secrets
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import psutil
 from PIL import Image, ImageColor, ImageDraw, ImageFont
-from ping3 import ping
 
 from battery_runtime import BatteryDevice
 from i18n import normalize_language, translate
@@ -54,7 +48,6 @@ MEDIA_VIS_REGION_WITH_BATTERY = (96, 266, 269, 295)
 ROOT = Path(__file__).resolve().parent
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SENSOR_CACHE_PATH = APP_DATA / "elevated-sensors.json"
-DEATHMATCH_CACHE_PATH = APP_DATA / "deathmatch-state.json"
 if hasattr(sys, "_MEIPASS"):
     DRIVER_ROOT = Path(sys._MEIPASS)
 elif (ROOT / "third_party" / "turing-smart-screen-python").is_dir():
@@ -63,39 +56,8 @@ else:
     DRIVER_ROOT = ROOT.parent / "turing-driver"
 ICON_ROOT = ROOT / "icons" / "png"
 SENSOR_ROOT = ROOT / "vendor"
-GSI_PORT = 38791
-GSI_TOKEN_PATH = APP_DATA / "gsi-token.txt"
-_GSI_TOKEN_CACHE: str | None = None
-# Outcome of the latest GSI POSTs (diagnostics + restart hint).
-GSI_AUTH_STATE: dict[str, object] = {"rejected_at": None}
 
 
-def gsi_token() -> str:
-    """Random per-install GSI token stored in %APPDATA% (not a shared constant)."""
-    global _GSI_TOKEN_CACHE
-    if _GSI_TOKEN_CACHE:
-        return _GSI_TOKEN_CACHE
-    token = ""
-    try:
-        token = GSI_TOKEN_PATH.read_text(encoding="ascii").strip()
-    except OSError:
-        token = ""
-    if not re.fullmatch(r"[A-Za-z0-9_-]{24,128}", token or ""):
-        token = secrets.token_urlsafe(32)
-        try:
-            GSI_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-            temporary = GSI_TOKEN_PATH.with_suffix(f".{os.getpid()}.tmp")
-            temporary.write_text(token, encoding="ascii")
-            os.replace(temporary, GSI_TOKEN_PATH)
-        except OSError as exc:
-            log_exception("gsi", "GSI token could not be stored", exc)
-    _GSI_TOKEN_CACHE = token
-    return token
-
-
-GSI_THROTTLE_SECONDS = 0.2
-GSI_MAX_PAYLOAD_BYTES = 1024 * 1024
-DEATHMATCH_RESULT_HOLD_SECONDS = 7.0
 MAX_HARDWARE_LABEL_LENGTH = 12
 _RENDER_LANGUAGE = contextvars.ContextVar("render_language", default="tr")
 
@@ -117,6 +79,25 @@ COLORS = {
     "track": "#263B32",
     "warning": "#E5C36D",
     "danger": "#E36F6F",
+}
+
+# Classic-design palette used automatically while cs2.exe runs: CS2's orange
+# (T side) and blue (CT side) on a dark warm background. warning/danger stay
+# yellow/red so a hot CPU or GPU is still distinguishable from the theme.
+CS2_THEME_COLORS = {
+    "bg": "#14100A",
+    "panel": "#221A0E",
+    "panel_2": "#1A140B",
+    "edge": "#4A3618",
+    "cpu": "#F5A524",
+    "gpu": "#5EB8F0",
+    "ram": "#E8CFA0",
+    "text": "#FBF3E6",
+    "muted": "#C9B293",
+    "dim": "#8A7556",
+    "track": "#3A2C16",
+    "warning": "#FFD166",
+    "danger": "#EF5B5B",
 }
 
 # CPU/GPU/RAM colour limits are shared with the Claude design (thresholds.py).
@@ -153,875 +134,12 @@ FONTS = {
     "gauge_unit": load_font(17, heavy=True),
     "ping": load_font(24, True),
     "money": load_font(21, True),
-    "big_value": load_font(42, True),
-    "panel_title": load_font(14, heavy=True),
     # The complete value tile is repainted for every live update, so the
     # original, wider Segoe face remains tear-free without sacrificing size.
     "sensor": load_font(21, heavy=True),
     "sensor_compact": load_font(18, heavy=True),
     "ram_sensor": load_font(17, heavy=True),
     "detail": load_font(12, heavy=True),
-}
-
-
-@dataclass(frozen=True)
-class GameSnapshot:
-    connected: bool = False
-    in_match: bool = False
-    ping_ms: float | None = None
-    money: int | None = None
-    next_win_money: int | None = None
-    next_loss_money: int | None = None
-    loss_bonus: int | None = None
-    team: str = ""
-    has_defuse_kit: bool = False
-    # Only the round state ("planted") is kept: it changes the T loss award.
-    # There is deliberately no bomb countdown/timer anywhere in the app.
-    bomb_planted: bool = False
-    game_mode: str = ""
-    kills: int | None = None
-    headshot_kills: int | None = None
-    headshot_percent: int | None = None
-    # Extended official-GSI fields used by the new design.
-    map_name: str = ""
-    round_phase: str = ""
-    round_number: int | None = None
-    score_ct: int | None = None
-    score_t: int | None = None
-    loss_streak: int | None = None
-    alive: bool | None = None
-    round_kills: int | None = None
-    round_headshots: int | None = None
-    round_damage: int | None = None
-    match_kills: int | None = None
-    match_deaths: int | None = None
-    match_assists: int | None = None
-    match_mvps: int | None = None
-    match_score: int | None = None
-
-
-def _round_winner(value: str) -> str | None:
-    lowered = value.lower()
-    if lowered.startswith("ct_") or "ct_win" in lowered:
-        return "CT"
-    if lowered.startswith("t_") or "terrorist_win" in lowered:
-        return "T"
-    return None
-
-
-def _completed_round_winners(map_data: dict) -> list[str]:
-    round_wins = map_data.get("round_wins") or {}
-    if not isinstance(round_wins, dict):
-        return []
-    ordered: list[tuple[int, str]] = []
-    for key, value in round_wins.items():
-        try:
-            index = int(key)
-        except (TypeError, ValueError):
-            continue
-        winner = _round_winner(str(value))
-        if winner:
-            ordered.append((index, winner))
-    return [winner for _index, winner in sorted(ordered)]
-
-
-def _economy_mode(map_data: dict) -> str:
-    mode = str(map_data.get("mode") or "").strip().lower()
-    if any(token in mode for token in ("scrimcomp2v2", "competitive2v2", "wingman")):
-        return "wingman"
-    if any(token in mode for token in ("competitive", "premier", "scrimcomp5v5")):
-        return "competitive"
-    return "unsupported"
-
-
-def _is_deathmatch_mode(mode: str) -> bool:
-    lowered = str(mode or "").strip().lower()
-    return any(token in lowered for token in ("deathmatch", "teamdeathmatch", "dm_freeforall"))
-
-
-def _current_half_winners(winners: list[str], half_length: int) -> list[str]:
-    """Return only rounds played on the player's current CT/T side.
-
-    GSI records winners as CT or T, not as the player's permanent team.  Old
-    halves therefore must not be counted after the side switch. Regulation
-    halves use the selected mode's length; competitive overtime uses
-    three-round halves.
-    """
-    completed = len(winners)
-    regulation_rounds = half_length * 2
-    if completed < regulation_rounds:
-        start = (completed // half_length) * half_length
-    else:
-        overtime_rounds = completed - regulation_rounds
-        start = regulation_rounds + (overtime_rounds // 3) * 3
-    return winners[start:]
-
-
-def calculate_economy(
-    money: int | None, team: str, map_data: dict, bomb_planted: bool,
-    force_competitive: bool = False,
-) -> tuple[int | None, int | None, int | None]:
-    """Return win total, loss total and the upcoming loss award.
-
-    Values mirror CS2's local competitive and competitive2v2 configuration.
-    The loss estimate assumes the player receives the normal team award; a
-    T-side timeout save is the one in-game exception and cannot be predicted.
-    """
-    if money is None or team not in {"CT", "T"}:
-        return None, None, None
-    mode = _economy_mode(map_data)
-    raw_mode = str(map_data.get("mode") or "").strip().lower()
-    # FACEIT community servers may identify themselves as `custom` although
-    # they use the normal 5v5 competitive economy. The caller only enables
-    # this override while FACEIT AC is active; explicit casual/deathmatch
-    # modes are never overridden.
-    if mode == "unsupported" and force_competitive and raw_mode in {"", "custom"}:
-        mode = "competitive"
-    if mode == "unsupported":
-        return None, None, None
-    if mode == "wingman":
-        loss_base, loss_step, starting_losses = 2000, 300, 0
-        standard_win, max_money, half_length = 2750, 8000, 8
-    else:
-        loss_base, loss_step, starting_losses = 1400, 500, 1
-        standard_win, max_money, half_length = 3250, 16000, 12
-
-    # Since the March 2019 economy change, winning lowers the loss counter by
-    # one instead of resetting it.  The counter is capped at four steps.
-    loss_counter = starting_losses
-    winners = _current_half_winners(_completed_round_winners(map_data), half_length)
-    for winner in winners:
-        if winner == team:
-            loss_counter = max(0, loss_counter - 1)
-        else:
-            loss_counter = min(4, loss_counter + 1)
-    loss_award = loss_base + (loss_step * loss_counter)
-    if team == "T" and bomb_planted:
-        loss_award += 600
-    return (
-        min(max_money, money + standard_win),
-        min(max_money, money + loss_award),
-        loss_award,
-    )
-
-
-class CS2GameState:
-    """Thread-safe receiver state for CS2's official Game State Integration."""
-
-    def __init__(self, deathmatch_cache_path: Path | None = None) -> None:
-        self._lock = threading.Lock()
-        self._data: dict = {}
-        self._last_update = 0.0
-        self._last_local_player: dict = {}
-        self._pending_save: dict | None = None
-        self._last_save = 0.0
-        # CS2 resets state.round_kills/round_killhs after every death in
-        # Deathmatch.  Keep a match-local accumulator so the panel represents
-        # the scoreboard instead of only the current life.
-        self._dm_active = False
-        self._dm_identity = ""
-        self._dm_phase = ""
-        self._dm_countdown_seconds: float | None = None
-        self._dm_kills = 0
-        self._dm_headshots = 0
-        self._dm_life_kills = 0
-        self._dm_life_headshots = 0
-        self._dm_match_kills: int | None = None
-        self._dm_match_deaths: int | None = None
-        self._dm_match_score: int | None = None
-        self._dm_last_health: int | None = None
-        self._dm_death_seen = False
-        self._dm_last_reset_reason = ""
-        self._dm_gameover_started: float | None = None
-        self._dm_cache_path = (
-            deathmatch_cache_path
-            if deathmatch_cache_path is not None
-            else DEATHMATCH_CACHE_PATH if getattr(sys, "frozen", False) else None
-        )
-        self._restore_deathmatch_stats()
-
-    def _restore_deathmatch_stats(self) -> None:
-        if self._dm_cache_path is None:
-            return
-        try:
-            cached = json.loads(self._dm_cache_path.read_text(encoding="utf-8"))
-            saved_at = float(cached.get("saved_at", 0.0))
-            if time.time() - saved_at > 45.0:
-                return
-            identity = str(cached.get("identity") or "")
-            if not identity:
-                return
-            self._dm_active = True
-            self._dm_identity = identity
-            self._dm_phase = str(cached.get("phase") or "")
-            cached_seconds = cached.get("countdown_seconds")
-            self._dm_countdown_seconds = (
-                max(0.0, float(cached_seconds)) if cached_seconds is not None else None
-            )
-            self._dm_kills = max(0, int(cached.get("kills", 0)))
-            self._dm_headshots = max(0, int(cached.get("headshots", 0)))
-            self._dm_life_kills = max(0, int(cached.get("life_kills", 0)))
-            self._dm_life_headshots = max(0, int(cached.get("life_headshots", 0)))
-            self._dm_match_kills = (
-                max(0, int(cached["match_kills"]))
-                if cached.get("match_kills") is not None else None
-            )
-            self._dm_match_deaths = (
-                max(0, int(cached["match_deaths"]))
-                if cached.get("match_deaths") is not None else None
-            )
-            self._dm_match_score = (
-                int(cached["match_score"])
-                if cached.get("match_score") is not None else None
-            )
-            self._dm_last_health = (
-                max(0, int(cached["last_health"]))
-                if cached.get("last_health") is not None else None
-            )
-            self._dm_death_seen = bool(cached.get("death_seen", False))
-            self._dm_last_reset_reason = str(cached.get("last_reset_reason") or "")
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return
-
-    def _save_deathmatch_stats_locked(self) -> None:
-        """Queue the cache payload; the disk write happens outside the lock."""
-        if self._dm_cache_path is None:
-            return
-        payload = {
-            "saved_at": time.time(),
-            "identity": self._dm_identity,
-            "phase": self._dm_phase,
-            "countdown_seconds": self._dm_countdown_seconds,
-            "kills": self._dm_kills,
-            "headshots": self._dm_headshots,
-            "life_kills": self._dm_life_kills,
-            "life_headshots": self._dm_life_headshots,
-            # These official GSI cumulative fields also make the cache a
-            # privacy-safe diagnostic record: no name or Steam ID is
-            # written, only the counters needed to verify match borders.
-            "match_kills": self._dm_match_kills,
-            "match_deaths": self._dm_match_deaths,
-            "match_score": self._dm_match_score,
-            "last_health": self._dm_last_health,
-            "death_seen": self._dm_death_seen,
-            "last_reset_reason": self._dm_last_reset_reason,
-        }
-        self._pending_save = payload
-
-    def _flush_pending_save(self, force: bool = False) -> None:
-        """Write at most every 2 s, never while holding the state lock."""
-        now = time.monotonic()
-        with self._lock:
-            payload = self._pending_save
-            if payload is None or (not force and now - self._last_save < 2.0):
-                return
-            self._pending_save = None
-            self._last_save = now
-        if self._dm_cache_path is None:
-            return
-        try:
-            self._dm_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self._dm_cache_path.with_suffix(f".{os.getpid()}.tmp")
-            temporary.write_text(json.dumps(payload), encoding="utf-8")
-            os.replace(temporary, self._dm_cache_path)
-        except OSError as exc:
-            log_exception("gsi", "deathmatch cache write failed", exc)
-
-    def _clear_deathmatch_stats_locked(self) -> None:
-        if self._dm_cache_path is None:
-            return
-        try:
-            self._dm_cache_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    def _update_deathmatch_stats_locked(self, payload: dict, player: dict) -> None:
-        map_data = payload.get("map") or self._data.get("map") or {}
-        mode = str(map_data.get("mode") or "")
-        if not mode:
-            # A heartbeat may arrive before the first complete map packet.
-            # Do not discard a fresh restart cache until the mode is known.
-            return
-        if not _is_deathmatch_mode(mode):
-            self._dm_active = False
-            self._dm_identity = ""
-            self._dm_phase = ""
-            self._dm_countdown_seconds = None
-            self._dm_kills = 0
-            self._dm_headshots = 0
-            self._dm_life_kills = 0
-            self._dm_life_headshots = 0
-            self._dm_match_kills = None
-            self._dm_match_deaths = None
-            self._dm_match_score = None
-            self._dm_last_health = None
-            self._dm_death_seen = False
-            self._dm_last_reset_reason = ""
-            self._dm_gameover_started = None
-            self._clear_deathmatch_stats_locked()
-            return
-
-        phase_data = payload.get("phase_countdowns") or self._data.get("phase_countdowns") or {}
-        countdown_phase = str(phase_data.get("phase") or "").lower()
-        map_phase = str(map_data.get("phase") or "").lower()
-        phase = countdown_phase or map_phase or self._dm_phase
-        if phase == "gameover":
-            if self._dm_gameover_started is None:
-                self._dm_gameover_started = time.monotonic()
-        else:
-            self._dm_gameover_started = None
-        try:
-            countdown_seconds = max(0.0, float(phase_data["phase_ends_in"]))
-        except (KeyError, TypeError, ValueError):
-            countdown_seconds = None
-        match_stats = player.get("match_stats") or {} if player else {}
-
-        def cumulative_stat(name: str) -> int | None:
-            try:
-                return max(0, int(match_stats[name]))
-            except (KeyError, TypeError, ValueError):
-                return None
-
-        match_kills = cumulative_stat("kills")
-        match_deaths = cumulative_stat("deaths")
-        try:
-            match_score = int(match_stats["score"])
-        except (KeyError, TypeError, ValueError):
-            match_score = None
-        state = player.get("state") or {} if player else {}
-        try:
-            health = max(0, int(state["health"]))
-        except (KeyError, TypeError, ValueError):
-            health = None
-        try:
-            incoming_life_kills = max(0, int(state["round_kills"]))
-        except (KeyError, TypeError, ValueError):
-            incoming_life_kills = None
-        if health is not None and health <= 0:
-            self._dm_death_seen = True
-        identity = f"{mode.lower()}|{str(map_data.get('name') or '').lower()}"
-        entered_warmup = phase == "warmup" and self._dm_phase != "warmup"
-        entered_live = phase == "live" and self._dm_phase in {
-            "warmup", "intermission", "gameover",
-        }
-        # Some Deathmatch servers keep map.phase="live" during warm-up. In
-        # that case the only reliable boundary is the countdown jumping from
-        # a few warm-up seconds to the full match clock (normally 600 s).
-        match_clock_restarted = (
-            countdown_seconds is not None
-            and self._dm_countdown_seconds is not None
-            and countdown_seconds >= 300.0
-            and countdown_seconds > self._dm_countdown_seconds + 120.0
-        )
-        # On the official Deathmatch servers tested here, both map.phase and
-        # phase_countdowns can remain "live" (or the latter can be omitted)
-        # across warm-up. player_match_stats is cumulative across respawns,
-        # but resets when the real match begins; a decrease is therefore a
-        # direct GSI match boundary rather than a timer guess.
-        cumulative_stats_reset = any((
-            match_kills is not None
-            and self._dm_match_kills is not None
-            and match_kills < self._dm_match_kills,
-            match_deaths is not None
-            and self._dm_match_deaths is not None
-            and match_deaths < self._dm_match_deaths,
-        ))
-        # When Valve omits both countdowns and player_match_stats, the local
-        # life counter is the remaining official signal. A normal respawn is
-        # preceded by health=0; the warm-up reset drops round_kills while the
-        # player stays alive. Require known positive health on both packets so
-        # missing death packets never erase a real match total.
-        alive_counter_reset = (
-            incoming_life_kills is not None
-            and incoming_life_kills < self._dm_life_kills
-            and health is not None and health > 0
-            and self._dm_last_health is not None and self._dm_last_health > 0
-            and not self._dm_death_seen
-        )
-        reset_reasons = []
-        if not self._dm_active:
-            reset_reasons.append("first-packet")
-        if self._dm_identity and identity != self._dm_identity:
-            reset_reasons.append("map-change")
-        if entered_warmup:
-            reset_reasons.append("warmup-phase")
-        if entered_live:
-            reset_reasons.append("live-phase")
-        if match_clock_restarted:
-            reset_reasons.append("match-clock")
-        if cumulative_stats_reset:
-            reset_reasons.append("match-stats")
-        if alive_counter_reset:
-            reset_reasons.append("alive-counter-reset")
-        reset_match = bool(reset_reasons)
-        if reset_match:
-            self._dm_kills = 0
-            self._dm_headshots = 0
-            self._dm_life_kills = 0
-            self._dm_life_headshots = 0
-            self._dm_last_reset_reason = "+".join(reset_reasons)
-
-        self._dm_active = True
-        self._dm_identity = identity
-        self._dm_phase = phase
-        self._dm_countdown_seconds = countdown_seconds
-        if match_kills is not None:
-            self._dm_match_kills = match_kills
-        if match_deaths is not None:
-            self._dm_match_deaths = match_deaths
-        if match_score is not None:
-            self._dm_match_score = match_score
-
-        if not player:
-            return
-        try:
-            life_kills = max(0, int(state["round_kills"]))
-        except (KeyError, TypeError, ValueError):
-            life_kills = None
-        try:
-            life_headshots = max(0, int(state["round_killhs"]))
-        except (KeyError, TypeError, ValueError):
-            life_headshots = None
-
-        if life_kills is not None:
-            if life_kills >= self._dm_life_kills:
-                self._dm_kills += life_kills - self._dm_life_kills
-            else:
-                # A lower value is a respawn. The old life's kills are
-                # already in the total; count only events in the new life.
-                self._dm_kills += life_kills
-            self._dm_life_kills = life_kills
-        if life_headshots is not None:
-            if life_headshots >= self._dm_life_headshots:
-                self._dm_headshots += life_headshots - self._dm_life_headshots
-            else:
-                self._dm_headshots += life_headshots
-            self._dm_life_headshots = life_headshots
-
-        if health is not None:
-            if health > 0 and self._dm_last_health == 0:
-                self._dm_death_seen = False
-            self._dm_last_health = health
-
-        # match_stats.kills is cumulative on builds that expose it. Use it as
-        # a floor to recover kills if a short-lived GSI packet was missed.
-        scoreboard_kills = match_kills
-        if scoreboard_kills is not None:
-            self._dm_kills = max(self._dm_kills, scoreboard_kills)
-        self._save_deathmatch_stats_locked()
-
-    def update(self, payload: dict) -> None:
-        now = time.monotonic()
-        # "previously"/"added" are diff sections; merging them would leave
-        # stale nested values in the state forever.
-        payload = {
-            key: value for key, value in payload.items()
-            if key not in {"previously", "added", "auth"}
-        }
-        with self._lock:
-            incoming_map = payload.get("map")
-            current_map = self._data.get("map")
-            if (
-                isinstance(incoming_map, dict) and isinstance(current_map, dict)
-                and incoming_map.get("name") and current_map.get("name")
-                and incoming_map.get("name") != current_map.get("name")
-            ):
-                # New map: forget every section of the previous match.
-                self._data = {}
-                self._last_local_player = {}
-            provider_id = str((payload.get("provider") or {}).get("steamid") or "")
-            player = payload.get("player") or {}
-            player_id = str(player.get("steamid") or "")
-            # On death CS2 can briefly omit `player`, then publish the player
-            # being spectated. Neither packet represents a lobby transition.
-            # Keep the last known local player until CS2 sends that local
-            # player's state again so the screen does not flash matchmaking
-            # pings between death and spectator/economy updates.
-            if player and (not provider_id or (player_id and provider_id == player_id)):
-                self._last_local_player = player
-                self._update_deathmatch_stats_locked(payload, player)
-            elif not player:
-                # Map phase changes (warm-up -> live, gameover -> warm-up)
-                # can arrive without a player section and must still reset
-                # the Deathmatch totals at the correct boundary.
-                self._update_deathmatch_stats_locked(payload, {})
-            # GSI packets are normally complete, but death/observer boundary
-            # packets can omit a top-level section for one delivery. Preserve
-            # the last value for omitted sections while accepting every
-            # section that CS2 did send.
-            merged = dict(self._data)
-            merged.update(payload)
-            self._data = merged
-            self._last_update = now
-        self._flush_pending_save()
-
-    def snapshot(self, force_competitive_economy: bool = False) -> GameSnapshot:
-        now = time.monotonic()
-        with self._lock:
-            payload = dict(self._data)
-            player = dict(self._last_local_player)
-            last_update = self._last_update
-            dm_kills = self._dm_kills
-            dm_headshots = self._dm_headshots
-            dm_gameover_started = self._dm_gameover_started
-        connected = bool(last_update and now - last_update < 8.0)
-        map_data = payload.get("map") or {}
-        state = player.get("state") or {}
-        team = str(player.get("team") or "").upper()
-        try:
-            money = int(state["money"])
-        except (KeyError, TypeError, ValueError):
-            money = None
-        match_stats = player.get("match_stats") or {}
-        if _is_deathmatch_mode(str(map_data.get("mode") or "")):
-            kills = dm_kills
-            headshot_kills = dm_headshots
-        else:
-            try:
-                kills = int(state.get("round_kills", match_stats.get("kills")))
-            except (TypeError, ValueError):
-                kills = None
-            try:
-                headshot_kills = int(state["round_killhs"])
-            except (KeyError, TypeError, ValueError):
-                headshot_kills = None
-        headshot_percent = (
-            # CS2's scoreboard truncates the fractional part instead of
-            # rounding it (12 headshots / 17 kills is shown as 70%, not 71%).
-            int((headshot_kills * 100.0) / kills)
-            if kills and headshot_kills is not None else 0 if kills == 0 else None
-        )
-        has_kit = bool(state.get("defusekit"))
-        round_data = payload.get("round") or {}
-        bomb_planted = str(round_data.get("bomb") or "").lower() == "planted"
-        next_win, next_loss, loss_bonus = calculate_economy(
-            money, team, map_data, bomb_planted,
-            force_competitive=force_competitive_economy,
-        )
-        # GSI can keep the last map payload alive for a few seconds after the
-        # player returns to the menu.  Requiring the local player's activity
-        # to be "playing" prevents that stale payload from hiding the
-        # pre-match FACEIT/Valve ping panel.
-        activity = str(player.get("activity") or "").lower()
-        in_match = (
-            connected
-            and activity == "playing"
-            and str(map_data.get("phase") or "").lower() not in {"", "gameover"}
-        )
-        # CS2 publishes gameover shortly before its result screen has finished.
-        # Keep the final Deathmatch kills/HS visible long enough to read them
-        # instead of flashing straight back to the pre-match ping panel.
-        if (
-            connected
-            and _is_deathmatch_mode(str(map_data.get("mode") or ""))
-            and dm_gameover_started is not None
-            and now - dm_gameover_started < DEATHMATCH_RESULT_HOLD_SECONDS
-        ):
-            in_match = True
-        return GameSnapshot(
-            connected=connected,
-            in_match=in_match,
-            money=money,
-            next_win_money=next_win,
-            next_loss_money=next_loss,
-            loss_bonus=loss_bonus,
-            team=team,
-            has_defuse_kit=has_kit,
-            bomb_planted=bomb_planted,
-            game_mode=str(map_data.get("mode") or ""),
-            kills=kills,
-            headshot_kills=headshot_kills,
-            headshot_percent=headshot_percent,
-            **_extended_round_fields(map_data, round_data, player, team),
-        )
-
-
-def _int_or_none(value: object) -> int | None:
-    try:
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
-
-
-def _extended_round_fields(map_data: dict, round_data: dict, player: dict, team: str) -> dict:
-    """Official GSI values for the buy/death/live screens of the new design."""
-    state = player.get("state") if isinstance(player.get("state"), dict) else {}
-    match_stats = player.get("match_stats") if isinstance(player.get("match_stats"), dict) else {}
-    team_ct = map_data.get("team_ct") if isinstance(map_data.get("team_ct"), dict) else {}
-    team_t = map_data.get("team_t") if isinstance(map_data.get("team_t"), dict) else {}
-    own_team = team_ct if team == "CT" else team_t if team == "T" else {}
-    health = _int_or_none(state.get("health"))
-    played = _int_or_none(map_data.get("round"))
-    return {
-        "map_name": str(map_data.get("name") or ""),
-        "round_phase": str(round_data.get("phase") or "").lower(),
-        # map.round counts completed rounds; the current round is +1.
-        "round_number": None if played is None else played + 1,
-        "score_ct": _int_or_none(team_ct.get("score")),
-        "score_t": _int_or_none(team_t.get("score")),
-        "loss_streak": _int_or_none(own_team.get("consecutive_round_losses")),
-        "alive": None if health is None else health > 0,
-        "round_kills": _int_or_none(state.get("round_kills")),
-        "round_headshots": _int_or_none(state.get("round_killhs")),
-        "round_damage": _int_or_none(state.get("round_totaldmg")),
-        "match_kills": _int_or_none(match_stats.get("kills")),
-        "match_deaths": _int_or_none(match_stats.get("deaths")),
-        "match_assists": _int_or_none(match_stats.get("assists")),
-        "match_mvps": _int_or_none(match_stats.get("mvps")),
-        "match_score": _int_or_none(match_stats.get("score")),
-    }
-
-
-def _note_gsi_request(status: str, reason: str) -> None:
-    """Remember the outcome of the latest GSI POST (for the diagnostic log)."""
-    now = time.time()
-    GSI_AUTH_STATE["last_at"] = now
-    GSI_AUTH_STATE["last_status"] = status
-    GSI_AUTH_STATE["last_reason"] = reason
-    key = "accepted" if status == "accepted" else "rejected"
-    GSI_AUTH_STATE[key] = int(GSI_AUTH_STATE.get(key) or 0) + 1
-    if reason == "token mismatch":
-        # Usually CS2 still runs with an older cfg/token: it reads
-        # gamestate_integration_*.cfg only at launch.
-        GSI_AUTH_STATE["rejected_at"] = now
-
-
-def gsi_request_summary() -> str:
-    state = GSI_AUTH_STATE
-    if not state.get("last_at"):
-        return "no GSI request received yet"
-    age = max(0.0, time.time() - float(state["last_at"]))
-    return (
-        f"last={state.get('last_status')}; reason={state.get('last_reason')}; "
-        f"age={age:.1f}s; accepted={int(state.get('accepted') or 0)}; "
-        f"rejected={int(state.get('rejected') or 0)}"
-    )
-
-
-class _GSIHandler(http.server.BaseHTTPRequestHandler):
-    def _reply(self, code: int) -> None:
-        self.send_response(code)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def _read_body(self) -> bytes | None:
-        if "chunked" in str(self.headers.get("Transfer-Encoding") or "").lower():
-            body = bytearray()
-            while True:
-                size_line = self.rfile.readline(64)
-                size = int(size_line.split(b";", 1)[0].strip() or b"0", 16)
-                if size == 0:
-                    self.rfile.readline(64)
-                    return bytes(body)
-                body += self.rfile.read(size)
-                self.rfile.readline(64)
-                if len(body) > GSI_MAX_PAYLOAD_BYTES:
-                    return None
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0 or length > GSI_MAX_PAYLOAD_BYTES:
-            return None
-        return self.rfile.read(length)
-
-    def do_POST(self) -> None:  # noqa: N802 - stdlib handler name
-        # CS2 ("Valve/Steam HTTP Client 1.0") never sends an Origin header;
-        # browsers always do for cross-site POSTs. Rejecting it blocks
-        # drive-by requests from web pages.
-        if self.headers.get("Origin") is not None:
-            _note_gsi_request("rejected", "origin header")
-            self._reply(403)
-            return
-        try:
-            raw = self._read_body()
-            if raw is None:
-                _note_gsi_request("rejected", "bad length")
-                self._reply(413)
-                return
-            payload = json.loads(raw.decode("utf-8-sig"))
-            if not isinstance(payload, dict):
-                raise ValueError("GSI payload must be an object")
-            auth = payload.get("auth")
-            token = str((auth if isinstance(auth, dict) else {}).get("token") or "").strip()
-            if hmac.compare_digest(token.encode(), gsi_token().encode()):
-                self.server.game_state.update(payload)  # type: ignore[attr-defined]
-                _note_gsi_request("accepted", "ok")
-            else:
-                _note_gsi_request("rejected", "token mismatch" if token else "no token")
-            self._reply(200)
-        except Exception as exc:
-            _note_gsi_request("rejected", f"bad payload ({type(exc).__name__})")
-            self._reply(400)
-
-    def log_message(self, _format: str, *_args: object) -> None:
-        return
-
-
-class GSIServer:
-    def __init__(self, game_state: CS2GameState) -> None:
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", GSI_PORT), _GSIHandler)
-        self.server.game_state = game_state  # type: ignore[attr-defined]
-        self.thread = threading.Thread(target=self.server.serve_forever, name="cs2-gsi", daemon=True)
-
-    def start(self) -> None:
-        self.thread.start()
-
-    def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2.0)
-
-
-@dataclass(frozen=True)
-class RelayPing:
-    code: str
-    name: str
-    ip: str
-    latency_ms: float
-
-
-MATCHMAKING_POP_NAMES = {
-    "ams": "Amsterdam", "atl": "Atlanta", "bom": "Mumbai", "dxb": "Dubai",
-    "dfw": "Dallas", "eze": "Buenos Aires", "fra": "Frankfurt", "fsn": "Falkenstein",
-    "gru": "São Paulo", "hel": "Helsinki", "hkg": "Hong Kong", "iad": "Virginia",
-    "jnb": "Johannesburg", "lax": "Los Angeles", "lhr": "Birleşik Krallık",
-    "lim": "Lima", "maa": "Chennai", "mad": "Madrid", "man": "Manchester",
-    "ord": "Chicago", "par": "Paris", "scl": "Santiago", "sea": "Seattle",
-    "sgp": "Singapur", "sto": "Stockholm", "syd": "Sidney", "tyo": "Tokyo",
-    "vie": "Viyana", "waw": "Varşova",
-}
-CS2_CONSOLE_PING_READ_INTERVAL_SECONDS = 1.0
-CS2_EXACT_PING_MODE = "console_log"
-
-
-class CS2ConsolePingMonitor:
-    """Read the SDR table written by CS2 itself to its local console log."""
-
-    _PING_LINE = re.compile(r"(?i)\b([a-z][a-z0-9]{2,3}):\s*(\d+)\s*ms\b")
-    _PING_LOCATION = re.compile(r"(?im)Ping location:\s*([^\r\n]+)")
-
-    VALUE_MAX_AGE_SECONDS = 600.0
-    TAIL_KEEP_BYTES = 256 * 1024
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._values: list[RelayPing] = []
-        self._values_at = 0.0
-        self._last_read = 0.0
-        self._last_size = -1
-        self._offset = 0
-        self._path: Path | None = None
-        self._tail = ""
-
-    @classmethod
-    def parse_ping_text(cls, text: str) -> dict[str, int]:
-        table = {
-            code.lower(): int(latency)
-            for code, latency in cls._PING_LINE.findall(text)
-            if code.lower() in MATCHMAKING_POP_NAMES and code.lower() != "fsn"
-        }
-        locations = cls._PING_LOCATION.findall(text)
-        if not locations:
-            return table
-        latest: dict[str, int] = {}
-        for item in locations[-1].split(","):
-            code, separator, routes = item.strip().partition("=")
-            code = code.lower()
-            if not separator or code not in MATCHMAKING_POP_NAMES or code == "fsn":
-                continue
-            estimates = [int(value) for value in re.findall(r"/?(\d+)\+\d+", routes)]
-            if estimates:
-                latest[code] = min(estimates)
-        return latest or table
-
-    @staticmethod
-    def _console_log_path() -> Path | None:
-        cfg_dir = find_cs2_cfg_dir()
-        return cfg_dir.parent / "console.log" if cfg_dir is not None else None
-
-    def _current_values(self, now: float) -> list[RelayPing]:
-        if self._values and now - self._values_at > self.VALUE_MAX_AGE_SECONDS:
-            # A ping table from an old session must not be shown as current.
-            self._values = []
-        return list(self._values)
-
-    def read(self) -> list[RelayPing]:
-        now = time.monotonic()
-        with self._lock:
-            if now - self._last_read < CS2_CONSOLE_PING_READ_INTERVAL_SECONDS:
-                return self._current_values(now)
-            self._last_read = now
-        path = self._console_log_path()
-        if path is None:
-            return []
-        try:
-            size = path.stat().st_size
-            with self._lock:
-                if path != self._path or size < self._offset:
-                    # New file or truncated by a CS2 restart: start over, but
-                    # never read more than the last megabyte.
-                    self._path = path
-                    self._offset = max(0, size - 1024 * 1024)
-                    self._tail = ""
-                if size == self._last_size:
-                    return self._current_values(now)
-                self._last_size = size
-                offset = self._offset
-            with path.open("rb") as stream:
-                stream.seek(offset)
-                chunk = stream.read(max(0, size - offset))
-            text = chunk.decode("utf-8", errors="ignore")
-            with self._lock:
-                self._offset = offset + len(chunk)
-                # Keep a bounded tail so a table split across reads still parses.
-                self._tail = (self._tail + text)[-self.TAIL_KEEP_BYTES:]
-                tail = self._tail
-            parsed = self.parse_ping_text(tail)
-            rows = [
-                RelayPing(code, MATCHMAKING_POP_NAMES[code], "", float(latency))
-                for code, latency in parsed.items()
-            ]
-            rows.sort(key=lambda item: item.latency_ms)
-            with self._lock:
-                if len(rows) >= 3 and text and self.parse_ping_text(text):
-                    self._values = rows[:3]
-                    self._values_at = now
-                elif len(rows) >= 3 and not self._values:
-                    self._values = rows[:3]
-                    self._values_at = now
-                return self._current_values(now)
-        except OSError as exc:
-            log_exception("cs2-ping", "console.log read failed", exc)
-            return []
-
-    def close(self) -> None:
-        return None
-
-
-class MatchmakingPingMonitor:
-    """Read only the matchmaking table that CS2 writes to its own log."""
-
-    def __init__(self) -> None:
-        self.exact = CS2ConsolePingMonitor()
-
-    def read(self) -> list[RelayPing]:
-        return self.exact.read()
-
-    def close(self) -> None:
-        self.exact.close()
-
-
-STEAM_PING_MONITOR = MatchmakingPingMonitor()
-atexit.register(STEAM_PING_MONITOR.close)
-
-
-# Addresses are selected from HiperZ's current EU diagnostic package, the
-# latency test FACEIT support directs players to for FACEIT server routing.
-FACEIT_LOCATION_TARGETS = {
-    "Almanya": ("85.114.146.1", "fsn.icmp.hetzner.com", "145.239.244.75"),
-    "Hollanda": ("mirror.nforce.com", "iperf.worldstream.nl", "mirror.i3d.net"),
-    "İsveç": ("185.76.9.135", "185.62.206.1", "speed.se.m247.ro"),
-    "Finlandiya": ("hel.icmp.hetzner.com",),
-    "Birleşik Krallık": ("198.244.202.178", "185.38.150.1", "185.59.221.51"),
-    "Fransa": ("54.37.87.229", "185.93.2.193"),
 }
 
 
@@ -1075,84 +193,6 @@ class ProcessScanner:
 PROCESS_SCANNER = ProcessScanner()
 
 
-def faceit_ac_is_running() -> bool:
-    return PROCESS_SCANNER.running("faceitclient.exe")
-
-
-class FaceitPingMonitor:
-    """Measure the official HiperZ diagnostic nodes while FACEIT AC is active."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._started = False
-        self._stop = threading.Event()
-        self._values: list[RelayPing] = []
-
-    def read(self) -> list[RelayPing]:
-        with self._lock:
-            if not self._started:
-                self._started = True
-                threading.Thread(target=self._run, name="faceit-ping-reader", daemon=True).start()
-            return list(self._values)
-
-    def close(self) -> None:
-        self._stop.set()
-
-    @staticmethod
-    def _probe(item: tuple[str, str]) -> tuple[str, float] | None:
-        location, host = item
-        try:
-            latency = ping(host, timeout=0.8, unit="ms")
-        except Exception:
-            latency = None
-        if latency is None or latency <= 0:
-            return None
-        return location, float(latency)
-
-    def _run(self) -> None:
-        targets = [
-            (location, host)
-            for location, hosts in FACEIT_LOCATION_TARGETS.items()
-            for host in hosts
-        ]
-        executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=len(targets), thread_name_prefix="faceit-ping",
-        )
-        try:
-            self._loop(executor, targets)
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-            with self._lock:
-                self._started = False
-
-    def _loop(self, executor: concurrent.futures.ThreadPoolExecutor, targets: list) -> None:
-        while not self._stop.is_set():
-            if not faceit_ac_is_running():
-                # Nothing to show: do not send ICMP probes in the background.
-                with self._lock:
-                    self._values = []
-                self._stop.wait(5.0)
-                continue
-            samples = list(executor.map(self._probe, targets))
-            grouped: dict[str, list[float]] = {}
-            for sample in samples:
-                if sample is not None:
-                    grouped.setdefault(sample[0], []).append(sample[1])
-            values = [
-                RelayPing(location.lower(), location, "", min(latencies))
-                for location, latencies in grouped.items()
-                if latencies
-            ]
-            values.sort(key=lambda item: item.latency_ms)
-            with self._lock:
-                self._values = values[:3]
-            self._stop.wait(4.0)
-
-
-FACEIT_PING_MONITOR = FaceitPingMonitor()
-atexit.register(FACEIT_PING_MONITOR.close)
-
-
 def cs2_is_running() -> bool:
     return PROCESS_SCANNER.running("cs2.exe")
 
@@ -1163,231 +203,6 @@ def msfs_session_seconds() -> float | None:
     if started_at is None:
         return None
     return max(0.0, time.time() - (started_at or time.time()))
-
-
-_CFG_DIR_CACHE: tuple[float, Path | None] | None = None
-CFG_DIR_CACHE_SECONDS = 300.0
-
-
-def find_cs2_cfg_dir() -> Path | None:
-    """Cached lookup (registry + libraryfolders.vdf parse is not free)."""
-    global _CFG_DIR_CACHE
-    now = time.monotonic()
-    cached = _CFG_DIR_CACHE
-    if cached is not None and now - cached[0] < CFG_DIR_CACHE_SECONDS:
-        if cached[1] is None or cached[1].is_dir():
-            return cached[1]
-    result = _find_cs2_cfg_dir_uncached()
-    _CFG_DIR_CACHE = (now, result)
-    return result
-
-
-def _find_cs2_cfg_dir_uncached() -> Path | None:
-    candidates: list[Path] = []
-    if os.name == "nt":
-        try:
-            import winreg
-            for hive, key_name in (
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam"),
-                (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
-            ):
-                try:
-                    with winreg.OpenKey(hive, key_name) as key:
-                        value, _kind = winreg.QueryValueEx(key, "InstallPath")
-                        candidates.append(Path(value))
-                except OSError:
-                    continue
-        except ImportError:
-            pass
-    libraries: list[Path] = []
-    for steam_root in candidates:
-        libraries.append(steam_root)
-        library_file = steam_root / "steamapps" / "libraryfolders.vdf"
-        try:
-            content = library_file.read_text(encoding="utf-8", errors="ignore")
-            for line in content.splitlines():
-                stripped = line.strip()
-                if not stripped.startswith('"path"'):
-                    continue
-                value = stripped.split('"')[3].replace("\\\\", "\\")
-                libraries.append(Path(value))
-        except OSError:
-            continue
-    for library in libraries:
-        cfg_dir = library / "steamapps" / "common" / "Counter-Strike Global Offensive" / "game" / "csgo" / "cfg"
-        if cfg_dir.is_dir():
-            return cfg_dir
-    return None
-
-
-def _vdf_block_bounds(content: str, key: str) -> tuple[int, int] | None:
-    """Locate a quoted VDF object's braces without being confused by nesting."""
-    for match in re.finditer(rf'"{re.escape(key)}"\s*\{{', content):
-        opening = content.find("{", match.start())
-        depth = 0
-        quoted = False
-        escaped = False
-        for index in range(opening, len(content)):
-            char = content[index]
-            if quoted:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    quoted = False
-                continue
-            if char == '"':
-                quoted = True
-            elif char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    return opening, index
-    return None
-
-
-def add_cs2_console_log_launch_option(content: str) -> tuple[str, bool]:
-    """Enable CS2 console logging while preserving the user's other options."""
-    search_from = 0
-    while search_from < len(content):
-        relative = _vdf_block_bounds(content[search_from:], "730")
-        if relative is None:
-            return content, False
-        opening = search_from + relative[0]
-        closing = search_from + relative[1]
-        block = content[opening:closing + 1]
-        option_match = re.search(r'("LaunchOptions"\s*")([^"]*)(")', block)
-        if option_match is None:
-            search_from = closing + 1
-            continue
-        options = option_match.group(2).strip()
-        # Remove the unsupported VConsole switch if an earlier build added it.
-        updated_options = re.sub(
-            r"(?:^|\s)-vconsole(?=\s|$)", " ", options, flags=re.IGNORECASE,
-        )
-        updated_options = " ".join(updated_options.split())
-        if not re.search(r"(?:^|\s)-condebug(?:\s|$)", updated_options, re.IGNORECASE):
-            updated_options = f"{updated_options} -condebug".strip()
-        if updated_options == options:
-            return content, False
-        updated_block = (
-            block[:option_match.start(2)] + updated_options + block[option_match.end(2):]
-        )
-        return content[:opening] + updated_block + content[closing + 1:], True
-    return content, False
-
-
-def install_cs2_console_log_launch_option() -> Path | None:
-    """Enable CS2's own local console log for exact ping reads next launch."""
-    if os.name != "nt":
-        return None
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam\ActiveProcess") as key:
-            active_user, _kind = winreg.QueryValueEx(key, "ActiveUser")
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
-            steam_path, _kind = winreg.QueryValueEx(key, "SteamPath")
-    except (ImportError, OSError):
-        return None
-    if not active_user:
-        return None
-    target = Path(steam_path) / "userdata" / str(int(active_user)) / "config" / "localconfig.vdf"
-    try:
-        content = target.read_text(encoding="utf-8", errors="ignore")
-        updated, changed = add_cs2_console_log_launch_option(content)
-        if changed:
-            temporary = target.with_suffix(".vdf.sabasakal.tmp")
-            temporary.write_text(updated, encoding="utf-8")
-            os.replace(temporary, target)
-        return target
-    except OSError:
-        return None
-
-
-def gsi_config_text() -> str:
-    return f'''"CS2 Screen v1.0"
-{{
-    "uri" "http://127.0.0.1:{GSI_PORT}"
-    "timeout" "0.1"
-    "buffer" "0.0"
-    "throttle" "{GSI_THROTTLE_SECONDS:.1f}"
-    "heartbeat" "5.0"
-    "auth"
-    {{
-        "token" "{gsi_token()}"
-    }}
-    "data"
-    {{
-        "provider" "1"
-        "map" "1"
-        "map_round_wins" "1"
-        "round" "1"
-        "player_id" "1"
-        "player_state" "1"
-        "player_match_stats" "1"
-        "player_weapons" "1"
-        "phase_countdowns" "1"
-    }}
-}}
-'''
-
-
-GSI_CONFIG_NAME = "gamestate_integration_cs2_screen.cfg"
-# No legacy fixed token is accepted: it is public in the source code, so any
-# local process could inject fake game data with it.  A restart hint is shown
-# instead when CS2 still runs with an outdated cfg.
-GSI_REJECTED_HINT_SECONDS = 15.0
-
-
-def gsi_restart_needed(
-    cs2_started_at: float | None = None, cfg_path: Path | None = None,
-    now: float | None = None, connected: bool = False,
-) -> bool:
-    """True when the running CS2 cannot be sending our current GSI token.
-
-    CS2 loads GSI cfgs only at launch, so a cfg written after cs2.exe started
-    (or recently rejected posts) means the game must be restarted.
-    """
-    if connected:
-        return False
-    now = time.time() if now is None else now
-    rejected = GSI_AUTH_STATE.get("rejected_at")
-    if rejected is not None and now - float(rejected) < GSI_REJECTED_HINT_SECONDS:
-        return True
-    if cs2_started_at is None:
-        cs2_started_at = PROCESS_SCANNER.created_at("cs2.exe")
-    if not cs2_started_at:
-        return False
-    if cfg_path is None:
-        cfg_dir = find_cs2_cfg_dir()
-        cfg_path = cfg_dir / GSI_CONFIG_NAME if cfg_dir is not None else None
-    try:
-        return cfg_path is not None and cfg_path.stat().st_mtime > float(cs2_started_at) + 2.0
-    except OSError:
-        return False
-
-
-def install_gsi_config() -> Path:
-    cfg_dir = find_cs2_cfg_dir()
-    if cfg_dir is None:
-        raise FileNotFoundError("CS2 kurulum klasörü bulunamadı.")
-    target = cfg_dir / GSI_CONFIG_NAME
-    content = gsi_config_text()
-    if not target.exists() or target.read_text(encoding="utf-8", errors="ignore") != content:
-        target.write_text(content, encoding="utf-8")
-        if cs2_is_running():
-            log_info(
-                "gsi",
-                "WARNING: GSI cfg/token changed while cs2.exe is running; "
-                "restart CS2 to enable game data",
-            )
-    # FACEIT kill switch: never touch CS2 launch options while FACEIT AC runs.
-    if not faceit_ac_is_running():
-        install_cs2_console_log_launch_option()
-    return target
 
 
 class EmbeddedSensorMonitor:
@@ -2386,46 +1201,6 @@ def temperature_number_color(
     return temperature_unit_color(value, component, colors, animation_time)
 
 
-@functools.lru_cache(maxsize=1)
-def _load_cs2_hero() -> Image.Image | None:
-    """Load the bundled CS2 showcase background once per process."""
-    path = ROOT / "cs2-hero.jpg"
-    if not path.is_file():
-        return None
-    try:
-        return Image.open(path).convert("RGB").resize((450, 144), Image.Resampling.LANCZOS)
-    except (OSError, ValueError):
-        return None
-
-
-def add_cs2_backdrop(image: Image.Image, colors: dict[str, str]) -> None:
-    """Draw the CS2 hero image with a theme-aware tactical overlay."""
-    backdrop, mask = _cs2_backdrop(colors["panel"])
-    image.paste(backdrop, (15, 161), mask)
-
-
-@functools.lru_cache(maxsize=8)
-def _cs2_backdrop(panel_color: str) -> tuple[Image.Image, Image.Image]:
-    """Static per palette: blend once instead of on every frame."""
-    colors = {"panel": panel_color}
-    width, height = 450, 144
-    hero = _load_cs2_hero()
-    panel_rgb = ImageColor.getrgb(colors["panel"])
-    if hero is None:
-        base = Image.new("RGB", (width, height), panel_rgb)
-    else:
-        # Retain the recognisable artwork while keeping live values readable
-        # in every light/dark colour preset.
-        tint = Image.new("RGB", (width, height), panel_rgb)
-        base = Image.blend(hero, tint, 0.52)
-        base = Image.blend(base, Image.new("RGB", (width, height), (0, 0, 0)), 0.12)
-    overlay = base.convert("RGBA")
-
-    mask = Image.new("L", (width, height), 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, width - 1, height - 1), radius=7, fill=255)
-    return overlay.convert("RGB"), mask
-
-
 def draw_open_ring(
     image: Image.Image,
     draw: ImageDraw.ImageDraw,
@@ -2518,172 +1293,6 @@ def _temperature(value: float | None) -> str:
 
 def _frequency(value: float | None) -> str:
     return _t("Canlı hız bekleniyor") if value is None else f"{value:.2f} GHz"
-
-
-def ping_color(latency_ms: float, colors: dict[str, str] | None = None) -> str:
-    colors = colors or COLORS
-    if latency_ms < 55:
-        return colors["cpu"]
-    if latency_ms < 85:
-        return colors["warning"]
-    return colors["danger"]
-
-
-CITY_NAMES_TR = {
-    "vienna": "Viyana",
-    "frankfurt": "Frankfurt",
-    "paris": "Paris",
-    "amsterdam": "Amsterdam",
-    "stockholm": "Stockholm",
-    "helsinki": "Helsinki",
-    "madrid": "Madrid",
-    "istanbul": "İstanbul",
-    "dubai": "Dubai",
-    "singapore": "Singapur",
-    "tokyo": "Tokyo",
-    "warsaw": "Varşova",
-    "london": "Londra",
-    "bucharest": "Bükreş",
-    "budapest": "Budapeşte",
-    "prague": "Prag",
-    "sofia": "Sofya",
-    "moscow": "Moskova",
-    "munich": "Münih",
-    "copenhagen": "Kopenhag",
-    "brussels": "Brüksel",
-    "athens": "Atina",
-    "belgrade": "Belgrad",
-    "milan": "Milano",
-    "rome": "Roma",
-    "cologne": "Köln",
-}
-
-
-def relay_display_name(relay: RelayPing) -> str:
-    lower_name = relay.name.lower()
-    for english, turkish in CITY_NAMES_TR.items():
-        if english in lower_name:
-            return turkish if _RENDER_LANGUAGE.get() == "tr" else english.title()
-    for provider in ("datapacket ", "valve ", "partner "):
-        if lower_name.startswith(provider):
-            return relay.name[len(provider):]
-    return relay.name
-
-
-def _money(value: int | None) -> str:
-    if value is None:
-        return "—"
-    rendered = f"${value:,}"
-    return rendered.replace(",", ".") if _RENDER_LANGUAGE.get() == "tr" else rendered
-
-
-def draw_matchmaking_panel(
-    draw: ImageDraw.ImageDraw,
-    pings: list[RelayPing],
-    colors: dict[str, str],
-    source: str,
-    right: int = 449,
-) -> None:
-    if source == "FACEIT":
-        title, detail = "FACEIT", _t("HiperZ · arama öncesi")
-    else:
-        title, detail = _t("Eşleştirme öncesi"), _t("Valve rotası")
-    draw.text((28, 181), title, font=FONTS["small_bold"], fill=colors["muted"])
-    draw.text((right, 181), detail, font=FONTS["tiny"], fill=colors["dim"], anchor="ra")
-    if not pings:
-        center = (28 + right) // 2
-        draw.text((center, 235), _t("Steam ölçümü hazırlanıyor…"), font=FONTS["label"], fill=colors["text"], anchor="mm")
-        waiting = _t("FACEIT AC açıkken otomatik yenilenir") if source == "FACEIT" else _t("CS2 açıkken otomatik yenilenir")
-        draw.text((center, 268), waiting, font=FONTS["small"], fill=colors["muted"], anchor="mm")
-        return
-    column_width = (right - 28) / 3
-    centers = tuple(round(28 + column_width * (index + 0.5)) for index in range(3))
-    for index, (center, item) in enumerate(zip(centers, pings[:3])):
-        if index:
-            divider = round(28 + column_width * index)
-            draw.line((divider, 210, divider, 287), fill=colors["edge"], width=1)
-        color = ping_color(item.latency_ms, colors)
-        name = _fit_text(draw, relay_display_name(item), FONTS["small_bold"], column_width - 8)
-        draw.text((center, 219), name, font=FONTS["small_bold"], fill=colors["muted"], anchor="mm")
-        draw.text((center - 7, 263), f"{int(round(item.latency_ms))}", font=FONTS["value"], fill=colors["text"], anchor="mm")
-        draw.text((center + 31, 266), "ms", font=FONTS["tiny"], fill=color, anchor="lm")
-
-
-def draw_economy_panel(
-    draw: ImageDraw.ImageDraw, snapshot: GameSnapshot,
-    colors: dict[str, str], right: int = 449,
-) -> None:
-    team_color = _team_accent(snapshot.team, colors)
-    if snapshot.team == "CT":
-        title, team_label = _t("Savunma ekonomisi"), "CT"
-    elif snapshot.team == "T":
-        title, team_label = _t("Hücum ekonomisi"), "T"
-    else:
-        title, team_label = _t("Maç ekonomisi"), ""
-    draw.rounded_rectangle((18, 169, 22, 296), radius=2, fill=team_color)
-    draw.text((28, 181), title, font=FONTS["panel_title"], fill=team_color)
-    if team_label:
-        badge_left = right - 35
-        draw.rounded_rectangle(
-            (badge_left, 171, right, 198), radius=12,
-            fill=colors["panel_2"], outline=team_color, width=1,
-        )
-        draw.text(((badge_left + right) // 2, 184), team_label, font=FONTS["small_bold"], fill=team_color, anchor="mm")
-    column_width = (right - 28) / 3
-    columns = (
-        (28, _t("Şimdi"), snapshot.money, colors["text"]),
-        (round(28 + column_width), _t("Kazanırsan"), snapshot.next_win_money, team_color),
-        (round(28 + column_width * 2), _t("Kaybedersen"), snapshot.next_loss_money, colors["warning"]),
-    )
-    for x, label, value, color in columns:
-        draw.text((x, 210), label, font=FONTS["tiny_bold"], fill=colors["muted"])
-        draw.text((x, 248), _money(value), font=FONTS["money"], fill=color, anchor="ls")
-    if snapshot.loss_bonus is not None:
-        draw.text((28, 280), _t("Kayıp bonusu +${value}", value=snapshot.loss_bonus), font=FONTS["tiny"], fill=colors["dim"])
-    else:
-        draw.text((28, 280), _t("Maç verisi bekleniyor"), font=FONTS["tiny"], fill=colors["dim"])
-
-
-def draw_deathmatch_panel(
-    draw: ImageDraw.ImageDraw, snapshot: GameSnapshot,
-    colors: dict[str, str], right: int = 449,
-) -> None:
-    draw.rounded_rectangle((18, 169, 22, 296), radius=2, fill=colors["danger"])
-    draw.text((28, 181), _t("Ölüm Maçı"), font=FONTS["panel_title"], fill=colors["text"])
-    center = round((28 + right) / 2)
-    draw.line((center, 209, center, 284), fill=colors["edge"], width=1)
-    left_center = round((28 + center) / 2)
-    right_center = round((center + right) / 2)
-    draw.text(
-        (left_center, 220), _t("ÖLDÜRME"), font=FONTS["tiny_bold"],
-        fill=colors["muted"], anchor="mm",
-    )
-    draw.text(
-        (left_center, 259), str(snapshot.kills or 0), font=FONTS["big_value"],
-        fill=colors["text"], anchor="mm",
-    )
-    draw.text(
-        (right_center, 220), _t("KAFA VURUŞU"), font=FONTS["tiny_bold"],
-        fill=colors["muted"], anchor="mm",
-    )
-    hs_text = "—" if snapshot.headshot_percent is None else f"%{snapshot.headshot_percent}"
-    draw.text(
-        (right_center, 259), hs_text, font=FONTS["money"],
-        fill=colors["warning"], anchor="mm",
-    )
-    if snapshot.headshot_kills is not None:
-        draw.text(
-            (right_center, 284), _t("{value} kafa vuruşu", value=snapshot.headshot_kills),
-            font=FONTS["small_bold"], fill=colors["muted"], anchor="mm",
-        )
-
-
-def _team_accent(team: str, colors: dict[str, str]) -> str:
-    if team == "CT":
-        return mix_color("#5E9EFF", colors["text"], 0.08)
-    if team == "T":
-        return mix_color("#F0A15F", colors["text"], 0.06)
-    return colors["muted"]
 
 
 @functools.lru_cache(maxsize=32)
@@ -2867,30 +1476,12 @@ def draw_battery_devices(
     draw: ImageDraw.ImageDraw,
     devices: tuple[BatteryDevice, ...],
     colors: dict[str, str],
-    game_overlay: bool = False,
 ) -> None:
     devices = devices[:3]
     if not devices:
         return
-    if game_overlay:
-        # Blend the device rail into the CS2 artwork instead of placing a hard,
-        # opaque rectangle over the character and weapon.  The gradual shade
-        # keeps labels readable while preserving the scene behind them.
-        shade = Image.new("RGBA", (142, 130), (0, 0, 0, 0))
-        shade_draw = ImageDraw.Draw(shade, "RGBA")
-        panel_rgb = ImageColor.getrgb(colors["panel"])
-        for x in range(shade.width):
-            progress = x / max(1, shade.width - 1)
-            alpha = round(25 + (185 * progress * progress))
-            shade_draw.line((x, 0, x, shade.height), fill=(*panel_rgb, alpha))
-        if image.mode == "RGBA":
-            image.alpha_composite(shade, (323, 169))
-        else:
-            image.paste(shade, (323, 169), shade)
-        draw.line((337, 207, 337, 290), fill=colors["edge"], width=1)
-    else:
-        draw.rectangle((338, 176, 455, 294), fill=colors["panel"])
-        draw.line((337, 176, 337, 294), fill=colors["edge"], width=1)
+    draw.rectangle((338, 176, 455, 294), fill=colors["panel"])
+    draw.line((337, 176, 337, 294), fill=colors["edge"], width=1)
     # A single, centred battery glyph labels the rail without spending the
     # horizontal space needed by three peripheral rows.
     header_color = colors["muted"]
@@ -2926,7 +1517,7 @@ def draw_battery_devices(
             # Rows are 42+ px apart with one or two devices: room for DPI.
             draw.text(
                 (451, center_y + 15), f"{dpi} DPI", font=FONTS["tiny"],
-                fill=colors["warning"] if getattr(device, "dpi_warning", False) else colors["muted"],
+                fill=colors["muted"],
                 anchor="rm",
             )
         if device.charging:
@@ -3223,11 +1814,7 @@ def _vram_label(megabytes: float | None) -> str:
 
 def render_screen(
     metrics: dict[str, float | None],
-    game_state: GameSnapshot | None,
-    game_active: bool,
     colors: dict[str, str] | None = None,
-    matchmaking_pings: list[RelayPing] | None = None,
-    matchmaking_source: str = "VALVE",
     hardware_labels: dict[str, str] | None = None,
     animation_time: float | None = None,
     media_snapshot: MediaSnapshot | None = None,
@@ -3238,9 +1825,11 @@ def render_screen(
     msfs_layout: str = "classic",
     weather_readings: tuple[WeatherReading, ...] = (),
     language: str = "tr",
+    cs2_active: bool = False,
 ) -> Image.Image:
     _RENDER_LANGUAGE.set(normalize_language(language))
-    colors = {**COLORS, **(colors or {})}
+    # While CS2 runs the normal desktop screen is drawn in CS2's orange.
+    colors = dict(CS2_THEME_COLORS) if cs2_active else {**COLORS, **(colors or {})}
     labels = resolve_hardware_labels(hardware_labels)
     image = Image.new("RGB", (WIDTH, HEIGHT), colors["bg"])
     draw = ImageDraw.Draw(image)
@@ -3314,35 +1903,16 @@ def render_screen(
     draw.rounded_rectangle((14, 160, 466, 306), radius=8, fill=colors["panel"], outline=colors["edge"], width=1)
     media_snapshot = media_snapshot or MediaSnapshot()
     audio_spectrum = audio_spectrum or AudioSpectrumSnapshot()
-    if not game_active and msfs_active:
+    if not cs2_active and msfs_active:
         draw_msfs_panel(
             image, draw, colors, flight_telemetry or FlightTelemetry(), battery_devices,
             msfs_layout,
         )
         return image
-    if not game_active and (media_snapshot.visible or audio_spectrum.active):
+    if not cs2_active and (media_snapshot.visible or audio_spectrum.active):
         draw_media_panel(image, draw, media_snapshot, audio_spectrum, colors, battery_devices)
         return image
-    if not game_active:
-        draw_weather_panel(image, draw, weather_readings, colors, battery_devices)
-        return image
-
-    add_cs2_backdrop(image, colors)
-    draw.rounded_rectangle((14, 160, 466, 306), radius=8, outline=colors["edge"], width=1)
-
-    snapshot = game_state or GameSnapshot()
-    content_right = 320 if battery_devices else 449
-    if snapshot.in_match and _is_deathmatch_mode(snapshot.game_mode):
-        draw_deathmatch_panel(draw, snapshot, colors, content_right)
-    elif snapshot.in_match and snapshot.next_win_money is not None:
-        draw_economy_panel(draw, snapshot, colors, content_right)
-    elif not snapshot.in_match:
-        draw_matchmaking_panel(
-            draw, matchmaking_pings or [], colors, matchmaking_source, content_right,
-        )
-    if battery_devices:
-        draw_battery_devices(image, draw, battery_devices, colors, game_overlay=True)
-
+    draw_weather_panel(image, draw, weather_readings, colors, battery_devices)
     return image
 
 
@@ -3598,11 +2168,11 @@ class ScreenSession:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="CS2 game-state + system ring display prototype")
+    parser = argparse.ArgumentParser(description="System ring display for the 3.5-inch screen")
     parser.add_argument("--preview", type=Path, help="Save one rendered frame as PNG")
     parser.add_argument("--screen-once", action="store_true", help="Send one rendered frame to the 3.5-inch display")
     parser.add_argument("--run-screen", action="store_true", help="Continuously update the display")
-    parser.add_argument("--force-cs2", action="store_true", help="Show/test the CS2 mode even if the game is closed")
+    parser.add_argument("--force-cs2", action="store_true", help="Use the CS2 colours even if the game is closed")
     parser.add_argument("--port", default="AUTO", help="Display serial port, default: AUTO")
     parser.add_argument("--brightness", type=int, default=55, choices=range(0, 101), metavar="0-100")
     parser.add_argument("--interval", type=float, default=3.0, help="Refresh interval for continuous mode")
@@ -3615,11 +2185,8 @@ def main() -> int:
         return run_sensor_bridge()
     if args.sensor_file_bridge:
         return run_sensor_bridge(SENSOR_CACHE_PATH)
-    game_state = CS2GameState()
-    game_active = args.force_cs2 or cs2_is_running()
-    faceit_active = faceit_ac_is_running()
     metrics = get_metrics()
-    frame = render_screen(metrics, game_state.snapshot(), game_active or faceit_active)
+    frame = render_screen(metrics, cs2_active=args.force_cs2 or cs2_is_running())
 
     if args.preview:
         args.preview.parent.mkdir(parents=True, exist_ok=True)
@@ -3632,7 +2199,6 @@ def main() -> int:
 
     if args.run_screen:
         screen = None
-        gsi_server = None
         frame_count = 0
         failures = 0
         try:
@@ -3641,32 +2207,9 @@ def main() -> int:
                 try:
                     if screen is None:
                         screen = ScreenSession(args.port, args.brightness)
-                    faceit_active = faceit_ac_is_running()
-                    # FACEIT kill switch: no CS game data while FACEIT AC runs.
-                    if faceit_active and gsi_server is not None:
-                        gsi_server.close()
-                        gsi_server = None
-                    elif not faceit_active and gsi_server is None:
-                        try:
-                            gsi_server = GSIServer(game_state)
-                            gsi_server.start()
-                        except OSError as exc:
-                            log_exception("cli", "GSI listener unavailable", exc)
-                            gsi_server = None
-                    game_active = args.force_cs2 or cs2_is_running()
-                    metrics = get_metrics()
-                    if faceit_active:
-                        pings, source = FACEIT_PING_MONITOR.read(), "FACEIT"
-                    elif game_active:
-                        pings, source = STEAM_PING_MONITOR.read(), "VALVE"
-                    else:
-                        pings, source = [], "VALVE"
                     frame = render_screen(
-                        metrics,
-                        GameSnapshot() if faceit_active else game_state.snapshot(),
-                        game_active or faceit_active,
-                        matchmaking_pings=pings, matchmaking_source=source,
-                        animation_time=started,
+                        get_metrics(), animation_time=started,
+                        cs2_active=args.force_cs2 or cs2_is_running(),
                     )
                     screen.show(frame)
                     failures = 0
@@ -3687,8 +2230,6 @@ def main() -> int:
                 elapsed = time.monotonic() - started
                 time.sleep(max(0.2, args.interval - elapsed))
         finally:
-            if gsi_server is not None:
-                gsi_server.close()
             if screen is not None:
                 screen.close()
 

@@ -36,7 +36,6 @@ ENGLISH: dict[str, str] = {
     "Hava durumu gösterilecek şehir.": "City whose weather will be shown.",
     "3,5 inç ekran önizlemesi": "3.5-inch display preview",
     "Günlük": "Daily",
-    "Ölüm maçı": "Deathmatch",
     "Kablosuz": "Wireless",
     "Günlük kullanım · medya görünümü": "Daily use · media view",
     "Renkler": "Colours",
@@ -105,8 +104,6 @@ ENGLISH: dict[str, str] = {
     "{name} rengi": "{name} colour",
     "Seçili renk: {colour}": "Selected colour: {colour}",
     # Preview context and sample data
-    "CS2 · ölüm maçı öldürme ve kafa vuruşu görünümü":
-        "CS2 · deathmatch kills and headshots view",
     "MSFS 2024 · canlı uçuş bilgileri": "MSFS 2024 · live flight information",
     "Boşta kullanım · seçili şehirlerin hava durumu": "Idle · weather for selected cities",
     "Kablosuz cihazlar · pil durumları": "Wireless devices · battery status",
@@ -128,12 +125,8 @@ ENGLISH: dict[str, str] = {
     "{name} paleti silindi": "Palette {name} deleted",
     "Varsayılan ayarlara dönüldü": "Default settings restored",
     "Önizleme hazırlanamadı: {error}": "Preview could not be prepared: {error}",
-    "CS2 bağlantısı kurulamadı": "Could not configure CS2 connection",
     "{error}\n\nUygulamayı yönetici olarak açıp yeniden deneyin.":
         "{error}\n\nRun the application as administrator and try again.",
-    "CS2 bağlantısı kuruldu.": "CS2 connection configured.",
-    " Verilerin gelmesi için CS2'yi bir kez yeniden başlatın.":
-        " Restart CS2 once for data to appear.",
     "Ayarlar kaydedilemedi; ekran yine de başlatılıyor · {error}":
         "Settings could not be saved; the display will still start · {error}",
     "Ayarlar kaydedilemedi": "Settings could not be saved",
@@ -147,10 +140,6 @@ ENGLISH: dict[str, str] = {
     "Mini ekran bağlandı · görüntü yenileniyor": "Mini display connected · refreshing image",
     "Mini ekran bekleniyor · {error}": "Waiting for mini display · {error}",
     "Bağlantı yenileniyor · {error}": "Refreshing connection · {error}",
-    "Ölüm maçı · öldürme ve HS verisi canlı": "Deathmatch · kills and HS data live",
-    "CS2 maçı açık · canlı veriler izleniyor": "CS2 match active · monitoring live data",
-    "FACEIT AC açık · FACEIT pingleri yenileniyor": "FACEIT AC running · refreshing FACEIT pings",
-    "CS2 açık · eşleştirme pingleri yenileniyor": "CS2 running · refreshing matchmaking pings",
     "MSFS 2024 açık · uçuş verileri canlı": "MSFS 2024 running · flight data live",
     "MSFS 2024 açık · kokpit bağlantısı bekleniyor":
         "MSFS 2024 running · waiting for cockpit connection",
@@ -166,24 +155,6 @@ ENGLISH: dict[str, str] = {
     "ayarlar kilitli": "settings locked",
     # Mini display
     "Canlı hız bekleniyor": "Live clock unavailable",
-    "HiperZ · arama öncesi": "HiperZ · before queue",
-    "Eşleştirme öncesi": "Before matchmaking",
-    "Valve rotası": "Valve route",
-    "Steam ölçümü hazırlanıyor…": "Preparing Steam measurement…",
-    "FACEIT AC açıkken otomatik yenilenir": "Refreshes automatically while FACEIT AC is running",
-    "CS2 açıkken otomatik yenilenir": "Refreshes automatically while CS2 is running",
-    "Savunma ekonomisi": "Defence economy",
-    "Hücum ekonomisi": "Attack economy",
-    "Maç ekonomisi": "Match economy",
-    "Şimdi": "Now",
-    "Kazanırsan": "If you win",
-    "Kaybedersen": "If you lose",
-    "Kayıp bonusu +${value}": "Loss bonus +${value}",
-    "Maç verisi bekleniyor": "Waiting for match data",
-    "Ölüm Maçı": "Deathmatch",
-    "ÖLDÜRME": "KILLS",
-    "KAFA VURUŞU": "HEADSHOTS",
-    "{value} kafa vuruşu": "{value} headshots",
     "sn": "sec",
     "Para": "Money",
     "Sistem sesi": "System audio",
@@ -200,36 +171,19 @@ ENGLISH: dict[str, str] = {
     "km/sa": "km/h",
     "kullanımda": "in use",
     "Otomatik başlatma ayarlanamadı · {error}": "Autostart could not be updated · {error}",
-    "CS2 · CT ekonomi görünümü": "CS2 · CT economy view",
-    "CS2 · T ekonomi görünümü": "CS2 · T economy view",
-    "CS2 açık · ekonomi verisi canlı": "CS2 running · economy data live",
     # Design selector
     "Tasarım": "Design",
     "Yeni": "New",
     "Claude: oyuna ve uçuş evresine göre değişen sade ekranlar. Codex: önceki görünüm.":
         "Claude: clean screens that follow the game and flight phase. Codex: previous layout.",
     "Yeni tasarım · masaüstü": "New design · desktop",
-    "Yeni tasarım · CS2 satın alma": "New design · CS2 buy phase",
-    "Yeni tasarım · CS2 round sonu": "New design · CS2 round over",
-    "Yeni tasarım · FACEIT (sadece sistem)": "New design · FACEIT (system only)",
     "Yeni tasarım · MSFS seyir": "New design · MSFS cruise",
     # New design screens
     "Fare": "Mouse", "Klv": "Kbd", "Kulak": "Head", "Cihaz": "Device", "Chz": "Dev",
     "açık": "clear", "parçalı bulutlu": "partly cloudy", "sisli": "foggy",
     "karlı": "snowy", "fırtınalı": "stormy", "yağmurlu": "rainy",
     "yük": "load",
-    "FACEIT · sadece sistem verisi": "FACEIT · system data only",
-    "CS2'yi yeniden başlat · oyun verisi için": "Restart CS2 to enable game data",
-    "CS2 · Oyun verisi bekleniyor": "CS2 · Waiting for game data",
-    "CS2 · Menü": "CS2 · Menu",
-    "CS2'yi yeniden başlatın: oyun verisi için yeni GSI ayarı yüklenmeli":
-        "Restart CS2: it must load the new GSI config to send game data",
-    
     "Maç K/D/A {k} / {d} / {a}": "Match K/D/A {k} / {d} / {a}",
-    "BU ROUND": "THIS ROUND", "Hasar": "Damage", "MAÇ K/D": "MATCH K/D",
-    "Asist": "Assists", "Skor": "Score",
-    "Sınır {limit}°C · son 30 sn ortalaması {avg}°C": "Limit {limit}°C · last 30 s average {avg}°C",
-    "Ani ping artışı · ortalama {avg} ms": "Ping spike · average {avg} ms",
     "YERDE · TAKSİ": "ON GROUND · TAXI", "YERDE · PARK": "ON GROUND · PARKED",
     "Yer hızı": "Ground speed", "kt · sınır 25": "kt · limit 25", "Yakıt": "Fuel",
     "ton": "t", "Ağırlık": "Weight",
@@ -249,6 +203,11 @@ ENGLISH: dict[str, str] = {
     "SERT": "HARD", "G kuvveti": "G force", "Zıplama": "Bounce", "Var": "Yes", "Yok": "No",
     "Kayıtlı iniş": "Saved landings", "COM1 aktif / yedek": "COM1 active / standby",
     "NAV1 aktif / yedek": "NAV1 active / standby", "Sonraki nokta": "Next fix",
+    # CS2 theme
+    "CS2 teması": "CS2 theme",
+    "CS2 açıkken · turuncu tema": "While CS2 runs · orange theme",
+    "Yeni tasarım · CS2 açıkken turuncu tema": "New design · orange theme while CS2 runs",
+    "CS2 açık · ekran CS2 renklerinde": "CS2 running · display in CS2 colours",
 }
 
 

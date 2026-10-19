@@ -10,7 +10,6 @@ driver_root = (
 datas = [
     ('sabasakal-logo.ico', '.'),
     ('sabasakal-logo.png', '.'),
-    ('cs2-hero.jpg', '.'),
     ('icons/png', 'icons/png'),
     ('icons/LICENSES.md', 'icons'),
     (str(driver_root / 'library' / 'lcd' / 'lcd_comm.py'), 'library/lcd'),

@@ -1,6 +1,17 @@
 # Sabasakal Mini Screen 3.5″
 
-Sürüm 1.1.6
+Sürüm 1.1.11
+
+1.1.11 değişiklikleri: saniyede yaklaşık 1 MB büyüyen bellek sızıntısı
+giderildi (Windows pil taraması her cihazın WinRT özellik tablosunu
+kopyalıyordu; bu yerel bellek sızdırıyordu ve bir günde onlarca GB'a
+ulaşabiliyordu); tam Windows cihaz taraması en fazla 10 sn'de bir yapılıyor;
+G HUB bağlantıları bellekte birikmiyor; kontrol panelindeki bozuk Türkçe
+karakterler düzeltildi (1.1.9'da gui.py yanlış kodlamayla kaydedilmişti).
+CS2 oyun verisi özellikleri (Game State Integration, ekonomi, ölüm maçı ve
+round ekranları, eşleştirme/FACEIT pingleri, uyarı katmanı, G HUB CS2
+profili DPI uyarısı) kaldırıldı. CS2
+açıkken normal masaüstü ekranı yalnızca CS2'nin turuncu temasıyla çizilir.
 
 1.1.6 düzeltmeleri: mini ekran çıkarılıp takılınca uygulama yeniden
 başlamadan bağlanıyor; sensör/çizim hatası USB oturumunu sıfırlamıyor; ekran
@@ -45,8 +56,9 @@ başlatıldığında hemen geçerli oluyor. Testler artık tamamen izole çalı�
 (geçici profil, gerçek donanım/zamanlanmış görev yok).
 
 Windows üzerinde 480×320 USB mini ekranlar için hazırlanmış modern bir bilgi
-panelidir. İşlemci, harici ekran kartı ve RAM değerlerinin yanında CS2, MSFS
-2024, medya, hava durumu ve kablosuz cihaz pil bilgilerini gösterebilir.
+panelidir. İşlemci, harici ekran kartı ve RAM değerlerinin yanında MSFS 2024,
+medya, hava durumu ve kablosuz cihaz pil bilgilerini gösterebilir. CS2 açıkken
+ekran kendiliğinden CS2'nin turuncu temasına geçer.
 
 Hazır paketi kullanmak için son GitHub sürümündeki
 `Sabasakal-Mini-Screen-3.5.zip` dosyasını indirin, normal bir klasöre çıkarın ve
@@ -55,19 +67,17 @@ ZIP içinden çıkan `_internal` klasörünü EXE'nin yanında bırakın. Bu ta�
 klasör yapısı geçici `_MEI` klasörü oluşturmadığı için açılış ve temizlik
 hatalarını önler.
 
-CS2 tarafında yalnızca Valve Game State Integration ile oyunun kendi yerel
-konsol/ağ bilgisini kullanır. Oyun belleğine erişme, kod enjekte etme, giriş
+CS2 teması için yalnızca `cs2.exe` işleminin çalışıp çalışmadığına bakılır;
+uygulama CS2 ile hiç konuşmaz. Oyun belleğine erişme, kod enjekte etme, giriş
 otomasyonu veya paket yakalama yapmaz.
 
 1.1.0 ile gelenler:
 
 - Kontrol panelinden seçilebilen iki ekran tasarımı: **Claude** (varsayılan) ve
   **Codex**.
-- FACEIT güvenlik modu: FACEIT Anti-Cheat çalışırken Game State Integration
-  dinleyicisi kapatılır, yalnızca sistem panelleri gösterilir.
 - Bomba sayacı kaldırıldı.
 
-![Yeni tasarım CS2 paneli](docs/images/new/cs2-live-dark.png)
+![Yeni tasarım, CS2 teması](docs/images/new/cs2-theme.png)
 
 Ayrıntılı özellikler, kaynak derleme adımları ve lisans bilgileri için
 [İngilizce ana belgeye](README.md) bakabilirsiniz.

@@ -1,6 +1,16 @@
 # Sabasakal Mini Screen 3.5″
 
-Version 1.1.6
+Version 1.1.11
+
+1.1.11 changes: fixed a memory leak of about 1 MB/s (the Windows battery scan
+copied every device's WinRT property map, which leaked native memory, so a
+day of uptime could reach tens of GB); the full Windows device scan now runs
+at most every 10 s; G HUB connections no longer accumulate in memory; Turkish
+text in the control panel is no longer garbled (1.1.9 saved gui.py with the
+wrong encoding). The CS2 game-data features (Game State Integration, economy,
+deathmatch and round screens, matchmaking/FACEIT pings, alert overlay, G HUB CS2-profile DPI
+warning) are removed. While CS2 runs, the normal desktop screen is simply drawn in CS2's
+orange theme.
 
 1.1.6 fixes: unplugging/replugging the LCD reconnects in-process instead of
 restarting the app; a sensor or render error no longer resets the USB session;
@@ -49,8 +59,8 @@ Yeni/Klasik designs takes effect immediately. The test suite is fully
 hermetic (temporary profile, no hardware, no scheduled tasks).
 
 A modern Windows dashboard for 480×320 USB mini displays. It combines live PC
-telemetry, game-aware panels, media animation, weather and wireless-device
-battery information in one compact, themeable interface.
+telemetry, MSFS 2024 flight panels, media animation, weather and
+wireless-device battery information in one compact, themeable interface.
 
 ![English settings interface](docs/images/control-panel-en.png)
 
@@ -59,14 +69,10 @@ battery information in one compact, themeable interface.
 - CPU, discrete GPU and RAM rings with component-specific warning thresholds
 - CPU/GPU temperature, CPU clock, VRAM and used-memory readouts
 - Smooth critical alerts for load and temperature
-- CS2 pre-queue Valve/FACEIT ping view using non-invasive public/local data
 - Two screen designs selectable in the control panel: **Claude** (new, default)
   and **Codex** (classic)
-- CS2 live-round, round-over and deathmatch statistics (Codex design also
-  shows the competitive/Wingman money panel; the Claude buy-phase screen was
-  removed in 1.1.4; the bomb timer was removed in 1.1.0)
-- FACEIT safety mode: while FACEIT Anti-Cheat runs, the Game State Integration
-  listener is stopped and only system panels are shown
+- CS2 theme: while `cs2.exe` runs, the normal desktop screen switches to CS2's
+  orange colours (no game data is read)
 - MSFS 2024 altitude, airspeed, vertical speed and heading panels
 - Live media spectrum plus platform/track metadata
 - Automatic Logitech G HUB and Windows battery-device discovery
@@ -78,22 +84,11 @@ battery information in one compact, themeable interface.
 
 ![English mini-display modes](docs/images/mini-screen-modes-en.png)
 
-## CS2 previews
+## Claude design previews
 
-### Claude design (new)
-
-![CS2 live panel, new design](docs/images/new/cs2-live-dark-en.png)
-![CS2 round-over panel, new design](docs/images/new/cs2-death-en.png)
+![Desktop, new design](docs/images/new/main-en.png)
+![Desktop in the CS2 theme, new design](docs/images/new/cs2-theme-en.png)
 ![MSFS cruise panel, new design](docs/images/new/msfs-cruise-en.png)
-
-### Codex design (classic): CT / T panels
-
-![CS2 CT panel](docs/images/cs2-ct.png)
-![CS2 T panel](docs/images/cs2-t.png)
-
-### Deathmatch panel
-
-![CS2 deathmatch panel](docs/images/cs2-deathmatch.png)
 
 ## Download and run
 
@@ -115,7 +110,7 @@ avoids temporary `_MEI` extraction and its associated startup/cleanup failures.
 - Turing Smart Screen-compatible 3.5-inch 480×320 serial display (the current
   binary is tested with the common Rev-A/Turing protocol)
 - Optional: Logitech G HUB for Logitech wireless battery values
-- Optional: CS2 and/or Microsoft Flight Simulator 2024 for game panels
+- Optional: Microsoft Flight Simulator 2024 for the flight panels
 
 Hardware revisions sold under similar names can use different USB protocols.
 If the app cannot find the display, open an issue with the USB/COM identity and
@@ -123,12 +118,12 @@ do not upload personal logs without reviewing them first.
 
 ## Safety and privacy
 
-The CS2 integration uses Valve Game State Integration and locally produced
-console/network information. It does not read or write game memory, inject
-code, automate input, inspect packets or bypass anti-cheat software. The same
-non-invasive rule applies while FACEIT Anti-Cheat is running.
+The CS2 theme only checks whether `cs2.exe` is running. The app does not
+talk to CS2, read or write game memory, inject code, automate input, inspect
+packets or touch anti-cheat software. MSFS values are read-only SimConnect
+variables.
 
-Settings and short-lived sensor/game state caches stay under `%APPDATA%` on the
+Settings and short-lived sensor caches stay under `%APPDATA%` on the
 local PC. Weather requests send only the selected city names/coordinates to
 Open-Meteo. See [PRIVACY.md](PRIVACY.md) for details.
 
