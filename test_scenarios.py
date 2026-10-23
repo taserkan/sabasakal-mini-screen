@@ -5439,6 +5439,82 @@ class CarouselScenarios(unittest.TestCase):
         self.assertEqual((loaded["carousel_seconds"], loaded["carousel_idle_seconds"]), (15, 120))
 
 
+class FadeRecordingScreen(RecordingScreen):
+    def fade(self, start, end, seconds, steps=8, sleep=None):
+        self.calls.append(("fade", start, end))
+
+
+class TransitionScenarios(Fix111Base):
+    """v1.5.1: big screen changes fade through dark instead of a visible sweep."""
+
+    def run_with(self, panel, screen_class, cycles=4):
+        panel.stop_event = CycleEvent(cycles)
+        panel.screen_connected = TrackingEvent()
+        screens: list = []
+
+        def factory(*args):
+            screen = screen_class(*args)
+            screens.append(screen)
+            return screen
+
+        render = _varying_frames()  # every frame differs completely -> "wipe"
+        patches = DesignSwitchScenarios.worker_patches(self) + [
+            patch.object(gui, "ScreenSession", side_effect=factory),
+            patch.object(gui, "render_new_screen", side_effect=lambda _ctx: render()),
+        ]
+        for item in patches:
+            item.start()
+        try:
+            panel._screen_worker()
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        return screens[0].calls
+
+    def test_screen_change_fades_out_paints_dark_and_fades_in(self) -> None:
+        panel = self.make_panel({"brightness": 70})
+        calls = self.run_with(panel, FadeRecordingScreen)
+        kinds = [call[0] for call in calls if call[0] in ("fade", "regions")]
+        self.assertIn("regions", kinds)
+        first = kinds.index("regions")
+        self.assertEqual(kinds[first - 1:first + 2], ["fade", "regions", "fade"])
+        fades = [call for call in calls if call[0] == "fade"]
+        self.assertEqual(fades[0][1:], (70, 0))
+        self.assertEqual(fades[1][1:], (0, 70))
+
+    def test_wipe_setting_keeps_the_old_sweep(self) -> None:
+        panel = self.make_panel({"screen_transition": "wipe"})
+        calls = self.run_with(panel, FadeRecordingScreen)
+        self.assertTrue(any(call[0] == "regions" for call in calls))
+        self.assertFalse(any(call[0] == "fade" for call in calls))
+
+    def test_carousel_progress_bar(self) -> None:
+        import screens_new as sn
+        pages = ("clock", "main")
+        settings = {"carousel_enabled": True, "carousel_seconds": 15, "carousel_idle_seconds": 60}
+        self.assertIsNone(gui.carousel_progress(settings, 10.0, pages, 0.0))  # in use
+        self.assertIsNone(gui.carousel_progress(settings, 99.0, ("main",), 0.0))  # nothing rotates
+        self.assertAlmostEqual(gui.carousel_progress(settings, 99.0, pages, 22.5), 0.5)
+        half = sn.render_new_screen(sn.NewScreenContext(metrics={}, page="clock", carousel_progress=0.5))
+        accent = ImageColor.getrgb(sn.MODE_DESKTOP[2])
+        self.assertEqual(half.getpixel((100, 319)), accent)
+        self.assertNotEqual(half.getpixel((400, 319)), accent)
+        game = sn.render_new_screen(sn.NewScreenContext(metrics={}, mode="cs2", carousel_progress=0.5))
+        self.assertNotEqual(game.getpixel((100, 319)), accent)  # never on game screens
+
+    def test_backlight_ramp_is_smooth_and_ends_on_target(self) -> None:
+        levels: list[int] = []
+        session = object.__new__(screen_app.ScreenSession)
+        session.display = SimpleNamespace(SetBrightness=levels.append)
+        session.fade(70, 0, 0.25, steps=8, sleep=lambda _s: None)
+        self.assertEqual(levels[-1], 0)
+        self.assertEqual(levels, sorted(levels, reverse=True))  # never flickers back up
+        levels.clear()
+        session.fade(0, 70, 0.30, steps=8, sleep=lambda _s: None)
+        self.assertEqual(levels[-1], 70)
+        self.assertEqual(levels, sorted(levels))
+
+
 class CarouselWorkerScenarios(Fix111Base):
     def test_worker_shows_carousel_pages_only_while_idle(self) -> None:
         for idle, expected in ((999.0, "clock"), (0.0, "main")):

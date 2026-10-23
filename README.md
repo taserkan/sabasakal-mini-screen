@@ -1,6 +1,12 @@
 # Sabasakal Mini Screen 3.5″
 
-Version 1.5.0
+Version 1.5.1
+
+1.5.1 changes: new screen transition. For big screen changes (page change,
+game mode) the backlight goes out at once, the new image is painted in the
+dark and the light comes back quickly instead of the visible left-to-right
+sweep; about 1 s in total. Idle carousel pages show a thin bar filling up until
+the next page. The old sweep can be chosen under Display > Screen transition.
 
 1.5.0 changes: game profiles (replacing the Zowie add-on). For every game you
 add (.exe): monitor mode (ZOWIE GAMER 1/2/3), NVIDIA digital vibrance, default

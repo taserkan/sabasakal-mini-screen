@@ -73,6 +73,14 @@ ENGLISH: dict[str, str] = {
     "Çıkış": "Exit",
     "Zowie eklentisi · CS2'de {game}, sonra {desktop}": "Zowie add-on · {game} in CS2, then {desktop}",
     "Zowie monitör": "Zowie monitor",
+    # v1.5.1 screen transition
+    "Ekran geçişi": "Screen transition",
+    "Yumuşak kararma (önerilen)": "Smooth fade (recommended)",
+    "Soldan sağa süpürme (eski)": "Left-to-right sweep (old)",
+    "Sayfa değişirken ekran ışığı yumuşakça kısılır, yeni görüntü karanlıkta çizilir ve ışık geri açılır.": (
+        "When the page changes the backlight fades out, the new image is drawn in the dark and the "
+        "light fades back in."
+    ),
     # v1.5 network tools
     "Ağ araçları": "Network tools",
     "ExitLag, NoPing gibi programlar kapatıldıktan sonra arka planda servis bırakabilir ve oyunda jitter / paket kaybı yapabilir. Buradan bulup tek tuşla kapatabilirsin.": (

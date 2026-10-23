@@ -129,6 +129,8 @@ class NewScreenContext:
     # v1.5: short banner (e.g. "GAMER 2") drawn over any screen.
     toast: str = ""
     game_name: str = ""
+    # v1.5.1: 0..1 through the current idle-carousel page (None = not rotating).
+    carousel_progress: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1244,9 +1246,24 @@ def render_new_screen(ctx: NewScreenContext) -> Image.Image:
         image = PAGE_RENDERERS[ctx.page](ctx)
     else:
         image = render_main(ctx)
+    if ctx.carousel_progress is not None and ctx.mode == "desktop":
+        draw_carousel_progress(image, ctx.carousel_progress)
     if ctx.toast:
         draw_toast(image, _t(ctx, "Monitör: {mode}", mode=ctx.toast))
     return image
+
+
+CAROUSEL_BAR = 3
+
+
+def draw_carousel_progress(image: Image.Image, fraction: float) -> None:
+    """Thin bar along the bottom edge filling up until the next page."""
+    draw = ImageDraw.Draw(image)
+    top = HEIGHT - CAROUSEL_BAR
+    draw.rectangle((0, top, WIDTH, HEIGHT), fill=blend(MODE_DESKTOP[0], MODE_DESKTOP[2], 0.18))
+    width = round(WIDTH * max(0.0, min(1.0, fraction)))
+    if width > 0:
+        draw.rectangle((0, top, width - 1, HEIGHT), fill=MODE_DESKTOP[2])
 
 
 __all__ = [

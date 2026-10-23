@@ -1,6 +1,12 @@
 # Sabasakal Mini Screen 3.5″
 
-Sürüm 1.5.0
+Sürüm 1.5.1
+
+1.5.1 değişiklikleri: Ekran geçişi yenilendi. Büyük ekran değişimlerinde
+(sayfa geçişi, oyun modu) soldan sağa görünen süpürme yerine ekran ışığı anında
+söner, yeni görüntü karanlıkta çizilir ve ışık hızla geri açılır; toplam ~1 sn.
+Boştayken dönen sayfaların altında bir sonraki sayfaya kalan süreyi gösteren
+ince bir çizgi var. Eski süpürme efekti Ekran > Ekran geçişi'nden seçilebilir.
 
 1.5.0 değişiklikleri: Oyun profilleri (Zowie eklentisinin yerini alır).
 Eklenen her oyun (.exe) için monitör modu (ZOWIE GAMER 1/2/3), NVIDIA dijital

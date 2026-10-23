@@ -2156,6 +2156,26 @@ class ScreenSession:
 
         self._with_recovery(send, image)
 
+    def set_brightness(self, level: int) -> None:
+        """Backlight only (a 6-byte command): cheap enough to animate."""
+        level = max(0, min(100, int(level)))
+
+        def apply() -> None:
+            self.display.SetBrightness(level)
+            self._flush()
+
+        self._with_recovery(apply, None)
+
+    def fade(self, start: int, end: int, seconds: float, steps: int = 8,
+             sleep: Callable[[float], None] = time.sleep) -> None:
+        """Ramp the backlight from ``start`` to ``end`` (ease-in-out)."""
+        steps = max(1, steps)
+        for index in range(1, steps + 1):
+            progress = index / steps
+            eased = progress * progress * (3 - 2 * progress)  # smoothstep
+            self.set_brightness(round(start + (end - start) * eased))
+            sleep(seconds / steps)
+
     def power_off(self) -> None:
         """Blank the physical panel immediately without a full-frame transfer."""
         if self.display is None:

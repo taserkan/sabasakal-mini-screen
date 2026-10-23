@@ -89,7 +89,7 @@ from zowie_runtime import (
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -237,6 +237,16 @@ def _parse_number(text: str) -> float | None:
     except ValueError:
         return None
     return value if value == value else None
+
+
+def carousel_progress(settings: dict, idle_seconds: float, pages: tuple[str, ...], now: float) -> float | None:
+    """0..1 through the current carousel page, or None when not rotating."""
+    if not settings.get("carousel_enabled", True) or len(pages) < 2:
+        return None
+    if idle_seconds < float(settings.get("carousel_idle_seconds", 60)):
+        return None
+    period = max(5.0, float(settings.get("carousel_seconds", 15)))
+    return (now % period) / period
 
 
 def carousel_page(settings: dict, idle_seconds: float, pages: tuple[str, ...], now: float) -> str:
@@ -411,6 +421,14 @@ NEW_DESIGN_TILES = tuple(
 WIPE_STRIP_WIDTH = 60
 WIPE_STRIPS = tuple((left, 0, left + WIPE_STRIP_WIDTH, 320) for left in range(0, 480, WIPE_STRIP_WIDTH))
 WIPE_AREA_FRACTION = 0.45
+# v1.5.1 default screen change: fade the backlight out, paint, fade back in.
+# Total budget ~1 s: the paint itself takes ~0.85-0.95 s, so the backlight
+# goes out at once (one command) and comes back in a quick 5-step ramp.
+FADE_OUT_SECONDS = 0.0
+FADE_OUT_STEPS = 1
+FADE_IN_SECONDS = 0.08
+FADE_STEPS = 5
+SCREEN_TRANSITIONS = ("fade", "wipe")
 
 
 # Dirty-rect planning for the Claude design. v1.1.7 diffed a fixed 120x40
@@ -571,6 +589,8 @@ DEFAULT_SETTINGS = {
     # FACEIT card: nickname + DPAPI-encrypted server-side API key.
     "faceit_nickname": "",
     "faceit_key_protected": "",
+    # Big screen changes: "fade" (backlight fade) or "wipe" (column sweep).
+    "screen_transition": "fade",
     # v1.5 game profiles (replace the 1.1.13 Zowie-only add-on).
     "game_profiles_enabled": True,
     "game_profiles": [],
@@ -1387,6 +1407,8 @@ def load_settings() -> dict:
             settings["game_profiles"] = migrated_profiles(saved)
         if isinstance(saved.get("game_profiles_enabled"), bool):
             settings["game_profiles_enabled"] = saved["game_profiles_enabled"]
+        if saved.get("screen_transition") in SCREEN_TRANSITIONS:
+            settings["screen_transition"] = saved["screen_transition"]
         nickname = saved.get("faceit_nickname")
         if isinstance(nickname, str):
             settings["faceit_nickname"] = nickname.strip()[:32]
@@ -2436,6 +2458,23 @@ class ControlPanel(QWidget):
             carousel_line.addWidget(combo)
         carousel_line.addStretch()
         screen_grid.addLayout(carousel_line, row, 1)
+        row += 1
+        screen_grid.addWidget(self._label("Ekran geçişi"), row, 0)
+        self.transition_combo = QComboBox()
+        self.transition_combo.addItem(self._tr("Yumuşak kararma (önerilen)"), "fade")
+        self.transition_combo.addItem(self._tr("Soldan sağa süpürme (eski)"), "wipe")
+        self.transition_combo.setCurrentIndex(max(0, self.transition_combo.findData(
+            self.settings.get("screen_transition", "fade"))))
+        self.transition_combo.setFixedHeight(34)
+        self.transition_combo.setMinimumWidth(220)
+        self.transition_combo.setToolTip(
+            "Sayfa değişirken ekran ışığı yumuşakça kısılır, yeni görüntü karanlıkta çizilir ve ışık geri açılır."
+        )
+        self.transition_combo.currentIndexChanged.connect(
+            lambda _i: self._set_live_setting(
+                "screen_transition", str(self.transition_combo.currentData() or "fade"))
+        )
+        screen_grid.addWidget(self.transition_combo, row, 1, Qt.AlignmentFlag.AlignLeft)
         display.addWidget(self.quick_card)
 
         # Information shown on the screen: hardware names + weather
@@ -2941,6 +2980,10 @@ class ControlPanel(QWidget):
                 "unit": self._tr("Birim fiyatı kendim gireceğim"),
             }),
             (self.theme_combo, {value: self._tr(label) for label, value in UI_THEME_NAMES.items()}),
+            (self.transition_combo, {
+                "fade": self._tr("Yumuşak kararma (önerilen)"),
+                "wipe": self._tr("Soldan sağa süpürme (eski)"),
+            }),
         ):
             for index in range(combo.count()):
                 combo.setItemText(index, labels.get(combo.itemData(index), combo.itemText(index)))
@@ -3683,7 +3726,7 @@ class ControlPanel(QWidget):
                 "carousel_enabled", "carousel_seconds", "carousel_idle_seconds",
                 "energy_price_mode", *ENERGY_LIMITS,
                 "faceit_nickname", "faceit_key_protected",
-                "game_profiles_enabled", "game_profiles",
+                "game_profiles_enabled", "game_profiles", "screen_transition",
             )},
         }
 
@@ -4484,20 +4527,20 @@ class ControlPanel(QWidget):
                         energy_summary = (
                             self.energy_meter.summary() if self.energy_meter.running else None
                         )
+                        progress_now = None
                         faceit_snapshot = (
                             self.faceit_monitor.snapshot() if self.faceit_monitor.configured() else None
                         )
                         if design_mode == "msfs":
                             requested_detail = getattr(flight_state, "phase", "")
                         elif design_mode == "desktop":
-                            requested_detail = carousel_page(
-                                current, user_idle_seconds(),
-                                available_pages(NewScreenContext(
-                                    metrics={}, weather=weather_snapshot.readings,
-                                    energy=energy_summary, faceit=faceit_snapshot,
-                                )),
-                                time.time(),
-                            )
+                            idle_now, wall_now = user_idle_seconds(), time.time()
+                            pages_now = available_pages(NewScreenContext(
+                                metrics={}, weather=weather_snapshot.readings,
+                                energy=energy_summary, faceit=faceit_snapshot,
+                            ))
+                            requested_detail = carousel_page(current, idle_now, pages_now, wall_now)
+                            progress_now = carousel_progress(current, idle_now, pages_now, wall_now)
                         else:
                             requested_detail = ""
                         if design_mode == "cs2" and active_profile is not None and active_profile.screen == "strip":
@@ -4521,6 +4564,7 @@ class ControlPanel(QWidget):
                             faceit=faceit_snapshot,
                             toast=self.current_toast(),
                             game_name=active_profile.title if active_profile is not None else "",
+                            carousel_progress=progress_now if design_mode == "desktop" else None,
                         ))
                         media_patch = None
                         if last_view_mode is None or sent_frame is None:
@@ -4534,9 +4578,26 @@ class ControlPanel(QWidget):
                             # Send only the pixels that changed; a screen change
                             # goes out as a left-to-right column wipe.
                             update_kind, send_regions = plan_new_design_update(frame, sent_frame)
+                            fade = (
+                                update_kind == "wipe"
+                                and current.get("screen_transition", "fade") == "fade"
+                                and hasattr(screen, "fade")
+                            )
                             if send_regions:
                                 transfer_started = time.monotonic()
-                                screen.show_regions(frame, send_regions)
+                                if fade:
+                                    # Fade through dark: the panel paints while
+                                    # unlit, so no half-old/half-new frame shows.
+                                    # In the dark the sweep order is invisible, so
+                                    # send only the changed widgets: the shortest
+                                    # possible blackout.
+                                    level = effective_brightness(current)
+                                    send_regions = widget_dirty_rects(frame, sent_frame) or send_regions
+                                    screen.fade(level, 0, FADE_OUT_SECONDS, steps=FADE_OUT_STEPS)
+                                    screen.show_regions(frame, send_regions)
+                                    screen.fade(0, level, FADE_IN_SECONDS, steps=FADE_STEPS)
+                                else:
+                                    screen.show_regions(frame, send_regions)
                                 if update_kind == "wipe":
                                     log_transfer(
                                         "wipe", time.monotonic() - transfer_started,
