@@ -1,6 +1,19 @@
 # Sabasakal Mini Screen 3.5″
 
-Sürüm 1.4.0
+Sürüm 1.5.0
+
+1.5.0 değişiklikleri: Oyun profilleri (Zowie eklentisinin yerini alır).
+Eklenen her oyun (.exe) için monitör modu (ZOWIE GAMER 1/2/3), NVIDIA dijital
+titreşim, varsayılan ses çıkışı ve mini ekran görünümü (turuncu tema ya da
+oyun şeridi) ayarlanır; oyun açılınca bir kez uygulanır, kapanınca titreşim ve
+ses çıkışı eski haline döner, monitör "Oyundan çıkınca" moduna geçer. Eski
+değerler önce diske yazılır; uygulama oyun sırasında kapanır ya da çökerse bir
+sonraki açılışta geri yüklenir. Monitör modu değişince mini ekranda 3 saniyelik
+bildirim çıkar. 1.1.13–1.4 Zowie ayarı otomatik olarak bir CS2 profiline
+dönüştürülür. Algılama yalnızca işlem adıdır; oyuna dokunulmaz. Ağ araçları:
+ExitLag, NoPing gibi ping düşürücülerin kapatıldıktan sonra arka planda kalan
+süreç ve servislerini bulur, tek tuşla (ya da tepsiden) kapatır; oyun sırasında
+böyle bir servis çalışıyorsa uyarır. Sürücülere, ağ ayarlarına ve oyuna dokunmaz.
 
 1.4.0 değişiklikleri: FACEIT kartı: ELO, seviye, bugünkü ELO değişimi, son 5
 maç ve bu maçların K/D ve HS% ortalaması FACEIT bölümünde ve dönen ekranlarda

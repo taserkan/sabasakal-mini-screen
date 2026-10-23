@@ -32,12 +32,13 @@ from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QGridLayout,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
     QMenu, QRadioButton, QScrollArea, QSizePolicy, QSlider, QSystemTrayIcon, QVBoxLayout, QWidget,
+    QDialog, QFileDialog,
 )
 
 from app import (
     COLORS,
     HEIGHT,
-    MAX_HARDWARE_LABEL_LENGTH, MEDIA_VIS_REGION, MEDIA_VIS_REGION_WITH_BATTERY,
+    MAX_HARDWARE_LABEL_LENGTH, MEDIA_VIS_REGION, MEDIA_VIS_REGION_WITH_BATTERY, PROCESS_SCANNER,
     NVIDIA_MONITOR, SENSOR_CACHE_PATH, SENSOR_MONITOR, ScreenSession,
     cs2_is_running,
     get_auto_hardware_labels, get_metrics,
@@ -65,6 +66,15 @@ from energy_runtime import (
     DEFAULT_OTHER_WATTS, DEFAULT_PSU_EFFICIENCY, EnergyMeter, EnergySummary, price_per_kwh,
 )
 from faceit_runtime import FaceitMatch, FaceitMonitor, FaceitSnapshot, protect_secret
+from audio_devices import (
+    default_output_device_id, list_output_devices, set_default_output_device,
+)
+import network_tools
+import nvidia_display
+from profiles_runtime import (
+    MONITOR_MODES, GameProfile, GameProfileMonitor, ProfileActions, normalise_profile,
+    normalise_profiles, profiles_to_settings,
+)
 from update_runtime import (
     CHECK_INTERVAL_SECONDS as UPDATE_CHECK_INTERVAL_SECONDS, UpdateInfo, fetch_latest_release,
     is_trusted_release_url,
@@ -72,14 +82,14 @@ from update_runtime import (
 from zowie_runtime import (
     DEFAULT_DESKTOP_MODE as ZOWIE_DEFAULT_DESKTOP_MODE,
     DEFAULT_GAME_MODE as ZOWIE_DEFAULT_GAME_MODE,
-    ZOWIE_MODE_LABELS, ZowieModeMonitor, normalise_mode as normalise_zowie_mode,
+    ZOWIE_MODE_LABELS, ZowieModeMonitor, normalise_mode as normalise_zowie_mode, set_zowie_mode,
 )
 
 
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -177,8 +187,9 @@ NAV_SECTIONS = (
     ("info", "Bilgiler", "cpu"),
     ("energy", "Elektrik", "zap"),
     ("colors", "Renkler", "palette"),
-    ("zowie", "Zowie monitör", "gamepad-2"),
+    ("games", "Oyun profilleri", "gamepad-2"),
     ("faceit", "FACEIT", "trophy"),
+    ("network", "Ağ araçları", "shield-check"),
     ("about", "Hakkında", "info"),
 )
 
@@ -560,7 +571,22 @@ DEFAULT_SETTINGS = {
     # FACEIT card: nickname + DPAPI-encrypted server-side API key.
     "faceit_nickname": "",
     "faceit_key_protected": "",
+    # v1.5 game profiles (replace the 1.1.13 Zowie-only add-on).
+    "game_profiles_enabled": True,
+    "game_profiles": [],
 }
+TOAST_SECONDS = 3.0
+
+
+def migrated_profiles(saved: dict) -> list[dict]:
+    """1.1.13-1.4 had a CS2-only Zowie switch: turn it into a CS2 profile once."""
+    if not saved.get("zowie_auto_mode"):
+        return []
+    return profiles_to_settings([GameProfile(
+        exe="cs2.exe", name="Counter-Strike 2",
+        monitor_mode=normalise_zowie_mode(saved.get("zowie_game_mode"), ZOWIE_DEFAULT_GAME_MODE),
+        vibrance=60, screen="strip",
+    )])
 FACEIT_DEVELOPERS_URL = "https://developers.faceit.com/"
 CAROUSEL_SECONDS_CHOICES = (10, 15, 30, 60)
 CAROUSEL_IDLE_CHOICES = (30, 60, 120, 300)
@@ -1355,6 +1381,12 @@ def load_settings() -> dict:
             settings["carousel_seconds"] = saved["carousel_seconds"]
         if saved.get("carousel_idle_seconds") in CAROUSEL_IDLE_CHOICES:
             settings["carousel_idle_seconds"] = saved["carousel_idle_seconds"]
+        if "game_profiles" in saved:
+            settings["game_profiles"] = profiles_to_settings(normalise_profiles(saved.get("game_profiles")))
+        else:
+            settings["game_profiles"] = migrated_profiles(saved)
+        if isinstance(saved.get("game_profiles_enabled"), bool):
+            settings["game_profiles_enabled"] = saved["game_profiles_enabled"]
         nickname = saved.get("faceit_nickname")
         if isinstance(nickname, str):
             settings["faceit_nickname"] = nickname.strip()[:32]
@@ -1664,6 +1696,141 @@ def pil_to_qimage(image) -> QImage:
     return QImage(rgb.tobytes("raw", "RGB"), rgb.width, rgb.height, rgb.width * 3, QImage.Format.Format_RGB888).copy()
 
 
+class ProfileDialog(QDialog):
+    """Add or edit one game profile."""
+
+    def __init__(self, parent, profile, audio_devices, tr) -> None:
+        super().__init__(parent)
+        self._tr = tr
+        self.setWindowTitle(tr("Oyun profili"))
+        self.setMinimumWidth(520)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(1, 1)
+
+        def label(text: str) -> QLabel:
+            widget = QLabel(tr(text))
+            widget.setObjectName("body")
+            return widget
+
+        grid.addWidget(label("Oyun dosyası"), 0, 0)
+        exe_line = QHBoxLayout()
+        self.exe_edit = QLineEdit(profile.exe if profile else "")
+        self.exe_edit.setPlaceholderText("cs2.exe")
+        self.exe_edit.setFixedHeight(34)
+        exe_line.addWidget(self.exe_edit, 1)
+        browse = QPushButton(tr("Gözat…"))
+        browse.clicked.connect(self._browse)
+        exe_line.addWidget(browse)
+        grid.addLayout(exe_line, 0, 1)
+        grid.addWidget(label("Görünen ad"), 1, 0)
+        self.name_edit = QLineEdit(profile.name if profile else "")
+        self.name_edit.setPlaceholderText("Counter-Strike 2")
+        self.name_edit.setFixedHeight(34)
+        self.name_edit.setMaxLength(40)
+        grid.addWidget(self.name_edit, 1, 1)
+
+        grid.addWidget(label("Monitör modu"), 2, 0)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem(tr("Değiştirme"), "")
+        for mode in MONITOR_MODES:
+            self.mode_combo.addItem(ZOWIE_MODE_LABELS[mode], mode)
+        self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(profile.monitor_mode if profile else "")))
+        grid.addWidget(self.mode_combo, 2, 1)
+
+        grid.addWidget(label("NVIDIA titreşimi"), 3, 0)
+        vibrance_line = QHBoxLayout()
+        self.vibrance_check = QCheckBox(tr("Değiştir"))
+        self.vibrance_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vibrance_slider.setRange(0, 100)
+        self.vibrance_slider.setValue(profile.vibrance if profile and profile.vibrance is not None else 60)
+        self.vibrance_value = QLabel()
+        self.vibrance_value.setObjectName("section")
+        self.vibrance_value.setMinimumWidth(34)
+        self.vibrance_check.setChecked(bool(profile and profile.vibrance is not None))
+        self.vibrance_check.toggled.connect(self._sync)
+        self.vibrance_slider.valueChanged.connect(self._sync)
+        vibrance_line.addWidget(self.vibrance_check)
+        vibrance_line.addWidget(self.vibrance_slider, 1)
+        vibrance_line.addWidget(self.vibrance_value)
+        grid.addLayout(vibrance_line, 3, 1)
+
+        grid.addWidget(label("Ses çıkışı"), 4, 0)
+        self.audio_combo = QComboBox()
+        self.audio_combo.addItem(tr("Değiştirme"), "")
+        for device in audio_devices:
+            self.audio_combo.addItem(device.name, device.device_id)
+        if profile and profile.audio_device and self.audio_combo.findData(profile.audio_device) < 0:
+            self.audio_combo.addItem(profile.audio_name or profile.audio_device, profile.audio_device)
+        self.audio_combo.setCurrentIndex(max(0, self.audio_combo.findData(profile.audio_device if profile else "")))
+        grid.addWidget(self.audio_combo, 4, 1)
+
+        grid.addWidget(label("Mini ekran"), 5, 0)
+        self.screen_combo = QComboBox()
+        self.screen_combo.addItem(tr("Turuncu tema (masaüstü ekranı)"), "theme")
+        self.screen_combo.addItem(tr("Oyun şeridi (CPU/GPU/RAM + piller)"), "strip")
+        self.screen_combo.setCurrentIndex(max(0, self.screen_combo.findData(profile.screen if profile else "theme")))
+        grid.addWidget(self.screen_combo, 5, 1)
+        for combo in (self.mode_combo, self.audio_combo, self.screen_combo):
+            combo.setFixedHeight(34)
+        layout.addLayout(grid)
+        note = QLabel(tr("Oyun kapanınca titreşim ve ses çıkışı eski haline döner; monitör "
+                         "'Oyundan çıkınca' ayarındaki moda geçer."))
+        note.setObjectName("device")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton(tr("Vazgeç"))
+        cancel.clicked.connect(self.reject)
+        self.ok_button = QPushButton(tr("Kaydet"), objectName="accent")
+        self.ok_button.clicked.connect(self._accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.ok_button)
+        layout.addLayout(buttons)
+        self._sync()
+
+    def _sync(self, *_args) -> None:
+        enabled = self.vibrance_check.isChecked()
+        self.vibrance_slider.setEnabled(enabled)
+        self.vibrance_value.setText(str(self.vibrance_slider.value()) if enabled else "—")
+
+    def _browse(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self, self._tr("Oyun dosyası"), "", "Oyun (*.exe)",
+        )
+        if path:
+            file = Path(path)
+            self.exe_edit.setText(file.name.lower())
+            if not self.name_edit.text().strip():
+                self.name_edit.setText(file.stem)
+
+    def result_profile(self) -> GameProfile | None:
+        exe = self.exe_edit.text().strip().lower()
+        if exe and not exe.endswith(".exe"):
+            exe += ".exe"
+        return normalise_profile({
+            "exe": exe,
+            "name": self.name_edit.text().strip(),
+            "monitor_mode": self.mode_combo.currentData() or "",
+            "vibrance": self.vibrance_slider.value() if self.vibrance_check.isChecked() else None,
+            "audio_device": self.audio_combo.currentData() or "",
+            "audio_name": self.audio_combo.currentText() if self.audio_combo.currentData() else "",
+            "screen": self.screen_combo.currentData() or "theme",
+        })
+
+    def _accept(self) -> None:
+        if self.result_profile() is None:
+            self.exe_edit.setFocus()
+            self.exe_edit.setStyleSheet("border-color: #E87878;")
+            return
+        self.accept()
+
+
 class WorkerSignals(QObject):
     preview = Signal(QImage)
     status = Signal(str)
@@ -1672,6 +1839,8 @@ class WorkerSignals(QObject):
     autostart_result = Signal(bool, str)
     update_result = Signal(object, str, bool)  # UpdateInfo | None, error, manual
     faceit_result = Signal(object)  # FaceitSnapshot
+    network_scan = Signal(object)  # list[network_tools.Finding]
+    network_stopped = Signal(object, object)  # done labels, failed labels
 
 
 class ControlPanel(QWidget):
@@ -1720,6 +1889,26 @@ class ControlPanel(QWidget):
             settings=lambda: self.settings,
             log=_runtime_log,
         )
+        # Game profiles; the polling thread is started by main() only.
+        self._toast: tuple[str, float] = ("", 0.0)
+        self.profile_monitor = GameProfileMonitor(
+            profiles=lambda: normalise_profiles(self.settings.get("game_profiles")),
+            settings=lambda: self.settings,
+            running_names=lambda: PROCESS_SCANNER.names().keys(),
+            actions=ProfileActions(
+                switch_monitor=set_zowie_mode,
+                get_vibrance=nvidia_display.get_vibrance,
+                set_vibrance=nvidia_display.set_vibrance,
+                get_audio=default_output_device_id,
+                set_audio=set_default_output_device,
+                audio_present=lambda device_id: any(
+                    device.device_id == device_id for device in list_output_devices()
+                ),
+            ),
+            state_path=APP_DATA / "profile-state.json",
+            log=_runtime_log,
+            toast=self._set_toast,
+        )
         # FACEIT card; the refresh thread is started by main() only.
         self.faceit_monitor = FaceitMonitor(
             settings=lambda: self.settings,
@@ -1736,6 +1925,13 @@ class ControlPanel(QWidget):
         self._update_notified = ""
         self.signals.update_result.connect(self._update_result)
         self.signals.faceit_result.connect(self._faceit_result)
+        self.network_findings: list = []
+        self._network_busy = False
+        self._network_warned = False
+        self._network_watch = False
+        self._network_next_scan = 0.0
+        self.signals.network_scan.connect(self._network_scan_result)
+        self.signals.network_stopped.connect(self._network_stopped)
         self.ui_theme = self.settings.get("ui_theme", DEFAULT_UI_THEME)
         if self.ui_theme not in UI_THEMES:
             self.ui_theme = DEFAULT_UI_THEME
@@ -1759,9 +1955,11 @@ class ControlPanel(QWidget):
         self.zowie_status_timer = QTimer(self)
         self.zowie_status_timer.timeout.connect(self._refresh_zowie_status)
         self.zowie_status_timer.timeout.connect(self._refresh_energy_readout)
+        self.zowie_status_timer.timeout.connect(self._network_tick)
         self.zowie_status_timer.start(1000)
         self._refresh_zowie_status()
         self.update_status_label.setText(self._tr("Henüz denetlenmedi"))
+        self.network_status_label.setText(self._tr("Henüz taranmadı"))
         self._refresh_preview()
         _runtime_log(f"control panel ready; autorun={autorun}; smoke_test={smoke_test}")
         if smoke_test:
@@ -2066,6 +2264,7 @@ class ControlPanel(QWidget):
         for mode, caption in (
             ("daily", "Günlük"), ("clock", "Saat"), ("weather", "Hava"),
             ("energy", "Elektrik"), ("faceit", "FACEIT"), ("cs2", "CS2 teması"),
+            ("game", "Oyun şeridi"),
             ("msfs", "MSFS"), ("wireless", "Kablosuz"),
         ):
             button = QPushButton(caption)
@@ -2470,24 +2669,50 @@ class ControlPanel(QWidget):
         self._update_palette_buttons()
         colours.addWidget(colour_card)
 
-        # Zowie add-on (live: usable while the screen runs)
-        zowie = section(
-            "zowie", "Zowie monitör",
-            "CS2 açılınca monitörü oyun moduna, kapanınca masaüstü moduna alır.",
+        # Game profiles (live: usable while the screen runs)
+        games = section(
+            "games", "Oyun profilleri",
+            "Eklediğin oyun açılınca monitör modu, NVIDIA titreşimi, ses çıkışı ve mini ekran "
+            "ayarlanır; oyun kapanınca hepsi eski haline döner.",
         )
-        zowie_card, zowie_grid = group()
-        self.zowie_check = QCheckBox("CS2'de otomatik mod")
-        self.zowie_check.setToolTip(
-            "CS2 açılınca monitörü oyun moduna, kapanınca masaüstü moduna alır."
+        games_card, games_grid = group()
+        self.profiles_check = QCheckBox("Oyun profillerini kullan")
+        self.profiles_check.setChecked(bool(self.settings.get("game_profiles_enabled", True)))
+        self.profiles_check.toggled.connect(self._profiles_toggled)
+        games_grid.addWidget(self._label("Otomatik"), 0, 0)
+        games_grid.addWidget(self.profiles_check, 0, 1, Qt.AlignmentFlag.AlignLeft)
+        games_grid.addWidget(self._label("Oyunlar"), 1, 0, Qt.AlignmentFlag.AlignTop)
+        self.profile_rows = QVBoxLayout()
+        self.profile_rows.setSpacing(6)
+        profile_rows_widget = QWidget(objectName="inline")
+        profile_rows_widget.setLayout(self.profile_rows)
+        self.profile_rows.setContentsMargins(0, 0, 0, 0)
+        games_grid.addWidget(profile_rows_widget, 1, 1)
+        add_line = QHBoxLayout()
+        self.add_profile_button = QPushButton("+ Oyun ekle")
+        self.add_profile_button.clicked.connect(lambda _checked=False: self._edit_profile(None))
+        add_line.addWidget(self.add_profile_button)
+        add_line.addStretch()
+        games_grid.addLayout(add_line, 2, 1)
+        games_grid.addWidget(self._label("Oyundan çıkınca"), 3, 0)
+        self.desktop_mode_combo = QComboBox()
+        self.desktop_mode_combo.addItem(self._tr("Monitör modunu değiştirme"), "")
+        for mode in MONITOR_MODES:
+            self.desktop_mode_combo.addItem(ZOWIE_MODE_LABELS[mode], mode)
+        self.desktop_mode_combo.setCurrentIndex(max(0, self.desktop_mode_combo.findData(
+            str(self.settings.get("zowie_desktop_mode") or ""))))
+        self.desktop_mode_combo.setFixedHeight(34)
+        self.desktop_mode_combo.setMinimumWidth(220)
+        self.desktop_mode_combo.currentIndexChanged.connect(
+            lambda _i: self._set_live_setting(
+                "zowie_desktop_mode", str(self.desktop_mode_combo.currentData() or ""))
         )
-        self.zowie_check.setChecked(bool(self.settings.get("zowie_auto_mode")))
-        self.zowie_check.toggled.connect(self._zowie_toggled)
-        zowie_grid.addWidget(self._label("Otomatik mod"), 0, 0)
-        zowie_grid.addWidget(self.zowie_check, 0, 1, Qt.AlignmentFlag.AlignLeft)
-        zowie_grid.addWidget(self._label("Monitör modu"), 1, 0)
+        games_grid.addWidget(self.desktop_mode_combo, 3, 1, Qt.AlignmentFlag.AlignLeft)
+        games_grid.addWidget(self._label("Monitör modu"), 4, 0)
         self.zowie_status_label = self._label("", "section")
-        zowie_grid.addWidget(self.zowie_status_label, 1, 1)
-        zowie.addWidget(zowie_card)
+        games_grid.addWidget(self.zowie_status_label, 4, 1)
+        games.addWidget(games_card)
+        self._rebuild_profile_rows()
 
         # FACEIT card (live: usable while the screen runs)
         faceit = section(
@@ -2535,6 +2760,37 @@ class ControlPanel(QWidget):
         faceit_note.setWordWrap(True)
         faceit_grid.addWidget(faceit_note, 3, 0, 1, 2)
         faceit.addWidget(faceit_card)
+
+        # Network tools: leftover ping boosters (live: usable while the screen runs)
+        network = section(
+            "network", "Ağ araçları",
+            "ExitLag, NoPing gibi programlar kapatıldıktan sonra arka planda servis bırakabilir ve "
+            "oyunda jitter / paket kaybı yapabilir. Buradan bulup tek tuşla kapatabilirsin.",
+        )
+        network_card, network_grid = group()
+        network_grid.addWidget(self._label("Durum"), 0, 0, Qt.AlignmentFlag.AlignTop)
+        self.network_status_label = self._label("", "section")
+        self.network_status_label.setWordWrap(True)
+        network_grid.addWidget(self.network_status_label, 0, 1)
+        network_buttons = QHBoxLayout()
+        network_buttons.setSpacing(10)
+        self.network_scan_button = QPushButton("Yeniden tara")
+        self.network_scan_button.clicked.connect(lambda _checked=False: self._scan_network_tools())
+        self.network_stop_button = QPushButton("Hepsini kapat", objectName="accent")
+        self.network_stop_button.setEnabled(False)
+        self.network_stop_button.clicked.connect(lambda _checked=False: self._stop_network_tools())
+        network_buttons.addWidget(self.network_scan_button)
+        network_buttons.addWidget(self.network_stop_button)
+        network_buttons.addStretch()
+        network_grid.addLayout(network_buttons, 1, 1)
+        network_note = self._label(
+            "Yalnızca bu programların süreçlerini ve servislerini kapatır; sürücülere, ağ "
+            "ayarlarına ve oyuna dokunmaz. Kapattıktan sonra açık olan oyunu yeniden başlatman önerilir.",
+            "device",
+        )
+        network_note.setWordWrap(True)
+        network_grid.addWidget(network_note, 2, 0, 1, 2)
+        network.addWidget(network_card)
 
         # About + updates
         about = section("about", "Hakkında")
@@ -2651,6 +2907,7 @@ class ControlPanel(QWidget):
     DYNAMIC_LABEL_ATTRIBUTES = (
         "status_label", "brightness_value", "zowie_status_label", "update_status_label",
         "energy_price_label", "energy_readout_label", "faceit_status_label",
+        "network_status_label",
     )
 
     def _register_static_translations(self) -> None:
@@ -2739,10 +2996,8 @@ class ControlPanel(QWidget):
             self.tray_start_action.setText(self._tr("Mini ekranı başlat"))
             self.tray_stop_action.setText(self._tr("Mini ekranı durdur"))
             self.tray_exit_action.setText(self._tr("Çıkış"))
-            self.tray_zowie_action.setText(self._zowie_action_text())
-            self.tray_zowie_action.setToolTip(self._tr(
-                "CS2 açılınca monitörü oyun moduna, kapanınca masaüstü moduna alır."
-            ))
+            self.tray_profiles_action.setText(self._tr("Oyun profilleri"))
+            self.tray_network_action.setText(self._tr("Ağ araçlarını kapat"))
         if getattr(self, "_active_color_key", None) in self.swatches:
             self._choose_color(self._active_color_key)
         if refresh_preview:
@@ -2783,14 +3038,14 @@ class ControlPanel(QWidget):
         menu.addAction(self.tray_start_action)
         menu.addAction(self.tray_stop_action)
         menu.addSeparator()
-        self.tray_zowie_action = QAction(self._zowie_action_text(), self)
-        self.tray_zowie_action.setCheckable(True)
-        self.tray_zowie_action.setChecked(bool(self.settings.get("zowie_auto_mode")))
-        self.tray_zowie_action.setToolTip(self._tr(
-            "CS2 açılınca monitörü oyun moduna, kapanınca masaüstü moduna alır."
-        ))
-        self.tray_zowie_action.toggled.connect(self._zowie_toggled)
-        menu.addAction(self.tray_zowie_action)
+        self.tray_profiles_action = QAction(self._tr("Oyun profilleri"), self)
+        self.tray_profiles_action.setCheckable(True)
+        self.tray_profiles_action.setChecked(bool(self.settings.get("game_profiles_enabled", True)))
+        self.tray_profiles_action.toggled.connect(self._profiles_toggled)
+        menu.addAction(self.tray_profiles_action)
+        self.tray_network_action = QAction(self._tr("Ağ araçlarını kapat"), self)
+        self.tray_network_action.triggered.connect(lambda _checked=False: self._stop_network_tools())
+        menu.addAction(self.tray_network_action)
         menu.addSeparator()
         self.tray_exit_action = QAction(self._tr("Çıkış"), self)
         self.tray_exit_action.triggered.connect(self._exit_application)
@@ -2811,23 +3066,10 @@ class ControlPanel(QWidget):
         }:
             self._show_from_tray()
 
-    def _zowie_action_text(self) -> str:
-        return self._tr(
-            "Zowie eklentisi · CS2'de {game}, sonra {desktop}",
-            game=ZOWIE_MODE_LABELS[normalise_zowie_mode(
-                self.settings.get("zowie_game_mode"), ZOWIE_DEFAULT_GAME_MODE,
-            )],
-            desktop=ZOWIE_MODE_LABELS[normalise_zowie_mode(
-                self.settings.get("zowie_desktop_mode"), ZOWIE_DEFAULT_DESKTOP_MODE,
-            )],
-        )
-
     def _configure_zowie_monitor(self) -> None:
-        self.zowie_monitor.configure(
-            bool(self.settings.get("zowie_auto_mode")),
-            str(self.settings.get("zowie_game_mode", ZOWIE_DEFAULT_GAME_MODE)),
-            str(self.settings.get("zowie_desktop_mode", ZOWIE_DEFAULT_DESKTOP_MODE)),
-        )
+        # v1.5: switching is done by the game profiles; the Zowie monitor
+        # thread only reads the current mode for the status line.
+        self.zowie_monitor.configure(False, ZOWIE_DEFAULT_GAME_MODE, ZOWIE_DEFAULT_DESKTOP_MODE)
 
     def start_zowie_monitor(self) -> None:
         self.zowie_monitor.start()
@@ -2940,6 +3182,92 @@ class ControlPanel(QWidget):
             text = " · ".join(parts)
         if self.energy_readout_label.text() != text:
             self.energy_readout_label.setText(text)
+
+    # ---- Network tools (leftover ping boosters) ------------------------------
+    NETWORK_SCAN_SECONDS = 30.0
+
+    def start_network_watch(self) -> None:
+        """Real launches only: scan now, then every 30 s while useful."""
+        self._network_watch = True
+        self._network_next_scan = 0.0
+
+    def _network_tick(self) -> None:
+        if not getattr(self, "_network_watch", False) or self._network_busy:
+            return
+        now = time.monotonic()
+        if now < self._network_next_scan:
+            return
+        # Scanning is only useful while someone looks or a game runs.
+        if (self.isVisible() and not self.isMinimized()) or cs2_is_running() or self.profile_monitor.active:
+            self._network_next_scan = now + self.NETWORK_SCAN_SECONDS
+            self._scan_network_tools()
+
+    def _scan_network_tools(self) -> None:
+        if self._network_busy:
+            return
+        self._network_busy = True
+        self.network_scan_button.setEnabled(False)
+        threading.Thread(
+            target=lambda: self.signals.network_scan.emit(network_tools.scan()),
+            name="network-scan", daemon=True,
+        ).start()
+
+    def _network_scan_result(self, findings) -> None:
+        self._network_busy = False
+        self.network_scan_button.setEnabled(True)
+        self.network_findings = list(findings)
+        self.network_stop_button.setEnabled(bool(findings))
+        if findings:
+            parts = [
+                self._tr("{name} servisi", name=f.label) if f.kind == "service" else f.label
+                for f in findings
+            ]
+            self.network_status_label.setText(self._tr("Arka planda çalışıyor: {items}", items=", ".join(parts)))
+            self.network_status_label.setStyleSheet("color: #E3B866;")
+        else:
+            self.network_status_label.setText(self._tr("Arka planda ağ aracı yok ✓"))
+            self.network_status_label.setStyleSheet(f"color: {ACCENT};")
+        in_game = cs2_is_running() or self.profile_monitor.active is not None
+        leftover_only = bool(findings) and all(f.kind == "service" for f in findings)
+        if in_game and leftover_only and not self._network_warned:
+            # Today's case: the booster window is closed but its service still runs.
+            self._network_warned = True
+            _runtime_log("network tools: booster service running during a game")
+            if self.tray_icon is not None:
+                self.tray_icon.showMessage(
+                    self._tr(APP_DISPLAY_NAME),
+                    self._tr("Arka planda ağ aracı servisi çalışıyor; oyunda paket kaybı yapabilir. "
+                             "Sabasakal > Ağ araçları > Hepsini kapat."),
+                    QSystemTrayIcon.MessageIcon.Warning, 8000,
+                )
+        if not in_game:
+            self._network_warned = False
+
+    def _stop_network_tools(self) -> None:
+        if self._network_busy:
+            return
+        self._network_busy = True
+        self.network_stop_button.setEnabled(False)
+        self.network_scan_button.setEnabled(False)
+        self.network_status_label.setText(self._tr("Kapatılıyor…"))
+
+        def work() -> None:
+            findings = network_tools.scan()  # fresh list: never act on stale pids
+            done, failed = network_tools.stop_all(findings)
+            self.signals.network_stopped.emit(done, failed)
+
+        threading.Thread(target=work, name="network-stop", daemon=True).start()
+
+    def _network_stopped(self, done, failed) -> None:
+        self._network_busy = False
+        _runtime_log(f"network tools stopped; done={len(done)}; failed={len(failed)}")
+        self._scan_network_tools()
+        if self.tray_icon is not None and (done or failed):
+            message = self._tr("Kapatıldı: {items}", items=", ".join(done)) if done else ""
+            if failed:
+                message += (" · " if message else "") + self._tr("Kapatılamadı: {items}", items=", ".join(failed))
+            self.tray_icon.showMessage(self._tr(APP_DISPLAY_NAME), message,
+                                       QSystemTrayIcon.MessageIcon.Information, 5000)
 
     # ---- FACEIT ---------------------------------------------------------------
     def _sync_faceit_controls(self) -> None:
@@ -3091,25 +3419,117 @@ class ControlPanel(QWidget):
             self.zowie_status_label.setText(text)
             self.zowie_status_label.setStyleSheet(f"color: {color};")
 
-    def _zowie_toggled(self, checked: bool) -> None:
-        # Saved straight away (like rotation): the window checkbox and the
-        # tray entry work even while the form is locked by a running screen.
+    def _profiles_toggled(self, checked: bool) -> None:
+        # Saved straight away: the window checkbox and the tray entry work
+        # even while the form is locked by a running screen.
         checked = bool(checked)
-        if checked == bool(self.settings.get("zowie_auto_mode")):
+        if checked == bool(self.settings.get("game_profiles_enabled", True)):
             return
-        for control in (getattr(self, "zowie_check", None), getattr(self, "tray_zowie_action", None)):
+        for control in (getattr(self, "profiles_check", None), getattr(self, "tray_profiles_action", None)):
             if control is not None and control.isChecked() != checked:
                 control.blockSignals(True)
                 control.setChecked(checked)
                 control.blockSignals(False)
-        self.settings = {**self.settings, "zowie_auto_mode": checked}
-        self._configure_zowie_monitor()
-        self._refresh_zowie_status()
+        self._set_live_setting("game_profiles_enabled", checked)
+        if not checked:
+            self.profile_monitor.restore_now()  # never leave a game's settings applied
+        _runtime_log(f"game profiles {'on' if checked else 'off'}")
+
+    def _profiles(self) -> list[GameProfile]:
+        return normalise_profiles(self.settings.get("game_profiles"))
+
+    def _save_profiles(self, profiles: list[GameProfile]) -> None:
+        self._set_live_setting("game_profiles", profiles_to_settings(profiles))
+        self._rebuild_profile_rows()
+
+    def _profile_summary(self, profile: GameProfile) -> str:
+        parts = []
+        if profile.monitor_mode:
+            parts.append(ZOWIE_MODE_LABELS.get(profile.monitor_mode, profile.monitor_mode))
+        if profile.vibrance is not None:
+            parts.append(self._tr("titreşim {value}", value=profile.vibrance))
+        if profile.audio_device:
+            parts.append(profile.audio_name or self._tr("ses çıkışı"))
+        parts.append(self._tr("oyun şeridi") if profile.screen == "strip" else self._tr("turuncu tema"))
+        return " · ".join(parts)
+
+    def _rebuild_profile_rows(self) -> None:
+        while self.profile_rows.count():
+            item = self.profile_rows.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        profiles = self._profiles()
+        if not profiles:
+            empty = self._label("Henüz oyun eklenmedi", "device")
+            empty.setProperty("i18n_source", "")
+            self.profile_rows.addWidget(empty)
+            return
+        for index, profile in enumerate(profiles):
+            row = QFrame(objectName="subCard")
+            line = QHBoxLayout(row)
+            line.setContentsMargins(12, 8, 8, 8)
+            line.setSpacing(10)
+            copy = QVBoxLayout()
+            copy.setSpacing(1)
+            title = QLabel(f"{profile.title}  ·  {profile.exe}" if profile.name else profile.exe)
+            title.setObjectName("section")
+            title.setProperty("i18n_source", "")
+            summary = QLabel(self._profile_summary(profile))
+            summary.setObjectName("device")
+            summary.setProperty("i18n_source", "")
+            copy.addWidget(title)
+            copy.addWidget(summary)
+            line.addLayout(copy, 1)
+            edit = QPushButton(self._tr("Düzenle"))
+            edit.setProperty("i18n_source", "")
+            edit.clicked.connect(lambda _checked=False, i=index: self._edit_profile(i))
+            remove = QPushButton(self._tr("Sil"))
+            remove.setProperty("i18n_source", "")
+            remove.clicked.connect(lambda _checked=False, i=index: self._remove_profile(i))
+            for button in (edit, remove):
+                button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+                line.addWidget(button)
+            self.profile_rows.addWidget(row)
+
+    def _remove_profile(self, index: int) -> None:
+        profiles = self._profiles()
+        if 0 <= index < len(profiles):
+            del profiles[index]
+            self._save_profiles(profiles)
+
+    def _edit_profile(self, index: int | None) -> None:
+        profiles = self._profiles()
+        current = profiles[index] if index is not None and 0 <= index < len(profiles) else None
         try:
-            save_settings_file(self.settings)
+            audio = list_output_devices()
         except Exception as exc:
-            _runtime_log(f"zowie setting save failed: {type(exc).__name__}: {exc}")
-        _runtime_log(f"zowie add-on {'on' if checked else 'off'}")
+            _runtime_log(f"audio device list failed: {type(exc).__name__}: {exc}")
+            audio = []
+        dialog = ProfileDialog(self, current, audio, self._tr)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        profile = dialog.result_profile()
+        if profile is None:
+            return
+        others = [p for i, p in enumerate(profiles) if i != index and p.exe != profile.exe]
+        if index is not None and current is not None:
+            others.insert(min(index, len(others)), profile)
+        else:
+            others.append(profile)
+        self._save_profiles(others)
+        # Edited while its game runs: apply the new vibrance/audio at once.
+        self.profile_monitor.profile_edited(profile)
+
+    def _set_toast(self, mode: str) -> None:
+        """Called from the profile thread when the monitor mode was switched."""
+        self.zowie_monitor.current_mode = mode
+        self.zowie_monitor.monitor_found = True
+        self._toast = (ZOWIE_MODE_LABELS.get(mode, mode), time.monotonic())
+
+    def current_toast(self) -> str:
+        label, at = self._toast
+        return label if label and time.monotonic() - at < TOAST_SECONDS else ""
 
     def _show_from_tray(self) -> None:
         self.showNormal()
@@ -3123,6 +3543,8 @@ class ControlPanel(QWidget):
         self.zowie_monitor.stop(timeout=1.0)
         self.energy_meter.stop(timeout=1.0)
         self.faceit_monitor.stop(timeout=1.0)
+        self.profile_monitor.stop(timeout=1.0)
+        self.profile_monitor.restore_now()
         self.unregister_session_notifications()
         if self.tray_icon is not None:
             self.tray_icon.hide()
@@ -3161,6 +3583,8 @@ class ControlPanel(QWidget):
         self.zowie_monitor.stop(timeout=1.0)
         self.energy_meter.stop(timeout=1.0)
         self.faceit_monitor.stop(timeout=1.0)
+        self.profile_monitor.stop(timeout=1.0)
+        self.profile_monitor.restore_now()
         self.unregister_session_notifications()
         self.stop_event.set()
         worker = self.worker
@@ -3177,7 +3601,7 @@ class ControlPanel(QWidget):
     def _sync_design_dependent_controls(self) -> None:
         classic = self._is_classic_design()
         # The idle carousel pages exist only in the Claude design.
-        for mode in ("clock", "energy", "faceit"):
+        for mode in ("clock", "energy", "faceit", "game"):
             button = getattr(self, "preview_buttons", {}).get(mode)
             if button is not None:
                 button.setVisible(not classic)
@@ -3259,6 +3683,7 @@ class ControlPanel(QWidget):
                 "carousel_enabled", "carousel_seconds", "carousel_idle_seconds",
                 "energy_price_mode", *ENERGY_LIMITS,
                 "faceit_nickname", "faceit_key_protected",
+                "game_profiles_enabled", "game_profiles",
             )},
         }
 
@@ -3285,7 +3710,7 @@ class ControlPanel(QWidget):
         self._refresh_preview()
 
     def _set_preview_mode(self, mode: str) -> None:
-        if mode not in {"daily", "clock", "energy", "faceit", "cs2", "msfs", "weather", "wireless"}:
+        if mode not in {"daily", "clock", "energy", "faceit", "cs2", "game", "msfs", "weather", "wireless"}:
             return
         self.preview_mode = mode
         self._refresh_preview()
@@ -3504,6 +3929,7 @@ class ControlPanel(QWidget):
                     "weather": "Boştayken dönen ekran · hava durumu",
                     "energy": "Boştayken dönen ekran · elektrik",
                     "faceit": "Boştayken dönen ekran · FACEIT",
+                    "game": "Oyun profili · oyun şeridi",
                     "wireless": "Yeni tasarım · masaüstü",
                     "cs2": "Yeni tasarım · CS2 açıkken turuncu tema",
                     "msfs": "Yeni tasarım · MSFS seyir",
@@ -3593,6 +4019,10 @@ class ControlPanel(QWidget):
             hardware_labels={"cpu": labels.get("cpu", ""), "gpu": labels.get("gpu", "")},
         )
         mode = self.preview_mode
+        if mode == "game":
+            return render_new_screen(NewScreenContext(
+                **common, mode="game", game_name="Counter-Strike 2",
+            ))
         if mode == "cs2":
             context = NewScreenContext(
                 **common, mode="cs2", weather=self._preview_weather_readings(),
@@ -3789,6 +4219,7 @@ class ControlPanel(QWidget):
         last_sensor_watchdog = 0.0
         cached_metrics = None
         game_active = False
+        active_profile = None
         msfs_active = False
         msfs_elapsed: float | None = None
         applied_cs2_theme: bool | None = None
@@ -3928,7 +4359,8 @@ class ControlPanel(QWidget):
                         cycle_started - last_context_refresh >= 0.45
                         or last_context_refresh == 0.0
                     ):
-                        game_active = cs2_is_running()
+                        active_profile = self.profile_monitor.active
+                        game_active = cs2_is_running() or active_profile is not None
                         msfs_elapsed = msfs_session_seconds()
                         msfs_active = msfs_elapsed is not None
                         last_context_refresh = cycle_started
@@ -4068,6 +4500,8 @@ class ControlPanel(QWidget):
                             )
                         else:
                             requested_detail = ""
+                        if design_mode == "cs2" and active_profile is not None and active_profile.screen == "strip":
+                            design_mode = "game"
                         design_mode, shown_detail = screen_stabilizer.update(
                             (design_mode, requested_detail), cycle_started,
                         )
@@ -4085,6 +4519,8 @@ class ControlPanel(QWidget):
                             page=(shown_detail or "main") if design_mode == "desktop" else "main",
                             energy=energy_summary,
                             faceit=faceit_snapshot,
+                            toast=self.current_toast(),
+                            game_name=active_profile.title if active_profile is not None else "",
                         ))
                         media_patch = None
                         if last_view_mode is None or sent_frame is None:
@@ -4627,6 +5063,8 @@ def main() -> int:
         panel.start_zowie_monitor()
         panel.energy_meter.start()
         panel.faceit_monitor.start()
+        panel.profile_monitor.start()
+        panel.start_network_watch()
         panel.register_session_notifications()
         panel.start_update_checks()
     if panel.tray_icon is not None:

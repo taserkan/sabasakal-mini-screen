@@ -73,6 +73,68 @@ ENGLISH: dict[str, str] = {
     "Çıkış": "Exit",
     "Zowie eklentisi · CS2'de {game}, sonra {desktop}": "Zowie add-on · {game} in CS2, then {desktop}",
     "Zowie monitör": "Zowie monitor",
+    # v1.5 network tools
+    "Ağ araçları": "Network tools",
+    "ExitLag, NoPing gibi programlar kapatıldıktan sonra arka planda servis bırakabilir ve oyunda jitter / paket kaybı yapabilir. Buradan bulup tek tuşla kapatabilirsin.": (
+        "Tools such as ExitLag or NoPing can leave a background service running after you close "
+        "them, causing in-game jitter or packet loss. Find and stop them here with one click."
+    ),
+    "Yeniden tara": "Scan again",
+    "Hepsini kapat": "Stop all",
+    "Yalnızca bu programların süreçlerini ve servislerini kapatır; sürücülere, ağ ayarlarına ve oyuna dokunmaz. Kapattıktan sonra açık olan oyunu yeniden başlatman önerilir.": (
+        "Only stops these programs' processes and services; drivers, network settings and the "
+        "game are not touched. Restart a running game afterwards."
+    ),
+    "{name} servisi": "{name} service",
+    "Arka planda çalışıyor: {items}": "Running in the background: {items}",
+    "Arka planda ağ aracı yok ✓": "No network tools in the background ✓",
+    "Arka planda ağ aracı servisi çalışıyor; oyunda paket kaybı yapabilir. Sabasakal > Ağ araçları > Hepsini kapat.": (
+        "A network tool service is running in the background and may cause packet loss. "
+        "Sabasakal > Network tools > Stop all."
+    ),
+    "Kapatılıyor…": "Stopping…",
+    "Kapatıldı: {items}": "Stopped: {items}",
+    "Kapatılamadı: {items}": "Could not stop: {items}",
+    "Henüz taranmadı": "Not scanned yet",
+    "Ağ araçlarını kapat": "Stop network tools",
+    # v1.5 game profiles
+    "Oyun profilleri": "Game profiles",
+    "Eklediğin oyun açılınca monitör modu, NVIDIA titreşimi, ses çıkışı ve mini ekran ayarlanır; oyun kapanınca hepsi eski haline döner.": (
+        "When a game you added starts, the monitor mode, NVIDIA vibrance, audio output and mini "
+        "display are set; when it closes everything goes back."
+    ),
+    "Oyun profillerini kullan": "Use game profiles",
+    "Otomatik": "Automatic",
+    "Oyunlar": "Games",
+    "+ Oyun ekle": "+ Add game",
+    "Oyundan çıkınca": "After the game",
+    "Monitör modunu değiştirme": "Keep the monitor mode",
+    "Henüz oyun eklenmedi": "No games added yet",
+    "Düzenle": "Edit",
+    "titreşim {value}": "vibrance {value}",
+    "ses çıkışı": "audio output",
+    "oyun şeridi": "in-game strip",
+    "turuncu tema": "orange theme",
+    "Oyun profili": "Game profile",
+    "Oyun dosyası": "Game file",
+    "Gözat…": "Browse…",
+    "Görünen ad": "Display name",
+    "Değiştirme": "Don't change",
+    "NVIDIA titreşimi": "NVIDIA vibrance",
+    "Değiştir": "Change",
+    "Ses çıkışı": "Audio output",
+    "Mini ekran": "Mini display",
+    "Turuncu tema (masaüstü ekranı)": "Orange theme (desktop screen)",
+    "Oyun şeridi (CPU/GPU/RAM + piller)": "In-game strip (CPU/GPU/RAM + batteries)",
+    "Oyun kapanınca titreşim ve ses çıkışı eski haline döner; monitör 'Oyundan çıkınca' ayarındaki moda geçer.": (
+        "When the game closes vibrance and audio output go back; the monitor switches to the "
+        "'After the game' mode."
+    ),
+    "Vazgeç": "Cancel",
+    "Kaydet": "Save",
+    "Oyun şeridi": "In-game strip",
+    "Oyun profili · oyun şeridi": "Game profile · in-game strip",
+    "Monitör: {mode}": "Monitor: {mode}",
     # v1.4 FACEIT
     "bugün {change}": "today {change}",
     "Son maçlar": "Recent matches",

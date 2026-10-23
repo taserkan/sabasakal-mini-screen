@@ -1,6 +1,20 @@
 # Sabasakal Mini Screen 3.5″
 
-Version 1.4.0
+Version 1.5.0
+
+1.5.0 changes: game profiles (replacing the Zowie add-on). For every game you
+add (.exe): monitor mode (ZOWIE GAMER 1/2/3), NVIDIA digital vibrance, default
+audio output and mini display look (orange theme or in-game strip). Applied
+once when the game starts; when it closes vibrance and audio output go back and
+the monitor switches to the "After the game" mode. The old values are written
+to disk first, so an app exit or crash mid-game is repaired on the next start.
+A 3-second banner shows the new monitor mode on the mini display. The
+1.1.13-1.4 Zowie setting is migrated to a CS2 profile automatically. Detection
+is a process-name check only; the game is never touched. Network tools: finds
+processes and services that ping boosters such as ExitLag or NoPing leave
+running after they are closed, stops them with one click (or from the tray) and
+warns when such a service runs during a game. Drivers, network settings and the
+game are never touched.
 
 1.4.0 changes: FACEIT card: ELO, level, today's ELO change, the last five
 matches and their average K/D and HS% appear in the FACEIT section and the idle

@@ -126,6 +126,9 @@ class NewScreenContext:
     page: str = "main"
     energy: object | None = None  # energy_runtime.EnergySummary
     faceit: object | None = None  # faceit_runtime.FaceitSnapshot (v1.4)
+    # v1.5: short banner (e.g. "GAMER 2") drawn over any screen.
+    toast: str = ""
+    game_name: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1199,14 +1202,51 @@ PAGE_RENDERERS = {
 }
 
 
+def render_game_strip(ctx: NewScreenContext) -> Image.Image:
+    """In-game screen: status strip on top, large CPU/GPU panels below."""
+    background, strip_bg, accent = MODE_CS2
+    image = Image.new("RGB", (WIDTH, HEIGHT), background)
+    draw_strip(image, ctx, strip_bg, accent)
+    draw = ImageDraw.Draw(image)
+    track = blend(background, accent, 0.22)
+    bottom = HEIGHT - 34
+    (l1, r1), (l2, r2) = _columns(14, WIDTH - 14, 2, 10)
+    _system_panel(image, draw, (l1, STRIP_HEIGHT + 10, r1, bottom), background, "cpu", ctx,
+                  96, track, _cpu_details(ctx), 30, False)
+    _system_panel(image, draw, (l2, STRIP_HEIGHT + 10, r2, bottom), background, "gpu", ctx,
+                  96, track, _gpu_details(ctx), 30, False)
+    now = ctx.now or dt.datetime.now()
+    text(draw, (14, HEIGHT - 10), fit(draw, ctx.game_name, 14, 300), 14, accent, anchor="ls")
+    text(draw, (WIDTH - 14, HEIGHT - 10), now.strftime("%H:%M"), 16, TEXT, condensed=True, anchor="rs")
+    return image
+
+
+TOAST_HEIGHT = 46
+
+
+def draw_toast(image: Image.Image, label: str) -> None:
+    """Bottom banner, e.g. the monitor's new picture mode."""
+    draw = ImageDraw.Draw(image)
+    top = HEIGHT - TOAST_HEIGHT
+    draw.rectangle((0, top, WIDTH, HEIGHT), fill="#0B0F14")
+    draw.rectangle((0, top, WIDTH, top + 2), fill=MODE_DESKTOP[2])
+    text(draw, (WIDTH / 2, top + 32), fit(draw, label, 24, WIDTH - 40), 24, TEXT, anchor="ms")
+
+
 def render_new_screen(ctx: NewScreenContext) -> Image.Image:
     ctx.language = normalize_language(ctx.language)
     if ctx.mode == "msfs":
         phase = getattr(ctx.flight_state, "phase", "ground") or "ground"
-        return MSFS_RENDERERS.get(phase, render_msfs_ground)(ctx)
-    if ctx.mode == "desktop" and ctx.page in PAGE_RENDERERS:
-        return PAGE_RENDERERS[ctx.page](ctx)
-    return render_main(ctx)
+        image = MSFS_RENDERERS.get(phase, render_msfs_ground)(ctx)
+    elif ctx.mode == "game":
+        image = render_game_strip(ctx)
+    elif ctx.mode == "desktop" and ctx.page in PAGE_RENDERERS:
+        image = PAGE_RENDERERS[ctx.page](ctx)
+    else:
+        image = render_main(ctx)
+    if ctx.toast:
+        draw_toast(image, _t(ctx, "Monitör: {mode}", mode=ctx.toast))
+    return image
 
 
 __all__ = [

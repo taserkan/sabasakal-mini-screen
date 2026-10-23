@@ -847,6 +847,7 @@ class PerformanceCounterScenarios(unittest.TestCase):
         process = SimpleNamespace(info={
             "name": "FlightSimulator2024.exe", "create_time": 100.0,
         })
+        screen_app.PROCESS_SCANNER.invalidate()  # other tests may have filled the 2 s cache
         with patch.object(
             screen_app.psutil, "process_iter", return_value=[process],
         ), patch.object(screen_app.time, "time", return_value=160.0):
@@ -2011,7 +2012,7 @@ class UiAndConnectionScenarios(unittest.TestCase):
         panel = self.make_panel()
         self.assertEqual(
             set(panel.preview_buttons),
-            {"daily", "clock", "weather", "energy", "faceit", "cs2", "msfs", "wireless"},
+            {"daily", "clock", "weather", "energy", "faceit", "cs2", "game", "msfs", "wireless"},
         )
         for design in ("new", "classic"):
             panel.design_combo.setCurrentIndex(panel.design_combo.findData(design))
@@ -2169,25 +2170,27 @@ class UiAndConnectionScenarios(unittest.TestCase):
             "Sabasakal Mini Ekran'ı aç",
             "Mini ekranı başlat",
             "Mini ekranı durdur",
-            "Zowie eklentisi · CS2'de GAMER 2, sonra GAMER 3",
+            "Oyun profilleri",
+            "Ağ araçlarını kapat",
             "Çıkış",
         })
-        # The Zowie add-on is a checkable tray toggle and starts switched off.
-        self.assertTrue(panel.tray_zowie_action.isCheckable())
-        self.assertFalse(panel.tray_zowie_action.isChecked())
-        self.assertFalse(panel.zowie_monitor.running)  # only main() starts the thread
+        # Game profiles are a checkable tray toggle, on by default.
+        self.assertTrue(panel.tray_profiles_action.isCheckable())
+        self.assertTrue(panel.tray_profiles_action.isChecked())
+        self.assertFalse(panel.zowie_monitor.running)  # only main() starts the threads
+        self.assertFalse(panel.profile_monitor.running)
         # The version is shown next to the title (not in the window title,
         # which _activate_existing_window() matches exactly).
         self.assertEqual(panel.version_label.text(), f"v{gui.APP_VERSION}")
         self.assertEqual(panel.windowTitle(), gui.WINDOW_TITLE)
         # Window checkbox and tray entry stay in sync and survive a form snapshot.
-        self.assertTrue(panel.zowie_check.isEnabled())
-        panel.zowie_check.setChecked(True)
-        self.assertTrue(panel.tray_zowie_action.isChecked())
-        self.assertIs(panel._snapshot_settings()["zowie_auto_mode"], True)
-        panel.tray_zowie_action.setChecked(False)
-        self.assertFalse(panel.zowie_check.isChecked())
-        self.assertIs(panel.settings["zowie_auto_mode"], False)
+        self.assertTrue(panel.profiles_check.isEnabled())
+        panel.profiles_check.setChecked(False)
+        self.assertFalse(panel.tray_profiles_action.isChecked())
+        self.assertIs(panel._snapshot_settings()["game_profiles_enabled"], False)
+        panel.tray_profiles_action.setChecked(True)
+        self.assertTrue(panel.profiles_check.isChecked())
+        self.assertIs(panel.settings["game_profiles_enabled"], True)
         panel.tray_icon.hide()
         panel.tray_icon = None
         panel.close()
@@ -4899,6 +4902,341 @@ class EnergyPanelScenarios(Fix111Base):
         self.assertEqual(panel.settings["energy_unit_price"], 3.25)
         self.assertIn("3,25", panel.energy_price_label.text())
         self.assertEqual(json.loads(gui.SETTINGS_PATH.read_text(encoding="utf-8"))["energy_unit_price"], 3.25)
+
+
+class NetworkToolsScenarios(unittest.TestCase):
+    """v1.5: leftover ping boosters are found and stopped; nothing else is touched."""
+
+    def fake_process(self, pid, name, exe=""):
+        return SimpleNamespace(info={"pid": pid, "name": name, "exe": exe})
+
+    def fake_service(self, name, status="running", display="", binpath=""):
+        return SimpleNamespace(as_dict=lambda: {
+            "name": name, "status": status, "display_name": display or name, "binpath": binpath,
+        })
+
+    def test_scan_finds_only_known_boosters(self) -> None:
+        import network_tools as nt
+        found = nt.scan(
+            processes=lambda: [
+                self.fake_process(10, "ExitLag.exe", r"C:\Program Files\ExitLag\ExitLag.exe"),
+                self.fake_process(11, "launcher.exe", r"C:\Games\NoPing\launcher.exe"),
+                self.fake_process(12, "cs2.exe", r"C:\Steam\cs2.exe"),
+                self.fake_process(13, "steam.exe"),
+            ],
+            services=lambda: [
+                self.fake_service("ExitLagPmService", binpath=r"C:\Program Files\ExitLag\ExitLagPmService.exe"),
+                self.fake_service("NoPingSvc", status="stopped"),
+                self.fake_service("Spooler"),
+            ],
+        )
+        self.assertEqual([(f.kind, f.name) for f in found], [
+            ("process", "ExitLag.exe"), ("process", "launcher.exe"), ("service", "ExitLagPmService"),
+        ])
+
+    def test_stop_all_stops_services_first_and_reports(self) -> None:
+        import network_tools as nt
+        calls = []
+        findings = [nt.Finding("process", "ExitLag.exe", "ExitLag.exe", 10),
+                    nt.Finding("service", "ExitLagPmService", "ExitLagPmService")]
+        done, failed = nt.stop_all(
+            findings,
+            stop_service=lambda name: calls.append(("service", name)) or True,
+            end_process=lambda pid: calls.append(("process", pid)) or False,
+        )
+        self.assertEqual(calls, [("service", "ExitLagPmService"), ("process", 10)])
+        self.assertEqual((done, failed), (["ExitLagPmService"], ["ExitLag.exe"]))
+
+    def test_module_never_touches_drivers_adapters_or_the_game(self) -> None:
+        source = (Path(__file__).parent / "network_tools.py").read_text(encoding="utf-8")
+        code = source.split('"""', 2)[2].lower()  # skip the module docstring
+        for marker in ("netsh", "route ", "set-netadapter", "disable-netadapter", "ipconfig",
+                       "winsock", "sc.exe delete", "cs2", "pnputil", "devcon"):
+            self.assertNotIn(marker, code, marker)
+
+
+class NetworkToolsPanelScenarios(Fix111Base):
+    def test_scan_result_and_stop_flow(self) -> None:
+        import network_tools as nt
+        panel = self.make_panel()
+        leftover = [nt.Finding("service", "ExitLagPmService", "ExitLagPmService")]
+        # Hermetic: never scan the real process table (it would fill the shared cache).
+        cs2 = patch.object(gui, "cs2_is_running", return_value=False)
+        cs2.start()
+        self.addCleanup(cs2.stop)
+        panel._network_scan_result(leftover)
+        self.assertIn("ExitLagPmService", panel.network_status_label.text())
+        self.assertTrue(panel.network_stop_button.isEnabled())
+        panel._network_scan_result([])
+        self.assertIn("✓", panel.network_status_label.text())
+        self.assertFalse(panel.network_stop_button.isEnabled())
+
+    def test_leftover_service_during_a_game_warns_once(self) -> None:
+        import network_tools as nt
+        with patch.object(gui.QSystemTrayIcon, "isSystemTrayAvailable", return_value=True):
+            panel = self.make_panel()
+        self.addCleanup(lambda: setattr(panel, "tray_icon", None))
+        leftover = [nt.Finding("service", "ExitLagPmService", "ExitLagPmService")]
+        with patch.object(gui, "cs2_is_running", return_value=True), \
+                patch.object(panel.tray_icon, "showMessage") as shown:
+            panel._network_scan_result(leftover)
+            panel._network_scan_result(leftover)
+        self.assertEqual(shown.call_count, 1)
+        panel.tray_icon.hide()
+
+    def test_periodic_scan_is_off_until_main_enables_it(self) -> None:
+        panel = self.make_panel()
+        with patch.object(panel, "_scan_network_tools") as scan:
+            panel._network_tick()
+            self.assertEqual(scan.call_count, 0)
+            panel.start_network_watch()
+            with patch.object(gui, "cs2_is_running", return_value=True):
+                panel._network_tick()
+            self.assertEqual(scan.call_count, 1)
+
+
+class FakeProfileHardware:
+    """Records profile side effects instead of touching NVIDIA/audio/monitor."""
+
+    def __init__(self, vibrance=50, audio="dev-speakers", devices=("dev-speakers", "dev-headset")):
+        self.vibrance, self.audio, self.devices = vibrance, audio, set(devices)
+        self.calls: list[tuple] = []
+        self.toasts: list[str] = []
+        self.fail_read_vibrance = False
+
+    def actions(self):
+        import profiles_runtime as pr
+
+        def get_vibrance():
+            if self.fail_read_vibrance:
+                raise OSError("no NVIDIA")
+            return self.vibrance
+
+        def set_vibrance(level):
+            self.calls.append(("vibrance", level))
+            self.vibrance = level
+
+        def set_audio(device):
+            self.calls.append(("audio", device))
+            self.audio = device
+
+        return pr.ProfileActions(
+            switch_monitor=lambda mode: self.calls.append(("monitor", mode)) or "XL2546X+",
+            get_vibrance=get_vibrance, set_vibrance=set_vibrance,
+            get_audio=lambda: self.audio, set_audio=set_audio,
+            audio_present=lambda device: device in self.devices,
+        )
+
+
+class GameProfileScenarios(unittest.TestCase):
+    """v1.5: per-game monitor mode / vibrance / audio / screen, always restored."""
+
+    def make(self, profiles, settings=None, hardware=None, state_dir=None):
+        import profiles_runtime as pr
+        hardware = hardware or FakeProfileHardware()
+        running: set[str] = set()
+        cfg = {"game_profiles_enabled": True, "zowie_desktop_mode": "GAMER3", **(settings or {})}
+        monitor = pr.GameProfileMonitor(
+            profiles=lambda: pr.normalise_profiles(profiles),
+            settings=lambda: cfg, running_names=lambda: set(running),
+            actions=hardware.actions(),
+            state_path=Path(state_dir or tempfile.mkdtemp()) / "profile-state.json",
+            toast=hardware.toasts.append,
+        )
+        return monitor, running, hardware, cfg
+
+    CS2 = {"exe": "cs2.exe", "name": "Counter-Strike 2", "monitor_mode": "GAMER2",
+           "vibrance": 60, "audio_device": "dev-headset", "screen": "strip"}
+
+    def polls(self, monitor, count):
+        for _ in range(count):
+            monitor.poll_once()
+
+    def test_game_start_applies_and_exit_restores_everything(self) -> None:
+        monitor, running, hw, _cfg = self.make([self.CS2])
+        monitor.poll_once()  # first look: nothing running
+        running.add("cs2.exe")
+        monitor.poll_once()
+        self.assertEqual(hw.calls, [("vibrance", 60), ("audio", "dev-headset"), ("monitor", "GAMER2")])
+        self.assertEqual(monitor.active.exe, "cs2.exe")
+        self.assertEqual(hw.toasts, ["GAMER2"])
+        self.polls(monitor, 20)  # alt-tab / manual GAMER1: nothing is re-applied
+        self.assertEqual(len(hw.calls), 3)
+        running.clear()
+        self.polls(monitor, 3)
+        self.assertEqual(hw.calls[3:], [("vibrance", 50), ("audio", "dev-speakers"), ("monitor", "GAMER3")])
+        self.assertEqual((hw.vibrance, hw.audio), (50, "dev-speakers"))
+        self.assertIsNone(monitor.active)
+        self.assertFalse(monitor._state_path.exists())
+
+    def test_a_missed_scan_does_not_restore(self) -> None:
+        monitor, running, hw, _cfg = self.make([self.CS2])
+        monitor.poll_once()
+        running.add("cs2.exe")
+        monitor.poll_once()
+        running.clear()
+        self.polls(monitor, 2)
+        running.add("cs2.exe")
+        self.polls(monitor, 5)
+        self.assertEqual(len(hw.calls), 3)  # still applied, never reverted
+
+    def test_startup_with_the_game_running_changes_nothing(self) -> None:
+        monitor, running, hw, _cfg = self.make([self.CS2])
+        running.add("cs2.exe")
+        self.polls(monitor, 5)
+        self.assertEqual(hw.calls, [])
+        self.assertEqual(monitor.active.exe, "cs2.exe")  # the screen still follows the game
+
+    def test_switching_games_restores_then_applies(self) -> None:
+        other = {"exe": "valorant.exe", "vibrance": 70}
+        monitor, running, hw, _cfg = self.make([self.CS2, other])
+        monitor.poll_once()
+        running.add("cs2.exe")
+        monitor.poll_once()
+        running.clear()
+        running.add("valorant.exe")
+        monitor.poll_once()
+        self.assertEqual(hw.calls[3:], [("vibrance", 50), ("audio", "dev-speakers"), ("vibrance", 70)])
+        self.assertNotIn(("monitor", "GAMER3"), hw.calls)  # no desktop flash between games
+
+    def test_disabled_profiles_do_nothing(self) -> None:
+        monitor, running, hw, _cfg = self.make([self.CS2], {"game_profiles_enabled": False})
+        monitor.poll_once()
+        running.add("cs2.exe")
+        self.polls(monitor, 3)
+        running.clear()
+        self.polls(monitor, 5)
+        self.assertEqual(hw.calls, [])
+        self.assertIsNone(monitor.active)
+
+    def test_missing_audio_device_and_unreadable_vibrance_are_skipped(self) -> None:
+        hw = FakeProfileHardware(devices=("dev-speakers",))
+        hw.fail_read_vibrance = True
+        monitor, running, hw, _cfg = self.make([self.CS2], hardware=hw)
+        monitor.poll_once()
+        running.add("cs2.exe")
+        monitor.poll_once()
+        # No vibrance (nothing to restore to), no audio (device gone): monitor only.
+        self.assertEqual(hw.calls, [("monitor", "GAMER2")])
+
+    def test_crash_mid_game_is_repaired_on_next_start(self) -> None:
+        state_dir = tempfile.mkdtemp()
+        monitor, running, hw, _cfg = self.make([self.CS2], state_dir=state_dir)
+        monitor.poll_once()
+        running.add("cs2.exe")
+        monitor.poll_once()
+        self.assertTrue(monitor._state_path.exists())
+        # The app dies here. Next start, the game is already closed:
+        restarted, _running, hw2, _cfg2 = self.make([self.CS2], state_dir=state_dir,
+                                                    hardware=FakeProfileHardware(vibrance=60, audio="dev-headset"))
+        restarted.poll_once()
+        self.assertEqual(hw2.calls, [("vibrance", 50), ("audio", "dev-speakers")])
+        self.assertFalse(restarted._state_path.exists())
+
+    def test_editing_the_running_game_applies_at_once_and_exit_restores_the_original(self) -> None:
+        import profiles_runtime as pr
+        monitor, running, hw, _cfg = self.make([self.CS2])
+        monitor.poll_once()
+        running.add("cs2.exe")
+        monitor.poll_once()  # vibrance 50 -> 60
+        edited = pr.normalise_profile({**self.CS2, "vibrance": 55})
+        self.assertTrue(monitor.profile_edited(edited))
+        self.assertEqual(hw.vibrance, 55)
+        running.clear()
+        self.polls(monitor, 3)
+        self.assertEqual(hw.vibrance, 50)  # the value from before the game, not 60
+        self.assertFalse(monitor.profile_edited(edited))  # game closed: nothing to apply
+
+    def test_editing_another_game_changes_nothing_now(self) -> None:
+        import profiles_runtime as pr
+        monitor, running, hw, _cfg = self.make([self.CS2, {"exe": "valorant.exe", "vibrance": 70}])
+        monitor.poll_once()
+        running.add("cs2.exe")
+        monitor.poll_once()
+        calls = len(hw.calls)
+        self.assertFalse(monitor.profile_edited(pr.normalise_profile({"exe": "valorant.exe", "vibrance": 80})))
+        self.assertEqual(len(hw.calls), calls)
+
+    def test_restore_now_reverts_without_switching_the_monitor(self) -> None:
+        monitor, running, hw, _cfg = self.make([self.CS2])
+        monitor.poll_once()
+        running.add("cs2.exe")
+        monitor.poll_once()
+        monitor.restore_now()
+        self.assertEqual(hw.calls[3:], [("vibrance", 50), ("audio", "dev-speakers")])
+
+    def test_profiles_are_validated(self) -> None:
+        import profiles_runtime as pr
+        profiles = pr.normalise_profiles([
+            {"exe": "CS2.EXE", "vibrance": 140, "monitor_mode": "gamer2", "screen": "x"},
+            {"exe": "cs2.exe"},  # duplicate
+            {"exe": "..\\evil.exe"}, {"exe": "notepad"}, "junk",
+            {"exe": "game.exe", "vibrance": True},
+        ])
+        self.assertEqual([p.exe for p in profiles], ["cs2.exe", "game.exe"])
+        self.assertEqual((profiles[0].vibrance, profiles[0].monitor_mode, profiles[0].screen), (100, "GAMER2", "theme"))
+        self.assertIsNone(profiles[1].vibrance)
+
+    def test_zowie_add_on_is_migrated_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "settings.json"
+            path.write_text('{"zowie_auto_mode": true, "zowie_game_mode": "GAMER1"}', encoding="utf-8")
+            with patch.object(gui, "APP_DATA", root), patch.object(gui, "SETTINGS_PATH", path):
+                migrated = gui.load_settings()
+                path.write_text('{"zowie_auto_mode": true, "game_profiles": []}', encoding="utf-8")
+                emptied = gui.load_settings()
+        self.assertEqual(len(migrated["game_profiles"]), 1)
+        profile = migrated["game_profiles"][0]
+        self.assertEqual((profile["exe"], profile["monitor_mode"], profile["vibrance"], profile["screen"]),
+                         ("cs2.exe", "GAMER1", 60, "strip"))
+        self.assertEqual(emptied["game_profiles"], [])  # a user-emptied list stays empty
+
+    def test_profile_code_never_touches_the_game(self) -> None:
+        for name in ("profiles_runtime.py", "nvidia_display.py", "audio_devices.py"):
+            source = (Path(__file__).parent / name).read_text(encoding="utf-8").lower()
+            for api in ("readprocessmemory", "writeprocessmemory", "openprocess", "sendinput",
+                        "keybd_event", "setwindowshookex", "createremotethread", "nvapi_setdvclevel\""):
+                self.assertNotIn(api, source, f"{name}: {api}")
+        nvidia = (Path(__file__).parent / "nvidia_display.py").read_text(encoding="utf-8")
+        self.assertNotIn("0x172409B4", nvidia)  # legacy SetDVCLevel (other scale) is never used
+
+
+class GameProfilePanelScenarios(Fix111Base):
+    def test_dialog_builds_a_profile_and_list_updates(self) -> None:
+        panel = self.make_panel()
+        dialog = gui.ProfileDialog(panel, None, [gui.AudioDevice("dev-1", "Headset")]
+                                   if hasattr(gui, "AudioDevice") else [], panel._tr)
+        dialog.exe_edit.setText("Valorant")
+        dialog.name_edit.setText("Valorant")
+        dialog.mode_combo.setCurrentIndex(dialog.mode_combo.findData("GAMER1"))
+        dialog.vibrance_check.setChecked(True)
+        dialog.vibrance_slider.setValue(70)
+        dialog.screen_combo.setCurrentIndex(dialog.screen_combo.findData("strip"))
+        profile = dialog.result_profile()
+        self.assertEqual((profile.exe, profile.monitor_mode, profile.vibrance, profile.screen),
+                         ("valorant.exe", "GAMER1", 70, "strip"))
+        dialog.close()
+        panel._save_profiles([profile])
+        self.assertEqual(json.loads(gui.SETTINGS_PATH.read_text(encoding="utf-8"))["game_profiles"][0]["exe"],
+                         "valorant.exe")
+        panel._remove_profile(0)
+        self.assertEqual(panel.settings["game_profiles"], [])
+
+    def test_worker_shows_the_strip_and_the_toast(self) -> None:
+        import profiles_runtime as pr
+        panel = self.make_panel()
+        strip_profile = pr.GameProfile("valorant.exe", "Valorant", screen="strip")
+        renders: list = []
+        panel._toast = ("GAMER 2", time.monotonic())
+        with patch.object(type(panel.profile_monitor), "active", new=property(lambda _self: strip_profile)):
+            DesignSwitchScenarios.run_worker(self, panel, cycles=3, design_renders=renders)
+        self.assertTrue(renders)
+        self.assertEqual(renders[0].mode, "game")
+        self.assertEqual(renders[0].game_name, "Valorant")
+        self.assertEqual(renders[0].toast, "GAMER 2")
+        panel._toast = ("GAMER 2", time.monotonic() - 10)
+        self.assertEqual(panel.current_toast(), "")
 
 
 class FakeFaceitClient:
