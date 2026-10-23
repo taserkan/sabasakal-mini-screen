@@ -1936,13 +1936,17 @@ class UiAndConnectionScenarios(unittest.TestCase):
 
     def test_preview_stays_at_native_35_inch_resolution_when_window_grows(self) -> None:
         panel = self.make_panel()
-        panel.resize(1500, 1000)
         panel.show()
+        self.app.processEvents()
+        widths_before = [button.width() for button in panel.preview_buttons.values()]
+        panel.resize(1500, 1000)
         self.app.processEvents()
         self.assertEqual(panel.preview_label.width(), screen_app.WIDTH)
         self.assertEqual(panel.preview_label.height(), screen_app.HEIGHT)
         self.assertFalse(hasattr(panel, "settings_tabs"))
-        self.assertTrue(all(button.width() == 96 for button in panel.preview_buttons.values()))
+        # v1.2 chips size to their text; they must not stretch with the window.
+        self.assertEqual([button.width() for button in panel.preview_buttons.values()], widths_before)
+        self.assertTrue(all(button.height() == 32 for button in panel.preview_buttons.values()))
         panel.close()
 
     def test_color_picker_expands_inline_and_uses_simple_choices(self) -> None:
@@ -2165,8 +2169,25 @@ class UiAndConnectionScenarios(unittest.TestCase):
             "Sabasakal Mini Ekran'ı aç",
             "Mini ekranı başlat",
             "Mini ekranı durdur",
+            "Zowie eklentisi · CS2'de GAMER 2, sonra GAMER 3",
             "Çıkış",
         })
+        # The Zowie add-on is a checkable tray toggle and starts switched off.
+        self.assertTrue(panel.tray_zowie_action.isCheckable())
+        self.assertFalse(panel.tray_zowie_action.isChecked())
+        self.assertFalse(panel.zowie_monitor.running)  # only main() starts the thread
+        # The version is shown next to the title (not in the window title,
+        # which _activate_existing_window() matches exactly).
+        self.assertEqual(panel.version_label.text(), f"v{gui.APP_VERSION}")
+        self.assertEqual(panel.windowTitle(), gui.WINDOW_TITLE)
+        # Window checkbox and tray entry stay in sync and survive a form snapshot.
+        self.assertTrue(panel.zowie_check.isEnabled())
+        panel.zowie_check.setChecked(True)
+        self.assertTrue(panel.tray_zowie_action.isChecked())
+        self.assertIs(panel._snapshot_settings()["zowie_auto_mode"], True)
+        panel.tray_zowie_action.setChecked(False)
+        self.assertFalse(panel.zowie_check.isChecked())
+        self.assertIs(panel.settings["zowie_auto_mode"], False)
         panel.tray_icon.hide()
         panel.tray_icon = None
         panel.close()
@@ -4719,6 +4740,262 @@ class Cs2ThemeScenarios(Fix111Base):
         self.assertEqual(first.getpixel((240, 1)), ImageColor.getrgb(sn.MODE_CS2[2]))
         self.assertEqual(first.getpixel((5, 160)), ImageColor.getrgb(sn.MODE_CS2[0]))
         priority.assert_any_call(below_normal=True)
+
+
+class LockScreenScenarios(Fix111Base):
+    """v1.2: the LCD goes dark while Windows is locked and comes back after."""
+
+    def test_lock_blanks_the_panel_and_unlock_reconnects_with_a_full_frame(self) -> None:
+        panel = self.make_panel()
+        hooks = {
+            2: lambda: panel._session_changed(panel.WTS_SESSION_LOCK),
+            5: lambda: panel._session_changed(panel.WTS_SESSION_UNLOCK),
+        }
+        screens = DesignSwitchScenarios.run_worker(self, panel, cycles=8, hooks=hooks)
+        self.assertGreaterEqual(len(screens), 2)
+        first = screens[0]
+        self.assertIn(("power_off",), first.calls)
+        self.assertTrue(first.closed)
+        # The session opened after unlock starts with a complete frame.
+        self.assertTrue(any(call[0] == "show" for call in screens[1].calls), screens[1].calls)
+        self.assertFalse(panel.display_suspended.is_set())
+
+    def test_lock_is_ignored_when_the_option_is_off(self) -> None:
+        panel = self.make_panel({"screen_off_when_locked": False})
+        self.assertFalse(panel.lock_off_check.isChecked())
+        panel._session_changed(panel.WTS_SESSION_LOCK)
+        self.assertFalse(panel.display_suspended.is_set())
+        panel.lock_off_check.setChecked(True)  # live: applies to the current lock
+        self.assertTrue(panel.display_suspended.is_set())
+        panel._session_changed(panel.WTS_SESSION_UNLOCK)
+        self.assertFalse(panel.display_suspended.is_set())
+
+    def test_new_settings_default_on_and_round_trip(self) -> None:
+        self.assertIs(gui.DEFAULT_SETTINGS["screen_off_when_locked"], True)
+        self.assertIs(gui.DEFAULT_SETTINGS["update_check"], True)
+        panel = self.make_panel({"screen_off_when_locked": False, "update_check": False})
+        snapshot = panel._snapshot_settings()
+        self.assertIs(snapshot["screen_off_when_locked"], False)
+        self.assertIs(snapshot["update_check"], False)
+
+
+class ThemeScenarios(Fix111Base):
+    """v1.2: light (pink-yellow) default theme, live switch to dark."""
+
+    def test_light_is_default_and_switch_is_live_and_saved(self) -> None:
+        self.assertEqual(gui.DEFAULT_SETTINGS["ui_theme"], "light")
+        panel = self.make_panel()
+        self.assertEqual(panel.ui_theme, "light")
+        self.assertIn("#CF7F95", panel.styleSheet())
+        self.assertTrue(panel.theme_combo.isEnabled())
+        panel.theme_combo.setCurrentIndex(panel.theme_combo.findData("dark"))
+        self.assertEqual(panel.ui_theme, "dark")
+        self.assertNotIn("#CF7F95", panel.styleSheet())
+        self.assertEqual(panel._snapshot_settings()["ui_theme"], "dark")
+        self.assertEqual(json.loads(gui.SETTINGS_PATH.read_text(encoding="utf-8"))["ui_theme"], "dark")
+        panel.theme_combo.setCurrentIndex(panel.theme_combo.findData("light"))
+        gui.apply_ui_theme("light")
+
+    def test_unknown_theme_falls_back_to_light(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "settings.json"
+            path.write_text('{"ui_theme": "neon"}', encoding="utf-8")
+            with patch.object(gui, "APP_DATA", root), patch.object(gui, "SETTINGS_PATH", path):
+                self.assertEqual(gui.load_settings()["ui_theme"], "light")
+
+
+class UpdateCheckScenarios(unittest.TestCase):
+    """v1.2: read-only update check; never downloads or runs anything."""
+
+    def release(self, **values) -> dict:
+        payload = {
+            "tag_name": "v1.3.0", "draft": False, "prerelease": False,
+            "html_url": "https://github.com/taserkan/sabasakal-mini-screen/releases/tag/v1.3.0",
+        }
+        payload.update(values)
+        return payload
+
+    def test_newer_and_same_versions_are_detected(self) -> None:
+        import update_runtime as ur
+        info = ur.evaluate_release(self.release(), "1.2.0")
+        self.assertTrue(info.newer)
+        self.assertEqual(info.latest, "1.3.0")
+        self.assertFalse(ur.evaluate_release(self.release(tag_name="v1.2.0"), "1.2.0").newer)
+        self.assertFalse(ur.evaluate_release(self.release(tag_name="v1.1.9"), "1.2.0").newer)
+        self.assertTrue(ur.evaluate_release(self.release(tag_name="v1.10.0"), "1.9.3").newer)
+
+    def test_untrusted_links_never_leave_this_repository(self) -> None:
+        import update_runtime as ur
+        for url in (
+            "https://evil.example/sabasakal.exe",
+            "https://github.com/someone-else/sabasakal-mini-screen/releases/tag/v9.9.9",
+            "javascript:alert(1)", "",
+        ):
+            info = ur.evaluate_release(self.release(html_url=url), "1.2.0")
+            self.assertTrue(info.url.startswith(ur.RELEASE_PAGE_PREFIX), info.url)
+
+    def test_drafts_prereleases_and_garbage_are_rejected(self) -> None:
+        import update_runtime as ur
+        for payload in (
+            self.release(prerelease=True), self.release(draft=True),
+            self.release(tag_name="latest"), [], "x",
+        ):
+            with self.assertRaises(ValueError):
+                ur.evaluate_release(payload, "1.2.0")
+
+    def test_update_code_cannot_download_or_execute(self) -> None:
+        source = (Path(__file__).parent / "update_runtime.py").read_text(encoding="utf-8").lower()
+        for marker in (
+            "urlretrieve", "subprocess", "startfile", "os.system", "exec(", "eval(",
+            "zipfile", "shutil", ".write_bytes", "write_text",
+        ):
+            self.assertNotIn(marker, source, marker)
+        import re
+        # urlopen() is the one allowed network call; a bare open() would write files.
+        self.assertIsNone(re.search(r"(?<![\w.])open\(", source))
+
+    def test_panel_shows_result_and_opens_only_trusted_pages(self) -> None:
+        import update_runtime as ur
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        with patch.object(gui, "load_settings", side_effect=default_settings), patch.object(
+            gui, "get_auto_hardware_labels", return_value={"cpu": "", "gpu": "", "ram": ""},
+        ), patch.object(gui, "get_metrics", return_value={}):
+            panel = gui.ControlPanel(smoke_test=True)
+        self.addCleanup(panel.close)
+        newer = ur.evaluate_release(self.release(), gui.APP_VERSION)
+        panel._update_result(newer, "", True)
+        self.assertIn("1.3.0", panel.update_status_label.text())
+        self.assertFalse(panel.update_open_button.isHidden())
+        with patch.object(gui.QDesktopServices, "openUrl") as opened:
+            panel._open_update_page()
+            panel.update_info = ur.UpdateInfo("9.9.9", "https://evil.example/", True)
+            panel._open_update_page()
+        self.assertEqual(opened.call_count, 1)
+        panel._update_result(None, "URLError: offline", True)
+        self.assertTrue(panel.update_check_button.isEnabled())
+
+
+class ZowieAddonScenarios(unittest.TestCase):
+    """Zowie add-on: edge-triggered monitor mode switch on cs2.exe start/exit."""
+
+    def make(self, states: list[bool], enabled: bool = True):
+        import zowie_runtime as zr
+        switched: list[str] = []
+        feed = iter(states)
+        monitor = zr.ZowieModeMonitor(
+            lambda: next(feed),
+            switch=lambda mode: switched.append(mode) or "XL2546X+",
+        )
+        monitor.configure(enabled, "GAMER2", "GAMER3")
+        return monitor, switched, len(states)
+
+    def run_all(self, monitor, count: int) -> None:
+        for _ in range(count):
+            monitor.poll_once()
+
+    def test_cs2_start_switches_once_and_exit_switches_back(self) -> None:
+        monitor, switched, count = self.make([False, True, True, True, False, False, False])
+        self.run_all(monitor, count)
+        self.assertEqual(switched, ["GAMER2", "GAMER3"])
+
+    def test_nothing_is_enforced_while_cs2_keeps_running(self) -> None:
+        # Alt-tab / manual GAMER1 choice: the process keeps running, so the
+        # add-on must not send anything after the first switch.
+        monitor, switched, count = self.make([False] + [True] * 50)
+        self.run_all(monitor, count)
+        self.assertEqual(switched, ["GAMER2"])
+
+    def test_a_single_missed_scan_does_not_switch_to_desktop(self) -> None:
+        monitor, switched, count = self.make([False, True, False, True, False, False, True])
+        self.run_all(monitor, count)
+        self.assertEqual(switched, ["GAMER2"])
+
+    def test_startup_with_cs2_already_running_changes_nothing(self) -> None:
+        monitor, switched, count = self.make([True, True, True])
+        self.run_all(monitor, count)
+        self.assertEqual(switched, [])
+
+    def test_disabled_add_on_never_touches_the_monitor(self) -> None:
+        monitor, switched, count = self.make([False, True, False, False, False], enabled=False)
+        self.run_all(monitor, count)
+        self.assertEqual(switched, [])
+
+    def test_failed_process_check_is_not_treated_as_exit(self) -> None:
+        import zowie_runtime as zr
+        switched: list[str] = []
+        answers = iter([False, True, RuntimeError("scan"), RuntimeError("scan"), RuntimeError("scan")])
+
+        def check():
+            value = next(answers)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        monitor = zr.ZowieModeMonitor(check, switch=lambda mode: switched.append(mode) or "XL")
+        monitor.configure(True, "GAMER2", "GAMER3")
+        for _ in range(5):
+            monitor.poll_once()
+        self.assertEqual(switched, ["GAMER2"])
+
+    def test_zowie_capabilities_are_recognised(self) -> None:
+        import zowie_runtime as zr
+        caps = "(prot(monitor)type(LCD)model(XL2546X+)vcp(10 12 DC(00 03 15 16 18 19 1A 1B))mccs_ver(2.2))"
+        self.assertTrue(zr.is_zowie_capabilities(caps))
+        self.assertFalse(zr.is_zowie_capabilities(caps.replace("XL2546X+", "VG27AQML1A")))
+        self.assertFalse(zr.is_zowie_capabilities("(model(XL2546X+)vcp(10 12))"))
+
+    def test_settings_default_off_and_invalid_modes_fall_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "settings.json"
+            path.write_text(json.dumps({
+                "zowie_auto_mode": True, "zowie_game_mode": "gamer 1", "zowie_desktop_mode": "FPS9",
+            }), encoding="utf-8")
+            with patch.object(gui, "APP_DATA", root), patch.object(gui, "SETTINGS_PATH", path):
+                loaded = gui.load_settings()
+        self.assertIs(gui.DEFAULT_SETTINGS["zowie_auto_mode"], False)
+        self.assertIs(loaded["zowie_auto_mode"], True)
+        self.assertEqual(loaded["zowie_game_mode"], "GAMER1")
+        self.assertEqual(loaded["zowie_desktop_mode"], "GAMER3")
+
+    def test_status_is_read_only_while_wanted_and_throttled(self) -> None:
+        import zowie_runtime as zr
+        reads: list[int] = []
+        monitor = zr.ZowieModeMonitor(
+            lambda: False, switch=lambda mode: "XL",
+            read_mode=lambda: reads.append(1) or "GAMER3", status_seconds=3.0,
+        )
+        monitor.refresh_status(100.0)  # window hidden: no DDC traffic
+        self.assertEqual(reads, [])
+        monitor.status_wanted = True
+        monitor.refresh_status(100.0)
+        monitor.refresh_status(101.0)  # throttled
+        monitor.refresh_status(103.5)
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(monitor.current_mode, "GAMER3")
+        monitor._read_mode = Mock(side_effect=RuntimeError("no monitor"))
+        monitor.refresh_status(110.0)
+        self.assertIs(monitor.monitor_found, False)
+        self.assertIsNone(monitor.current_mode)
+
+    def test_switch_updates_the_shown_mode(self) -> None:
+        monitor, switched, count = self.make([False, True])
+        self.run_all(monitor, count)
+        self.assertEqual(monitor.current_mode, "GAMER2")
+
+    def test_unknown_mode_codes_are_shown_raw(self) -> None:
+        import zowie_runtime as zr
+        self.assertEqual(zr.mode_from_code(0x19), "GAMER2")
+        self.assertEqual(zr.mode_from_code(0x03), "0x03")
+
+    def test_add_on_source_has_no_game_access(self) -> None:
+        source = (Path(__file__).parent / "zowie_runtime.py").read_text(encoding="utf-8").lower()
+        for api in (
+            "readprocessmemory", "writeprocessmemory", "createremotethread", "sendinput",
+            "keybd_event", "mouse_event", "setwindowshookex", "openprocess",
+        ):
+            self.assertNotIn(api, source, api)
 
 
 if __name__ == "__main__":

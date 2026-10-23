@@ -11,6 +11,7 @@ datas = [
     ('sabasakal-logo.ico', '.'),
     ('sabasakal-logo.png', '.'),
     ('icons/png', 'icons/png'),
+    ('icons/svg', 'icons/svg'),
     ('icons/LICENSES.md', 'icons'),
     (str(driver_root / 'library' / 'lcd' / 'lcd_comm.py'), 'library/lcd'),
     (str(driver_root / 'library' / 'lcd' / 'lcd_comm_rev_a.py'), 'library/lcd'),

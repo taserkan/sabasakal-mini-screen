@@ -1,6 +1,24 @@
 # Sabasakal Mini Screen 3.5″
 
-Sürüm 1.1.12
+Sürüm 1.2.0
+
+1.2.0 değişiklikleri: Yeni, sade kontrol paneli: solda menü (Genel bakış,
+Ekran, Bilgiler, Renkler, Zowie monitör, Hakkında), sağda kaydırılan tek
+sayfa, altta sabit "Kaydet ve başlat" çubuğu. Varsayılan tema açık (beyaz
+zemin, pembe-sarı geçişler); sol alttan Koyu temaya geçilebilir. Windows kilitlenince mini ekran
+kapanır, kilit açılınca geri gelir (Ekran bölümünden kapatılabilir). Hakkında
+bölümünde güncelleme kontrolü: günde bir kez GitHub'daki herkese açık sürüm
+listesine bakar, yeni sürüm varsa haber verir ve yalnızca bu reponun indirme
+sayfasını açar; hiçbir şeyi kendiliğinden indirmez veya çalıştırmaz.
+
+1.1.13 değişiklikleri: Zowie eklentisi. Sistem tepsisinden açılır (varsayılan
+kapalı). CS2 (`cs2.exe`) açılınca ZOWIE XL monitör bir kez GAMER 2'ye,
+kapanınca bir kez GAMER 3'e geçer; oyun açıkken hiçbir şey zorlanmaz, monitörün
+tuşlarıyla GAMER 1/GAMER 2 arasında serbestçe geçilebilir, alt-tab modu
+değiştirmez. Monitör DDC/CI (VCP 0xDC) ile sürülür; oyunla hiçbir iletişim
+yoktur. Geçiş başına tutamaç tutulmaz; 2000 gerçek geçişte bellek ve tutamaç
+sayısı sabit kaldı. Modlar `settings.json` içinde `zowie_game_mode` /
+`zowie_desktop_mode` (GAMER1/GAMER2/GAMER3) ile değiştirilebilir.
 
 1.1.12 değişiklikleri: CPU sensör yardımcısı birkaç MB'ta kalıyor. .NET,
 çöp toplama eşiğini X3D işlemcilerin 96 MB'lık L3 önbelleğine göre

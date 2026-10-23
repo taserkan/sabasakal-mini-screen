@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 import ctypes
+import ctypes.wintypes
 import dataclasses
 import datetime as dt
 import hashlib
@@ -22,12 +23,15 @@ from xml.sax.saxutils import escape as xml_escape
 
 from PIL import Image, ImageChops
 import psutil
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QIcon, QImage, QPixmap, QTransform
+from PySide6.QtCore import QByteArray, QObject, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QAction, QColor, QCloseEvent, QDesktopServices, QIcon, QImage, QPainter, QPixmap, QTransform,
+)
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QGridLayout,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QMenu, QRadioButton, QSizePolicy, QSlider, QSystemTrayIcon, QVBoxLayout, QWidget,
+    QMenu, QRadioButton, QScrollArea, QSizePolicy, QSlider, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from app import (
@@ -57,12 +61,21 @@ from weather_runtime import (
     normalise_city_names,
 )
 from i18n import SUPPORTED_LANGUAGES, normalize_language, translate
+from update_runtime import (
+    CHECK_INTERVAL_SECONDS as UPDATE_CHECK_INTERVAL_SECONDS, UpdateInfo, fetch_latest_release,
+    is_trusted_release_url,
+)
+from zowie_runtime import (
+    DEFAULT_DESKTOP_MODE as ZOWIE_DEFAULT_DESKTOP_MODE,
+    DEFAULT_GAME_MODE as ZOWIE_DEFAULT_GAME_MODE,
+    ZOWIE_MODE_LABELS, ZowieModeMonitor, normalise_mode as normalise_zowie_mode,
+)
 
 
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.1.12"
+APP_VERSION = "1.2.0"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -91,9 +104,93 @@ _SENSOR_HOST_LOCK = threading.RLock()
 _LEGACY_SENSOR_TASKS_CLEANED = False
 APP_ICON_PATH = RESOURCE_ROOT / "sabasakal-logo.ico"
 APP_LOGO_PATH = RESOURCE_ROOT / "sabasakal-logo.png"
-WINDOW_BG, CARD_BG, CARD_2 = "#0D0F13", "#15181E", "#101319"
-EDGE, TEXT, MUTED, ACCENT = "#2B313B", "#F3F5F7", "#9AA4B2", "#79A9F5"
-CONTROL_BG, CONTROL_HOVER, CONTROL_PRESSED = "#20242C", "#2A303A", "#191D24"
+# Control-panel themes. The module colour names below are rebound by
+# apply_ui_theme(), so every f-string that uses them follows the theme.
+UI_THEMES = {
+    "light": {
+        # Soft, low-glare variant: warm grey paper instead of white, muted rose/peach.
+        "window_bg": "#F4F1EE", "card_bg": "#FAF8F6", "card_2": "#F1ECE8",
+        "sidebar_bg": (
+            "qlineargradient(x1:0, y1:0, x2:0.35, y2:1, "
+            "stop:0 #F3E4E8, stop:0.55 #F3EAE4, stop:1 #F2ECDD)"
+        ),
+        "sidebar_border": "#E7DCDF",
+        "edge": "#E6DDDA", "text": "#2A2A30", "muted": "#716C76", "accent": "#C76B85",
+        "accent_fill": (
+            "qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #CF7F95, stop:1 #D9A27A)"
+        ),
+        "accent_fill_hover": (
+            "qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #D78FA3, stop:1 #E0AF8B)"
+        ),
+        "accent_text": "#FFFFFF",
+        "control_bg": "#EFE9E6", "control_hover": "#E9E1DD", "control_pressed": "#E2D8D4",
+        "nav_hover": "rgba(255, 255, 255, 0.35)", "nav_checked": "rgba(250, 248, 246, 0.85)",
+        "nav_checked_text": "#9E4E66",
+        "chip_checked_bg": "#F0DEE3", "chip_checked_text": "#9E4E66",
+        "selection": "#F0DEE3", "slider_track": "#E6DDDA", "indicator_off": "#FAF8F6",
+        "indicator_border": "#D8CBCF", "disabled_text": "#ADA6AE", "disabled_bg": "#EEE9E6",
+        "scroll_handle": "#DED3D2", "action_border": "#E6DDDA", "preview_bg": "#1A1C21",
+    },
+    "dark": {
+        "window_bg": "#16181D", "card_bg": "#1C1F25", "card_2": "#121418",
+        "sidebar_bg": "#0F1115", "sidebar_border": "#1E2229",
+        "edge": "#2A2F38", "text": "#ECEFF3", "muted": "#9AA4B2", "accent": "#79A9F5",
+        "accent_fill": "#79A9F5", "accent_fill_hover": "#93BAF7", "accent_text": "#0A1019",
+        "control_bg": "#24282F", "control_hover": "#2C313A", "control_pressed": "#1C1F25",
+        "nav_hover": "#1A1D23", "nav_checked": "#22262E", "nav_checked_text": "#ECEFF3",
+        "chip_checked_bg": "#29364A", "chip_checked_text": "#ECEFF3",
+        "selection": "#303846", "slider_track": "#29303A", "indicator_off": "#29303A",
+        "indicator_border": "#4B5563", "disabled_text": "#555D68", "disabled_bg": "#191D24",
+        "scroll_handle": "#2C313A", "action_border": "#22262E", "preview_bg": "#121418",
+    },
+}
+UI_THEME_NAMES = {"Açık": "light", "Koyu": "dark"}
+DEFAULT_UI_THEME = "light"
+WINDOW_BG = CARD_BG = CARD_2 = SIDEBAR_BG = EDGE = TEXT = MUTED = ACCENT = ""
+CONTROL_BG = CONTROL_HOVER = CONTROL_PRESSED = ""
+
+
+def apply_ui_theme(name: str) -> dict:
+    """Rebind the module colour names for ``name``; returns the palette."""
+    global WINDOW_BG, CARD_BG, CARD_2, SIDEBAR_BG, EDGE, TEXT, MUTED, ACCENT
+    global CONTROL_BG, CONTROL_HOVER, CONTROL_PRESSED
+    palette = UI_THEMES.get(name, UI_THEMES[DEFAULT_UI_THEME])
+    WINDOW_BG, CARD_BG, CARD_2 = palette["window_bg"], palette["card_bg"], palette["card_2"]
+    SIDEBAR_BG, EDGE, TEXT = palette["sidebar_bg"], palette["edge"], palette["text"]
+    MUTED, ACCENT = palette["muted"], palette["accent"]
+    CONTROL_BG, CONTROL_HOVER = palette["control_bg"], palette["control_hover"]
+    CONTROL_PRESSED = palette["control_pressed"]
+    return palette
+
+
+apply_ui_theme(DEFAULT_UI_THEME)
+ICON_SVG_ROOT = RESOURCE_ROOT / "icons" / "svg"
+SIDEBAR_WIDTH = 228
+# Sidebar entries: (section key, caption, Lucide icon name).
+NAV_SECTIONS = (
+    ("overview", "Genel bakış", "layout-dashboard"),
+    ("display", "Ekran", "monitor"),
+    ("info", "Bilgiler", "cpu"),
+    ("colors", "Renkler", "palette"),
+    ("zowie", "Zowie monitör", "gamepad-2"),
+    ("about", "Hakkında", "info"),
+)
+
+
+def _tinted_svg_icon(name: str, color: str, size: int = 36) -> QIcon:
+    """Render a Lucide (stroke="currentColor") SVG in ``color``."""
+    path = ICON_SVG_ROOT / f"{name}.svg"
+    try:
+        source = path.read_text(encoding="utf-8").replace("currentColor", color)
+    except OSError:
+        return QIcon()
+    renderer = QSvgRenderer(QByteArray(source.encode("utf-8")))
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    renderer.render(painter)
+    painter.end()
+    return QIcon(pixmap)
 COLOR_IMPACT_COPY = {
     "cpu": "Halkaların normal başlangıç rengi",
     "warning": "Yük ve sıcaklık yükselirken geçiş",
@@ -378,6 +475,16 @@ DEFAULT_SETTINGS = {
     "design": "new",
     "weather_cities": list(DEFAULT_WEATHER_CITIES),
     "custom_palettes": {}, "hardware_labels": {"cpu": "", "gpu": "", "ram": ""},
+    # Zowie add-on: monitor picture mode while cs2.exe runs / after it exits.
+    "zowie_auto_mode": False,
+    "zowie_game_mode": ZOWIE_DEFAULT_GAME_MODE,
+    "zowie_desktop_mode": ZOWIE_DEFAULT_DESKTOP_MODE,
+    # Blank the LCD while Windows is locked.
+    "screen_off_when_locked": True,
+    # Read-only daily look at the GitHub release list (never downloads).
+    "update_check": True,
+    # Control-panel look: "light" (pink-yellow) or "dark".
+    "ui_theme": DEFAULT_UI_THEME,
 }
 
 AUTO_BRIGHTNESS_DAY = 90
@@ -543,8 +650,8 @@ INSTANCE_STALE_SECONDS = 30.0
 EXIT_FALLBACK_MS = 5000
 QUICK_CARD_HEIGHT = 288
 SETTINGS_CARD_HEIGHT = 706 + (QUICK_CARD_HEIGHT - 252)
-WINDOW_DEFAULT_SIZE = (1200, 890 + (QUICK_CARD_HEIGHT - 252))
-WINDOW_MINIMUM_SIZE = (1160, 860 + (QUICK_CARD_HEIGHT - 252))
+WINDOW_DEFAULT_SIZE = (1100, 820)
+WINDOW_MINIMUM_SIZE = (900, 620)
 WORKER_RESTART_MAX_DELAY_MS = 60000
 # Must exceed the worst-case ScreenSession reconnect (write timeout + three
 # open attempts with back-off) so an unplug is recovered in-process instead of
@@ -1149,6 +1256,19 @@ def load_settings() -> dict:
                 key: normalise_hardware_label(labels.get(key))
                 for key in ("cpu", "gpu", "ram")
             }
+        if isinstance(saved.get("zowie_auto_mode"), bool):
+            settings["zowie_auto_mode"] = saved["zowie_auto_mode"]
+        for flag in ("screen_off_when_locked", "update_check"):
+            if isinstance(saved.get(flag), bool):
+                settings[flag] = saved[flag]
+        if saved.get("ui_theme") in UI_THEMES:
+            settings["ui_theme"] = saved["ui_theme"]
+        settings["zowie_game_mode"] = normalise_zowie_mode(
+            saved.get("zowie_game_mode"), ZOWIE_DEFAULT_GAME_MODE,
+        )
+        settings["zowie_desktop_mode"] = normalise_zowie_mode(
+            saved.get("zowie_desktop_mode"), ZOWIE_DEFAULT_DESKTOP_MODE,
+        )
     except (OSError, ValueError, TypeError):
         pass
     # Older test builds used a three-second pause after every completed frame.
@@ -1443,6 +1563,7 @@ class WorkerSignals(QObject):
     error = Signal(str)
     stopped = Signal()
     autostart_result = Signal(bool, str)
+    update_result = Signal(object, str, bool)  # UpdateInfo | None, error, manual
 
 
 class ControlPanel(QWidget):
@@ -1481,6 +1602,21 @@ class ControlPanel(QWidget):
         self._restart_failures = 0
         self._worker_started_at = 0.0
         self._exit_fallback_armed = False
+        # Zowie add-on; the thread is started by main() in real launches only.
+        self.zowie_monitor = ZowieModeMonitor(cs2_is_running, log=_runtime_log)
+        self._configure_zowie_monitor()
+        # Lock screen + update check state.
+        self.display_suspended = threading.Event()
+        self._windows_locked = False
+        self._session_notifications = False
+        self.update_info: UpdateInfo | None = None
+        self._update_check_running = False
+        self._update_notified = ""
+        self.signals.update_result.connect(self._update_result)
+        self.ui_theme = self.settings.get("ui_theme", DEFAULT_UI_THEME)
+        if self.ui_theme not in UI_THEMES:
+            self.ui_theme = DEFAULT_UI_THEME
+        apply_ui_theme(self.ui_theme)
         self.setWindowTitle(self._window_title())
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
@@ -1497,6 +1633,11 @@ class ControlPanel(QWidget):
         self.liveness_timer = QTimer(self)
         self.liveness_timer.timeout.connect(self._liveness_tick)
         self.liveness_timer.start(INSTANCE_HEARTBEAT_INTERVAL_MS)
+        self.zowie_status_timer = QTimer(self)
+        self.zowie_status_timer.timeout.connect(self._refresh_zowie_status)
+        self.zowie_status_timer.start(1000)
+        self._refresh_zowie_status()
+        self.update_status_label.setText(self._tr("Henüz denetlenmedi"))
         self._refresh_preview()
         _runtime_log(f"control panel ready; autorun={autorun}; smoke_test={smoke_test}")
         if smoke_test:
@@ -1594,45 +1735,63 @@ class ControlPanel(QWidget):
         os._exit(0)
 
     def _style_sheet(self) -> str:
+        p = UI_THEMES.get(self.ui_theme, UI_THEMES[DEFAULT_UI_THEME])
         return f"""
-            QWidget {{ background: {WINDOW_BG}; color: {TEXT}; font-family: 'Segoe UI Variable Text', 'Segoe UI'; font-size: 13px; }}
+            QWidget {{ background: {p['window_bg']}; color: {p['text']}; font-family: 'Segoe UI Variable Text', 'Segoe UI'; font-size: 13px; }}
             QLabel, QRadioButton, QCheckBox {{ background: transparent; }}
-            QFrame#card {{ background: {CARD_BG}; border: 1px solid {EDGE}; border-radius: 16px; }}
-            QFrame#subCard, QFrame#colorChooser {{ background: {CARD_2}; border: 1px solid {EDGE}; border-radius: 11px; }}
-            QFrame#previewShell, QFrame#statusBar {{ background: {CARD_2}; border: 0; border-radius: 11px; }}
+            QFrame#sidebar {{ background: {p['sidebar_bg']}; border-right: 1px solid {p['sidebar_border']}; }}
+            QFrame#sidebar QLabel, QFrame#sidebar QPushButton, QFrame#sidebar QWidget {{ background: transparent; }}
+            QFrame#sidebar QComboBox {{ background: {p['nav_checked']}; }}
+            QLabel#brand {{ font-size: 16px; font-weight: 700; }}
+            QPushButton#navItem {{ text-align: left; padding: 9px 12px; border-radius: 10px; color: {p['muted']}; font-weight: 600; border: 0; }}
+            QPushButton#navItem:hover {{ background: {p['nav_hover']}; color: {p['text']}; }}
+            QPushButton#navItem:checked {{ background: {p['nav_checked']}; color: {p['nav_checked_text']}; }}
+            QScrollArea#mainScroll, QWidget#page, QWidget#section {{ background: {p['window_bg']}; border: 0; }}
+            QLabel#pageTitle {{ font-size: 20px; font-weight: 700; }}
+            QFrame#group {{ background: {p['card_bg']}; border: 1px solid {p['edge']}; border-radius: 14px; }}
+            QFrame#group QLabel, QFrame#group QCheckBox {{ background: transparent; }}
+            QFrame#actionBar {{ background: {p['window_bg']}; border-top: 1px solid {p['action_border']}; }}
+            QScrollBar:vertical {{ background: transparent; width: 10px; margin: 4px 2px; }}
+            QScrollBar::handle:vertical {{ background: {p['scroll_handle']}; border-radius: 3px; min-height: 40px; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+            QFrame#card {{ background: {p['card_bg']}; border: 1px solid {p['edge']}; border-radius: 16px; }}
+            QFrame#subCard, QFrame#colorChooser {{ background: {p['card_2']}; border: 1px solid {p['edge']}; border-radius: 11px; }}
+            QFrame#previewShell {{ background: {p['preview_bg']}; border: 0; border-radius: 14px; }}
+            QFrame#statusBar {{ background: {p['card_2']}; border: 0; border-radius: 11px; }}
             QLabel#title {{ font-size: 30px; font-weight: 700; }}
-            QLabel#subtitle, QLabel#body, QLabel#device, QLabel#status {{ color: {MUTED}; }}
+            QLabel#subtitle, QLabel#body, QLabel#device, QLabel#status {{ color: {p['muted']}; }}
             QLabel#section {{ font-size: 15px; font-weight: 700; }}
             QLabel#preview {{ background: #080A0E; border-radius: 5px; }}
-            QComboBox, QLineEdit {{ background: {CONTROL_BG}; border: 1px solid {EDGE}; border-radius: 8px; padding: 9px 11px; }}
-            QComboBox:focus, QLineEdit:focus {{ border-color: {ACCENT}; }}
+            QComboBox, QLineEdit {{ background: {p['control_bg']}; border: 1px solid {p['edge']}; border-radius: 8px; padding: 9px 11px; }}
+            QComboBox:focus, QLineEdit:focus {{ border-color: {p['accent']}; }}
             QComboBox::drop-down {{ border: 0; width: 28px; }}
-            QComboBox QAbstractItemView {{ background: {CONTROL_BG}; selection-background-color: #303846; outline: 0; }}
-            QPushButton {{ background: {CONTROL_BG}; border: 1px solid transparent; border-radius: 9px; padding: 11px 14px; font-weight: 600; outline: none; }}
-            QPushButton:hover {{ background: {CONTROL_HOVER}; }} QPushButton:pressed {{ background: {CONTROL_PRESSED}; }}
-            QPushButton:focus {{ border-color: {ACCENT}; }}
-            QPushButton:disabled {{ color: #646C78; background: #191D24; }}
-            QComboBox:disabled, QLineEdit:disabled {{ color: #555D68; background: #111419; border-color: #20252D; }}
-            QRadioButton:disabled, QCheckBox:disabled {{ color: #555D68; }}
-            QSlider::groove:horizontal:disabled {{ background: #191D24; }}
-            QSlider::sub-page:horizontal:disabled {{ background: #343B46; }}
-            QSlider::handle:horizontal:disabled {{ background: #555D68; }}
-            QPushButton#accent {{ color: #0A1019; background: {ACCENT}; padding: 12px 16px; }}
-            QPushButton#accent:hover {{ background: #93BAF7; }}
-            QPushButton#accent:disabled {{ color: #555D68; background: #191D24; border: 1px solid #20252D; }}
-            QPushButton#previewMode {{ padding: 7px 8px; color: {MUTED}; background: transparent; border: 1px solid {EDGE}; font-size: 12px; }}
-            QPushButton#previewMode:hover {{ color: {TEXT}; background: {CONTROL_BG}; }}
-            QPushButton#previewMode:checked {{ color: {TEXT}; background: #29364A; border-color: {ACCENT}; }}
-            QPushButton#previewMode:disabled {{ color: #4E5661; background: #111419; border-color: #20252D; }}
-            QSlider::groove:horizontal {{ height: 5px; background: #29303A; border-radius: 2px; }}
-            QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}
-            QSlider::handle:horizontal {{ width: 16px; margin: -6px 0; background: {TEXT}; border-radius: 8px; }}
+            QComboBox QAbstractItemView {{ background: {p['card_bg']}; selection-background-color: {p['selection']}; selection-color: {p['text']}; outline: 0; }}
+            QPushButton {{ background: {p['control_bg']}; border: 1px solid transparent; border-radius: 9px; padding: 11px 14px; font-weight: 600; outline: none; }}
+            QPushButton:hover {{ background: {p['control_hover']}; }} QPushButton:pressed {{ background: {p['control_pressed']}; }}
+            QPushButton:focus {{ border-color: {p['accent']}; }}
+            QPushButton:disabled {{ color: {p['disabled_text']}; background: {p['disabled_bg']}; }}
+            QComboBox:disabled, QLineEdit:disabled {{ color: {p['disabled_text']}; background: {p['disabled_bg']}; border-color: {p['edge']}; }}
+            QRadioButton:disabled, QCheckBox:disabled {{ color: {p['disabled_text']}; }}
+            QSlider::groove:horizontal:disabled {{ background: {p['disabled_bg']}; }}
+            QSlider::sub-page:horizontal:disabled {{ background: {p['indicator_border']}; }}
+            QSlider::handle:horizontal:disabled {{ background: {p['disabled_text']}; }}
+            QPushButton#accent {{ color: {p['accent_text']}; background: {p['accent_fill']}; padding: 12px 18px; border: 0; }}
+            QPushButton#accent:hover {{ background: {p['accent_fill_hover']}; }}
+            QPushButton#accent:disabled {{ color: {p['disabled_text']}; background: {p['disabled_bg']}; border: 1px solid {p['edge']}; }}
+            QPushButton#previewMode {{ padding: 6px 14px; color: {p['muted']}; background: transparent; border: 1px solid {p['edge']}; border-radius: 16px; font-size: 12px; }}
+            QPushButton#previewMode:hover {{ color: {p['text']}; background: {p['control_bg']}; }}
+            QPushButton#previewMode:checked {{ color: {p['chip_checked_text']}; background: {p['chip_checked_bg']}; border-color: {p['accent']}; }}
+            QPushButton#previewMode:disabled {{ color: {p['disabled_text']}; background: transparent; border-color: {p['edge']}; }}
+            QSlider::groove:horizontal {{ height: 6px; background: {p['slider_track']}; border-radius: 3px; }}
+            QSlider::sub-page:horizontal {{ background: {p['accent_fill']}; border-radius: 2px; }}
+            QSlider::handle:horizontal {{ width: 14px; height: 14px; margin: -6px 0; background: {p['card_bg']}; border: 2px solid {p['accent']}; border-radius: 9px; }}
             QRadioButton, QCheckBox {{ spacing: 8px; }}
             QRadioButton::indicator, QCheckBox::indicator {{ width: 17px; height: 17px; }}
-            QRadioButton::indicator:unchecked, QCheckBox::indicator:unchecked {{ background: #29303A; border: 1px solid #4B5563; border-radius: 8px; }}
-            QRadioButton::indicator:checked, QCheckBox::indicator:checked {{ background: {ACCENT}; border: 3px solid #29303A; border-radius: 8px; }}
-            QFrame#rule {{ background: {EDGE}; max-height: 1px; border: 0; }}
-            QToolTip {{ background: {CONTROL_BG}; color: {TEXT}; border: 1px solid {EDGE}; padding: 6px; }}
+            QRadioButton::indicator:unchecked, QCheckBox::indicator:unchecked {{ background: {p['indicator_off']}; border: 1px solid {p['indicator_border']}; border-radius: 8px; }}
+            QRadioButton::indicator:checked, QCheckBox::indicator:checked {{ background: {p['accent_fill']}; border: 3px solid {p['indicator_off']}; border-radius: 8px; }}
+            QFrame#rule {{ background: {p['edge']}; max-height: 1px; border: 0; }}
+            QToolTip {{ background: {p['card_bg']}; color: {p['text']}; border: 1px solid {p['edge']}; padding: 6px; }}
         """
 
     def _label(self, text: str, name: str = "body") -> QLabel:
@@ -1645,6 +1804,8 @@ class ControlPanel(QWidget):
         return translate(text, self.language, **values)
 
     def _window_title(self) -> str:
+        # Must stay version-free: _activate_existing_window() finds the
+        # running panel by this exact title.
         return f"{self._tr(APP_DISPLAY_NAME)} · {self._tr('Ayarlar')}"
 
     def _rule(self) -> QFrame:
@@ -1654,77 +1815,179 @@ class ControlPanel(QWidget):
         return rule
 
     def _build_ui(self) -> None:
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(26, 20, 26, 20)
-        outer.setSpacing(14)
-        header = QHBoxLayout()
-        header.setSpacing(13)
+        """Sidebar navigation + one scrolling settings column + fixed action bar.
+
+        Every control lives on one page (the sidebar only scrolls to a
+        section), so nothing is ever hidden behind a tab.
+        """
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ---- Sidebar -----------------------------------------------------
+        sidebar = QFrame(objectName="sidebar")
+        sidebar.setFixedWidth(SIDEBAR_WIDTH)
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(14, 18, 14, 16)
+        side.setSpacing(4)
+        brand = QHBoxLayout()
+        brand.setSpacing(10)
         if APP_LOGO_PATH.exists():
             brand_mark = QLabel()
-            brand_mark.setFixedSize(52, 52)
+            brand_mark.setFixedSize(34, 34)
             brand_mark.setPixmap(QPixmap(str(APP_LOGO_PATH)).scaled(
-                52, 52, Qt.AspectRatioMode.KeepAspectRatio,
+                34, 34, Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             ))
-            header.addWidget(brand_mark)
-        header_copy = QVBoxLayout()
-        header_copy.setSpacing(2)
-        header_copy.addWidget(self._label(APP_DISPLAY_NAME, "title"))
-        header_copy.addWidget(self._label(
-            "Sistem, oyun, medya ve kablosuz cihaz bilgilerini tek yerden yönetin",
-            "subtitle",
-        ))
-        header.addLayout(header_copy)
-        header.addStretch()
-        language_box = QVBoxLayout()
-        language_box.setSpacing(3)
-        language_box.addWidget(self._label("Dil", "device"))
+            brand.addWidget(brand_mark)
+        brand_copy = QVBoxLayout()
+        brand_copy.setSpacing(0)
+        brand_copy.addWidget(self._label("Sabasakal", "brand"))
+        self.version_label = self._label(f"v{APP_VERSION}", "device")
+        self.version_label.setProperty("i18n_source", "")  # never translated
+        self.version_label.setToolTip(f"{APP_DISPLAY_NAME} {APP_VERSION}")
+        self.version_label.setProperty("i18n_tooltip", "")
+        brand_copy.addWidget(self.version_label)
+        brand.addLayout(brand_copy)
+        brand.addStretch()
+        side.addLayout(brand)
+        side.addSpacing(18)
+
+        self.nav_buttons: dict[str, QPushButton] = {}
+        self.nav_group = QButtonGroup(self)
+        self.nav_group.setExclusive(True)
+        for key, caption, icon in NAV_SECTIONS:
+            button = QPushButton(caption, objectName="navItem")
+            button.setCheckable(True)
+            button.setIcon(_tinted_svg_icon(icon, MUTED))
+            button.setIconSize(QSize(18, 18))
+            button.clicked.connect(lambda _checked=False, section=key: self._scroll_to_section(section))
+            self.nav_group.addButton(button)
+            self.nav_buttons[key] = button
+            side.addWidget(button)
+        self.nav_buttons[NAV_SECTIONS[0][0]].setChecked(True)
+        side.addStretch()
+        side.addWidget(self._label("Tema", "device"))
+        self.theme_combo = QComboBox()
+        for label, value in UI_THEME_NAMES.items():
+            self.theme_combo.addItem(self._tr(label), value)
+        self.theme_combo.setCurrentIndex(max(0, self.theme_combo.findData(self.ui_theme)))
+        self.theme_combo.setFixedHeight(36)
+        self.theme_combo.currentIndexChanged.connect(self._theme_changed)
+        side.addWidget(self.theme_combo)
+        side.addSpacing(6)
+        side.addWidget(self._label("Dil", "device"))
         self.language_combo = QComboBox()
         for code, label in SUPPORTED_LANGUAGES.items():
             self.language_combo.addItem(label, code)
         self.language_combo.setCurrentIndex(self.language_combo.findData(self.language))
-        self.language_combo.setFixedSize(122, 36)
+        self.language_combo.setFixedHeight(36)
         self.language_combo.currentIndexChanged.connect(self._language_changed)
-        language_box.addWidget(self.language_combo)
-        header.addLayout(language_box)
+        side.addWidget(self.language_combo)
         self.edit_controls.append(self.language_combo)
-        outer.addLayout(header)
+        root.addWidget(sidebar)
 
-        content = QHBoxLayout()
-        content.setSpacing(16)
-        outer.addLayout(content, 1)
-        content.addStretch(1)
+        # ---- Main column: scrolling sections + action bar ----------------
+        main = QFrame(objectName="main")
+        main_layout = QVBoxLayout(main)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        self.scroll_area = QScrollArea(objectName="mainScroll")
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        page = QWidget(objectName="page")
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(36, 26, 36, 30)
+        page_layout.setSpacing(10)
+        self.section_anchors: dict[str, QWidget] = {}
 
-        left_stack = QWidget()
-        left_stack.setFixedWidth(700)
-        left_layout = QVBoxLayout(left_stack)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(14)
-        content.addWidget(left_stack, 0, Qt.AlignmentFlag.AlignTop)
+        def section(key: str, title: str, subtitle: str = "") -> QVBoxLayout:
+            anchor = QWidget(objectName="section")
+            layout = QVBoxLayout(anchor)
+            layout.setContentsMargins(0, 18, 0, 6)
+            layout.setSpacing(8)
+            layout.addWidget(self._label(title, "pageTitle"))
+            if subtitle:
+                caption = self._label(subtitle, "subtitle")
+                caption.setWordWrap(True)
+                layout.addWidget(caption)
+            page_layout.addWidget(anchor)
+            self.section_anchors[key] = anchor
+            return layout
 
-        self.quick_card = QFrame(objectName="card")
-        # Height of the three selector rows + autostart; must never be
-        # smaller than the layout's minimum or rows start to overlap.
-        self.quick_card.setFixedHeight(QUICK_CARD_HEIGHT)
+        def group() -> tuple[QFrame, QGridLayout]:
+            frame = QFrame(objectName="group")
+            grid = QGridLayout(frame)
+            grid.setContentsMargins(18, 12, 18, 12)
+            grid.setHorizontalSpacing(18)
+            grid.setVerticalSpacing(12)
+            grid.setColumnStretch(1, 1)
+            return frame, grid
+
+        # Overview: live preview + preview modes
+        overview = section(
+            "overview", "Genel bakış",
+            "Sistem, oyun, medya ve kablosuz cihaz bilgilerini tek yerden yönetin",
+        )
+        preview_card = QFrame(objectName="group")
+        preview_layout = QVBoxLayout(preview_card)
+        preview_layout.setContentsMargins(18, 14, 18, 14)
+        preview_layout.setSpacing(10)
+        self.preview_buttons: dict[str, QPushButton] = {}
+        self.preview_button_group = QButtonGroup(self)
+        self.preview_button_group.setExclusive(True)
+        preview_modes = QHBoxLayout()
+        preview_modes.setSpacing(6)
+        for mode, caption in (
+            ("daily", "Günlük"), ("cs2", "CS2 teması"),
+            ("msfs", "MSFS"), ("weather", "Hava"),
+            ("wireless", "Kablosuz"),
+        ):
+            button = QPushButton(caption)
+            button.setObjectName("previewMode")
+            button.setFixedHeight(32)
+            button.setCheckable(True)
+            button.setChecked(mode == self.preview_mode)
+            button.clicked.connect(
+                lambda _checked=False, selected_mode=mode: self._set_preview_mode(selected_mode)
+            )
+            self.preview_button_group.addButton(button)
+            self.preview_buttons[mode] = button
+            self.edit_controls.append(button)
+            preview_modes.addWidget(button)
+        preview_modes.addStretch()
+        preview_layout.addLayout(preview_modes)
+        preview_shell = QFrame(objectName="previewShell")
+        preview_shell.setFixedSize(WIDTH + 28, HEIGHT + 28)
+        shell_layout = QVBoxLayout(preview_shell)
+        shell_layout.setContentsMargins(14, 14, 14, 14)
+        self.preview_label = self._label("", "preview")
+        self.preview_label.setFixedSize(WIDTH, HEIGHT)
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        shell_layout.addWidget(self.preview_label)
+        preview_layout.addWidget(preview_shell, 0, Qt.AlignmentFlag.AlignLeft)
+        self.preview_context_label = self._label("Günlük kullanım · medya görünümü", "device")
+        preview_layout.addWidget(self.preview_context_label)
+        overview.addWidget(preview_card)
+
+        # Display settings (one group: rows never overlap, combos share a column)
+        display = section("display", "Ekran", "Mini ekranın parlaklığı, yönü ve tasarımı")
+        self.quick_card, screen_grid = group()
         self.quick_card_effect = QGraphicsOpacityEffect(self.quick_card)
         self.quick_card_effect.setOpacity(1.0)
         self.quick_card.setGraphicsEffect(self.quick_card_effect)
-        quick_layout = QVBoxLayout(self.quick_card)
-        quick_layout.setContentsMargins(16, 14, 16, 14)
-        quick_layout.setSpacing(9)
-        quick_layout.addWidget(self._label("Ekran ve donanım", "section"))
-        quick_columns = QHBoxLayout()
-        quick_columns.setSpacing(10)
-        quick_layout.addLayout(quick_columns, 1)
-
-        screen_box = QFrame(objectName="subCard")
-        screen_form = QVBoxLayout(screen_box)
-        screen_form.setContentsMargins(13, 11, 13, 11)
-        screen_form.setSpacing(7)
-        screen_form.addWidget(self._label("Ekran", "section"))
+        row = 0
+        screen_grid.addWidget(self._label("Parlaklık"), row, 0)
         brightness_line = QHBoxLayout()
-        brightness_line.addWidget(self._label("Parlaklık"))
-        brightness_line.addStretch()
+        brightness_line.setSpacing(10)
+        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.brightness_slider.setRange(5, 100)
+        self.brightness_slider.setValue(int(self.settings["brightness"]))
+        brightness_line.addWidget(self.brightness_slider, 1)
+        self.brightness_value = self._label(f"%{int(self.settings['brightness'])}", "section")
+        self.brightness_value.setMinimumWidth(44)
+        brightness_line.addWidget(self.brightness_value)
         self.auto_brightness_check = QCheckBox("Otomatik")
         self.auto_brightness_check.setToolTip(
             "Saat 07.00–19.00 arasında %90, diğer saatlerde %30 parlaklık kullanır."
@@ -1740,30 +2003,22 @@ class ControlPanel(QWidget):
             "Otomatik kapalıyken parlaklığı sürgüden ayarlayabilirsiniz."
         )
         self.auto_brightness_info.setStyleSheet(
-            "color: #B9C4D2; border: 1px solid #667284; border-radius: 8px; "
-            "background: #171B22; font: 700 10px 'Segoe UI';"
+            f"color: {MUTED}; border: 1px solid {EDGE}; border-radius: 8px; "
+            "background: transparent; font: 700 10px 'Segoe UI';"
         )
         brightness_line.addWidget(self.auto_brightness_info)
-        self.brightness_value = self._label(f"%{int(self.settings['brightness'])}", "section")
-        brightness_line.addWidget(self.brightness_value)
-        screen_form.addLayout(brightness_line)
-        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
-        self.brightness_slider.setRange(5, 100)
-        self.brightness_slider.setValue(int(self.settings["brightness"]))
+        screen_grid.addLayout(brightness_line, row, 1)
         self.brightness_slider.valueChanged.connect(self._sync_brightness_controls)
         self.auto_brightness_check.toggled.connect(self._sync_brightness_controls)
-        screen_form.addWidget(self.brightness_slider)
         self.edit_controls.extend((self.auto_brightness_check, self.brightness_slider))
         self._sync_brightness_controls()
-        # One grid row per selector: label column + combo column. Every row
-        # has its own fixed slot, so no control can be drawn over another.
+
         self.rotation_combo = QComboBox()
         self.rotation_combo.addItem("0°", "normal")
         self.rotation_combo.addItem("180°", "180")
         selected_rotation = "180" if self.settings.get("rotation") == "180" else "normal"
         self.rotation_combo.setCurrentIndex(self.rotation_combo.findData(selected_rotation))
         self.rotation_combo.currentIndexChanged.connect(self._rotation_changed)
-
         self.design_combo = QComboBox()
         for label, value in DESIGNS.items():
             self.design_combo.addItem(self._tr(label), value)
@@ -1775,7 +2030,6 @@ class ControlPanel(QWidget):
             "Claude: oyuna ve uçuş evresine göre değişen sade ekranlar. Codex: önceki görünüm."
         )
         self.edit_controls.append(self.design_combo)
-
         self.msfs_layout_combo = QComboBox()
         for label, value in MSFS_LAYOUTS.items():
             self.msfs_layout_combo.addItem(self._tr(label), value)
@@ -1784,71 +2038,69 @@ class ControlPanel(QWidget):
         self.msfs_layout_combo.currentIndexChanged.connect(self._msfs_layout_changed)
         self.msfs_layout_combo.setToolTip("MSFS 2024 alt bölümünde kullanılacak görünüm.")
         self.edit_controls.append(self.msfs_layout_combo)
-
-        selector_grid = QGridLayout()
-        selector_grid.setHorizontalSpacing(10)
-        selector_grid.setVerticalSpacing(5)
-        selector_grid.setColumnStretch(1, 1)
-        for row, (caption, combo) in enumerate((
+        for caption, combo in (
             ("Ekran yönü", self.rotation_combo),
             ("Tasarım", self.design_combo),
             ("MSFS", self.msfs_layout_combo),
-        )):
+        ):
+            row += 1
             combo.setFixedHeight(34)
-            combo.setMinimumWidth(150)
-            combo.setStyleSheet("padding: 4px 10px;")
-            caption_label = self._label(caption, "device")
+            combo.setMinimumWidth(220)
+            caption_label = self._label(caption)
             if combo is self.msfs_layout_combo:
                 self.msfs_layout_caption = caption_label
-            selector_grid.addWidget(caption_label, row, 0)
-            selector_grid.addWidget(combo, row, 1)
-        screen_form.addLayout(selector_grid)
+            screen_grid.addWidget(caption_label, row, 0)
+            screen_grid.addWidget(combo, row, 1, Qt.AlignmentFlag.AlignLeft)
 
+        row += 1
+        screen_grid.addWidget(self._label("Başlangıç"), row, 0)
         self.autostart_check = QCheckBox("Windows açıldığında çalıştır")
         self.autostart_check.setToolTip("Windows açıldığında uygulamayı ve mini ekranı otomatik başlatır.")
         self.autostart_check.setChecked(bool(self.settings["autostart"]))
-        screen_form.addWidget(self.autostart_check)
+        screen_grid.addWidget(self.autostart_check, row, 1, Qt.AlignmentFlag.AlignLeft)
         self.edit_controls.append(self.autostart_check)
-        quick_columns.addWidget(screen_box, 1)
+        row += 1
+        screen_grid.addWidget(self._label("Kilit ekranı"), row, 0)
+        self.lock_off_check = QCheckBox("Windows kilitlenince mini ekranı kapat")
+        self.lock_off_check.setToolTip(
+            "Bilgisayar kilitlenince mini ekranın ışığı kapanır; kilit açılınca geri gelir."
+        )
+        self.lock_off_check.setChecked(bool(self.settings.get("screen_off_when_locked", True)))
+        self.lock_off_check.toggled.connect(self._lock_off_toggled)
+        screen_grid.addWidget(self.lock_off_check, row, 1, Qt.AlignmentFlag.AlignLeft)
+        display.addWidget(self.quick_card)
 
-        hardware_box = QFrame(objectName="subCard")
-        hardware_form = QVBoxLayout(hardware_box)
-        hardware_form.setContentsMargins(13, 11, 13, 11)
-        hardware_form.setSpacing(6)
-        hardware_header = QHBoxLayout()
-        hardware_header.addWidget(self._label("Donanım adları", "section"))
-        hardware_header.addStretch()
+        # Information shown on the screen: hardware names + weather
+        info = section("info", "Bilgiler", "Mini ekranda görünen adlar ve hava durumu şehirleri")
+        info_card, info_grid = group()
+        info_header = QHBoxLayout()
+        info_header.addWidget(self._label("Donanım adları", "section"))
+        info_header.addStretch()
         self.hardware_limit_label = self._label(
             self._tr("En fazla {count} karakter", count=MAX_HARDWARE_LABEL_LENGTH), "device"
         )
         self.hardware_limit_label.setProperty("i18n_source", "")
-        hardware_header.addWidget(self.hardware_limit_label)
-        hardware_form.addLayout(hardware_header)
+        info_header.addWidget(self.hardware_limit_label)
+        info_grid.addLayout(info_header, 0, 0, 1, 2)
         automatic_labels = get_auto_hardware_labels()
         saved_labels = self.settings.get("hardware_labels", {})
         self.hardware_inputs: dict[str, QLineEdit] = {}
-        hardware_grid = QGridLayout()
-        hardware_grid.setHorizontalSpacing(8)
-        hardware_grid.setVerticalSpacing(5)
-        for row, (key, caption) in enumerate((
+        for index, (key, caption) in enumerate((
             ("cpu", "İşlemci"), ("gpu", "Ekran kartı"), ("ram", "Bellek"),
-        )):
-            hardware_grid.addWidget(self._label(caption, "device"), row, 0)
+        ), start=1):
+            info_grid.addWidget(self._label(caption), index, 0)
             field = QLineEdit()
             field.setMaxLength(MAX_HARDWARE_LABEL_LENGTH)
             field.setFixedHeight(34)
-            field.setStyleSheet("padding: 5px 10px;")
             field.setText(normalise_hardware_label(saved_labels.get(key)))
             field.setPlaceholderText(automatic_labels[key])
             field.textChanged.connect(self._refresh_preview)
             self.hardware_inputs[key] = field
             self.edit_controls.append(field)
-            hardware_grid.addWidget(field, row, 1)
-        hardware_grid.setColumnStretch(1, 1)
-        hardware_form.addLayout(hardware_grid)
+            info_grid.addWidget(field, index, 1)
+        info_grid.addWidget(self._label("Hava durumu"), 4, 0)
         weather_line = QHBoxLayout()
         weather_line.setSpacing(8)
-        weather_line.addWidget(self._label("Hava", "device"))
         saved_cities = list(normalise_city_names(self.settings.get(
             "weather_cities", DEFAULT_WEATHER_CITIES,
         )))
@@ -1858,12 +2110,9 @@ class ControlPanel(QWidget):
             city_input = QLineEdit()
             city_input.setFixedHeight(34)
             city_input.setMaxLength(24)
-            city_input.setStyleSheet("padding: 5px 7px;")
             city_input.setText(saved_cities[index])
             city_input.setProperty("city_index", index + 1)
-            city_input.setPlaceholderText(
-                self._tr("{index}. şehir", index=index + 1)
-            )
+            city_input.setPlaceholderText(self._tr("{index}. şehir", index=index + 1))
             city_input.setToolTip("Hava durumu gösterilecek şehir.")
             city_input.textChanged.connect(self._refresh_preview)
             city_input.editingFinished.connect(
@@ -1873,66 +2122,19 @@ class ControlPanel(QWidget):
             self.weather_city_inputs.append(city_input)
             self.edit_controls.append(city_input)
             weather_line.addWidget(city_input, 1)
-        hardware_form.addLayout(weather_line)
+        info_grid.addLayout(weather_line, 4, 1)
+        info.addWidget(info_card)
         self._sync_design_dependent_controls()
-        quick_columns.addWidget(hardware_box, 1)
-        left_layout.addWidget(self.quick_card)
 
-        preview_card = QFrame(objectName="card")
-        preview_card.setFixedHeight(440)
-        preview_layout = QVBoxLayout(preview_card)
-        preview_layout.setContentsMargins(16, 14, 16, 12)
-        preview_layout.setSpacing(9)
-        preview_layout.addWidget(self._label("3,5 inç ekran önizlemesi", "section"))
-        preview_body = QHBoxLayout()
-        preview_body.setSpacing(10)
-        preview_layout.addLayout(preview_body)
-        self.preview_buttons: dict[str, QPushButton] = {}
-        self.preview_button_group = QButtonGroup(self)
-        self.preview_button_group.setExclusive(True)
-        preview_modes = QVBoxLayout()
-        preview_modes.setSpacing(5)
-        for mode, caption in (
-            ("daily", "Günlük"), ("cs2", "CS2 teması"),
-            ("msfs", "MSFS"), ("weather", "Hava"),
-            ("wireless", "Kablosuz"),
-        ):
-            button = QPushButton(caption)
-            button.setObjectName("previewMode")
-            button.setFixedSize(96, 34)
-            button.setCheckable(True)
-            button.setChecked(mode == self.preview_mode)
-            button.clicked.connect(
-                lambda _checked=False, selected_mode=mode: self._set_preview_mode(selected_mode)
-            )
-            self.preview_button_group.addButton(button)
-            self.preview_buttons[mode] = button
-            self.edit_controls.append(button)
-            preview_modes.addWidget(button)
-        preview_modes.addStretch()
-        preview_body.addLayout(preview_modes)
-        preview_shell = QFrame(objectName="previewShell")
-        preview_shell.setFixedSize(508, 348)
-        shell_layout = QVBoxLayout(preview_shell)
-        shell_layout.setContentsMargins(14, 14, 14, 14)
-        self.preview_label = self._label("", "preview")
-        self.preview_label.setFixedSize(WIDTH, HEIGHT)
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        shell_layout.addWidget(self.preview_label)
-        preview_body.addWidget(preview_shell)
-        preview_body.addStretch()
-        self.preview_context_label = self._label("Günlük kullanım · medya görünümü", "device")
-        preview_layout.addWidget(self.preview_context_label)
-        left_layout.addWidget(preview_card)
-        left_layout.addStretch()
-
-        settings_card = QFrame(objectName="card")
-        settings_card.setFixedSize(410, SETTINGS_CARD_HEIGHT)
-        settings_layout = QVBoxLayout(settings_card)
-        settings_layout.setContentsMargins(18, 16, 18, 16)
-        settings_layout.setSpacing(10)
-        settings_layout.addWidget(self._label("Renkler", "section"))
-        settings_layout.addWidget(self._label("Hazır palet"))
+        # Colours
+        colours = section("colors", "Renkler", "Halka, zemin ve yazı renklerinden birini seçin.")
+        colour_card = QFrame(objectName="group")
+        colour_layout = QVBoxLayout(colour_card)
+        colour_layout.setContentsMargins(18, 14, 18, 14)
+        colour_layout.setSpacing(10)
+        palette_line = QHBoxLayout()
+        palette_line.setSpacing(10)
+        palette_line.addWidget(self._label("Hazır palet"))
         self.palette_combo = QComboBox()
         for name in PALETTES:
             self.palette_combo.addItem(self._tr(name), name)
@@ -1942,28 +2144,37 @@ class ControlPanel(QWidget):
             self.palette_combo.addItem(self._tr("Özel"), "Özel")
         self.palette_combo.setCurrentIndex(self.palette_combo.findData(self.settings["palette"]))
         self.palette_combo.currentIndexChanged.connect(self._palette_changed)
-        settings_layout.addWidget(self.palette_combo)
-        self.edit_controls.append(self.palette_combo)
-        settings_layout.addWidget(self._label("Değiştirmek istediğiniz alanı seçin", "device"))
-
+        self.palette_combo.setFixedHeight(34)
+        self.palette_combo.setMinimumWidth(220)
+        palette_line.addWidget(self.palette_combo)
+        palette_line.addStretch()
+        self.save_palette_button = QPushButton("Paleti kaydet")
+        self.save_palette_button.setToolTip("Geçerli renkleri yeni bir palet olarak kaydeder.")
+        self.save_palette_button.clicked.connect(self._save_palette)
+        self.delete_palette_button = QPushButton("Sil")
+        self.delete_palette_button.setToolTip("Seçili özel renk paletini siler.")
+        self.delete_palette_button.clicked.connect(self._delete_palette)
+        self.edit_controls.extend((self.palette_combo, self.save_palette_button, self.delete_palette_button))
+        palette_line.addWidget(self.save_palette_button)
+        palette_line.addWidget(self.delete_palette_button)
+        colour_layout.addLayout(palette_line)
+        colour_layout.addWidget(self._label("Değiştirmek istediğiniz alanı seçin", "device"))
         color_editor = QHBoxLayout()
-        color_editor.setSpacing(10)
-        swatch_column = QVBoxLayout()
-        swatch_column.setSpacing(8)
-        for key, caption in (
+        color_editor.setSpacing(12)
+        swatch_grid = QGridLayout()
+        swatch_grid.setSpacing(8)
+        for index, (key, caption) in enumerate((
             ("cpu", "Normal"), ("warning", "Uyarı"),
             ("danger", "Kritik"), ("bg", "Zemin"),
             ("text", "Ana yazı"), ("muted", "İkincil yazı"),
-        ):
+        )):
             button = QPushButton(caption)
             button.setFixedSize(126, 40)
             button.clicked.connect(lambda _checked=False, color_key=key: self._choose_color(color_key))
             self.swatches[key] = button
             self.edit_controls.append(button)
-            swatch_column.addWidget(button)
-        swatch_column.addStretch()
-        color_editor.addLayout(swatch_column)
-
+            swatch_grid.addWidget(button, index // 3, index % 3)
+        color_editor.addLayout(swatch_grid)
         self.inline_color_panel = QFrame(objectName="colorChooser")
         self.inline_color_panel.setFixedWidth(0)
         self.inline_color_panel.setVisible(False)
@@ -1992,76 +2203,161 @@ class ControlPanel(QWidget):
             )
             self.simple_color_buttons.append(color_button)
             self.edit_controls.append(color_button)
-            color_grid.addWidget(color_button, index // 4, index % 4)
+            color_grid.addWidget(color_button, index // 6, index % 6)
         chooser_layout.addLayout(color_grid)
-        chooser_layout.addStretch()
         color_editor.addWidget(self.inline_color_panel)
         color_editor.addStretch()
-        settings_layout.addLayout(color_editor)
+        colour_layout.addLayout(color_editor)
         self.color_help_label = self._label("Halka, zemin ve yazı renklerinden birini seçin.", "device")
         self.color_help_label.setWordWrap(True)
-        settings_layout.addWidget(self.color_help_label)
+        self.color_help_label.setVisible(False)  # the section subtitle says it
+        colour_layout.addWidget(self.color_help_label)
+        reset_line = QHBoxLayout()
+        reset_line.addStretch()
+        self.reset_button = QPushButton("Varsayılana dön")
+        self.reset_button.setToolTip("Renkleri ve görünüm ayarlarını başlangıç değerlerine getirir.")
+        self.reset_button.clicked.connect(self._reset_defaults)
+        self.edit_controls.append(self.reset_button)
+        reset_line.addWidget(self.reset_button)
+        colour_layout.addLayout(reset_line)
         self._paint_swatches()
-
-        palette_actions = QHBoxLayout()
-        self.save_palette_button = QPushButton("Paleti kaydet")
-        self.save_palette_button.setToolTip("Geçerli renkleri yeni bir palet olarak kaydeder.")
-        self.save_palette_button.clicked.connect(self._save_palette)
-        self.delete_palette_button = QPushButton("Sil")
-        self.delete_palette_button.setToolTip("Seçili özel renk paletini siler.")
-        self.delete_palette_button.clicked.connect(self._delete_palette)
-        self.edit_controls.extend((self.save_palette_button, self.delete_palette_button))
-        palette_actions.addWidget(self.save_palette_button, 1)
-        palette_actions.addWidget(self.delete_palette_button)
-        settings_layout.addLayout(palette_actions)
-        settings_layout.addStretch()
         self._update_palette_buttons()
-        settings_layout.addWidget(self._rule())
-        action_line = QHBoxLayout()
-        self.start_button = QPushButton("Kaydet ve başlat", objectName="accent")
-        self.start_button.setToolTip("Ayarları kaydeder ve mini ekrana görüntü göndermeye başlar.")
-        self.start_button.clicked.connect(self.start_screen)
-        self.edit_controls.append(self.start_button)
+        colours.addWidget(colour_card)
+
+        # Zowie add-on (live: usable while the screen runs)
+        zowie = section(
+            "zowie", "Zowie monitör",
+            "CS2 açılınca monitörü oyun moduna, kapanınca masaüstü moduna alır.",
+        )
+        zowie_card, zowie_grid = group()
+        self.zowie_check = QCheckBox("CS2'de otomatik mod")
+        self.zowie_check.setToolTip(
+            "CS2 açılınca monitörü oyun moduna, kapanınca masaüstü moduna alır."
+        )
+        self.zowie_check.setChecked(bool(self.settings.get("zowie_auto_mode")))
+        self.zowie_check.toggled.connect(self._zowie_toggled)
+        zowie_grid.addWidget(self._label("Otomatik mod"), 0, 0)
+        zowie_grid.addWidget(self.zowie_check, 0, 1, Qt.AlignmentFlag.AlignLeft)
+        zowie_grid.addWidget(self._label("Monitör modu"), 1, 0)
+        self.zowie_status_label = self._label("", "section")
+        zowie_grid.addWidget(self.zowie_status_label, 1, 1)
+        zowie.addWidget(zowie_card)
+
+        # About + updates
+        about = section("about", "Hakkında")
+        about_card, about_grid = group()
+        about_grid.addWidget(self._label("Sürüm"), 0, 0)
+        about_version = self._label(f"{APP_VERSION}", "section")
+        about_version.setProperty("i18n_source", "")
+        about_grid.addWidget(about_version, 0, 1)
+        about_grid.addWidget(self._label("Güncellemeler"), 1, 0)
+        update_line = QHBoxLayout()
+        update_line.setSpacing(10)
+        self.update_status_label = self._label("", "device")
+        update_line.addWidget(self.update_status_label, 1)
+        self.update_open_button = QPushButton("İndirme sayfasını aç")
+        self.update_open_button.setVisible(False)
+        self.update_open_button.clicked.connect(self._open_update_page)
+        update_line.addWidget(self.update_open_button)
+        self.update_check_button = QPushButton("Şimdi denetle")
+        self.update_check_button.clicked.connect(lambda _checked=False: self._check_updates(manual=True))
+        update_line.addWidget(self.update_check_button)
+        about_grid.addLayout(update_line, 1, 1)
+        self.update_auto_check = QCheckBox("Yeni sürümleri otomatik denetle")
+        self.update_auto_check.setToolTip(
+            "Günde bir kez GitHub'daki sürüm listesine bakar. Hiçbir şeyi kendiliğinden indirmez."
+        )
+        self.update_auto_check.setChecked(bool(self.settings.get("update_check", True)))
+        self.update_auto_check.toggled.connect(self._update_check_toggled)
+        about_grid.addWidget(self.update_auto_check, 2, 1, Qt.AlignmentFlag.AlignLeft)
+        about.addWidget(about_card)
+        page_layout.addStretch()
+
+        self.scroll_area.setWidget(page)
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self._sync_nav_with_scroll)
+        main_layout.addWidget(self.scroll_area, 1)
+
+        # ---- Action bar ----------------------------------------------------
+        action_bar = QFrame(objectName="actionBar")
+        action_layout = QHBoxLayout(action_bar)
+        action_layout.setContentsMargins(24, 12, 24, 12)
+        action_layout.setSpacing(10)
+        self.status_dot = QLabel("●")
+        self.status_dot.setStyleSheet("color: #6F7C90; background: transparent;")
+        self.status_label = self._label("Ekran hazır", "status")
+        action_layout.addWidget(self.status_dot)
+        action_layout.addWidget(self.status_label, 1)
+        self.save_button = QPushButton("Yalnızca kaydet")
+        self.save_button.clicked.connect(self.save_settings)
         self.stop_button = QPushButton("Durdur")
         self.stop_button.setToolTip("Veri akışını durdurur ve mini ekranı temizler.")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_screen)
-        action_line.addWidget(self.start_button, 1)
-        action_line.addWidget(self.stop_button)
-        settings_layout.addLayout(action_line)
-        secondary_actions = QHBoxLayout()
-        self.save_button = QPushButton("Yalnızca kaydet")
-        self.save_button.clicked.connect(self.save_settings)
-        self.reset_button = QPushButton("Varsayılana dön")
-        self.reset_button.setToolTip("Renkleri ve görünüm ayarlarını başlangıç değerlerine getirir.")
-        self.reset_button.clicked.connect(self._reset_defaults)
-        secondary_actions.addWidget(self.save_button, 1)
-        secondary_actions.addWidget(self.reset_button, 1)
-        settings_layout.addLayout(secondary_actions)
-        self.edit_controls.extend((self.save_button, self.reset_button))
-        content.addWidget(settings_card, 0, Qt.AlignmentFlag.AlignTop)
-        content.addStretch(1)
-
-        status_bar = QFrame(objectName="statusBar")
-        status_bar.setMaximumWidth(1126)
-        status_layout = QHBoxLayout(status_bar)
-        status_layout.setContentsMargins(14, 9, 14, 9)
-        self.status_dot = QLabel("●")
-        self.status_dot.setStyleSheet("color: #6F7C90; background: transparent;")
-        self.status_label = self._label("Ekran hazır", "status")
-        status_layout.addWidget(self.status_dot)
-        status_layout.addWidget(self.status_label)
-        status_layout.addStretch()
-        outer.addWidget(status_bar, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.start_button = QPushButton("Kaydet ve başlat", objectName="accent")
+        self.start_button.setToolTip("Ayarları kaydeder ve mini ekrana görüntü göndermeye başlar.")
+        self.start_button.clicked.connect(self.start_screen)
+        self.edit_controls.extend((self.save_button, self.start_button))
+        action_layout.addWidget(self.save_button)
+        action_layout.addWidget(self.stop_button)
+        action_layout.addWidget(self.start_button)
+        main_layout.addWidget(action_bar)
+        root.addWidget(main, 1)
         # Mouse clicks should not leave the native dotted focus rectangle.
         # Keyboard navigation still receives focus through Tab.
         for button in self.findChildren(QPushButton):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
 
+    def _theme_changed(self, _index: int) -> None:
+        """Live theme switch (not an edit control: works while the screen runs)."""
+        theme = str(self.theme_combo.currentData() or DEFAULT_UI_THEME)
+        if theme == self.ui_theme:
+            return
+        self.ui_theme = theme
+        apply_ui_theme(theme)
+        self.setStyleSheet(self._style_sheet())
+        for key, _caption, icon in NAV_SECTIONS:
+            self.nav_buttons[key].setIcon(_tinted_svg_icon(icon, MUTED))
+        self.auto_brightness_info.setStyleSheet(
+            f"color: {MUTED}; border: 1px solid {EDGE}; border-radius: 8px; "
+            "background: transparent; font: 700 10px 'Segoe UI';"
+        )
+        self._paint_swatches()
+        self._refresh_zowie_status(force=True)
+        self.settings = {**self.settings, "ui_theme": theme}
+        try:
+            save_settings_file(self.settings)
+        except Exception as exc:
+            _runtime_log(f"theme save failed: {type(exc).__name__}: {exc}")
+
+    def _scroll_to_section(self, key: str) -> None:
+        anchor = self.section_anchors.get(key)
+        if anchor is None:
+            return
+        self._nav_scrolling = True
+        self.scroll_area.verticalScrollBar().setValue(anchor.y())
+        self._nav_scrolling = False
+        self.nav_buttons[key].setChecked(True)
+
+    def _sync_nav_with_scroll(self, value: int) -> None:
+        if getattr(self, "_nav_scrolling", False):
+            return
+        bar = self.scroll_area.verticalScrollBar()
+        current = NAV_SECTIONS[0][0]
+        if value >= bar.maximum() - 4:
+            current = NAV_SECTIONS[-1][0]
+        else:
+            for key, _caption, _icon in NAV_SECTIONS:
+                if self.section_anchors[key].y() <= value + 40:
+                    current = key
+        if not self.nav_buttons[current].isChecked():
+            self.nav_buttons[current].setChecked(True)
+
     # Labels whose text is rewritten at runtime. Restoring their construction
     # text on a language change would show stale values (e.g. "Ekran hazır"
     # while the screen is running, or an old brightness percentage).
-    DYNAMIC_LABEL_ATTRIBUTES = ("status_label", "brightness_value")
+    DYNAMIC_LABEL_ATTRIBUTES = (
+        "status_label", "brightness_value", "zowie_status_label", "update_status_label",
+    )
 
     def _register_static_translations(self) -> None:
         dynamic = {id(getattr(self, name)) for name in self.DYNAMIC_LABEL_ATTRIBUTES if hasattr(self, name)}
@@ -2110,6 +2406,8 @@ class ControlPanel(QWidget):
                 if tooltip:
                     widget.setToolTip(self._tr(str(tooltip)))
         self._sync_brightness_controls()
+        if hasattr(self, "zowie_monitor"):
+            self._refresh_zowie_status()
         self.hardware_limit_label.setText(self._tr(
             "En fazla {count} karakter", count=MAX_HARDWARE_LABEL_LENGTH,
         ))
@@ -2124,6 +2422,10 @@ class ControlPanel(QWidget):
             self.tray_start_action.setText(self._tr("Mini ekranı başlat"))
             self.tray_stop_action.setText(self._tr("Mini ekranı durdur"))
             self.tray_exit_action.setText(self._tr("Çıkış"))
+            self.tray_zowie_action.setText(self._zowie_action_text())
+            self.tray_zowie_action.setToolTip(self._tr(
+                "CS2 açılınca monitörü oyun moduna, kapanınca masaüstü moduna alır."
+            ))
         if getattr(self, "_active_color_key", None) in self.swatches:
             self._choose_color(self._active_color_key)
         if refresh_preview:
@@ -2164,6 +2466,15 @@ class ControlPanel(QWidget):
         menu.addAction(self.tray_start_action)
         menu.addAction(self.tray_stop_action)
         menu.addSeparator()
+        self.tray_zowie_action = QAction(self._zowie_action_text(), self)
+        self.tray_zowie_action.setCheckable(True)
+        self.tray_zowie_action.setChecked(bool(self.settings.get("zowie_auto_mode")))
+        self.tray_zowie_action.setToolTip(self._tr(
+            "CS2 açılınca monitörü oyun moduna, kapanınca masaüstü moduna alır."
+        ))
+        self.tray_zowie_action.toggled.connect(self._zowie_toggled)
+        menu.addAction(self.tray_zowie_action)
+        menu.addSeparator()
         self.tray_exit_action = QAction(self._tr("Çıkış"), self)
         self.tray_exit_action.triggered.connect(self._exit_application)
         menu.addAction(self.tray_exit_action)
@@ -2183,6 +2494,189 @@ class ControlPanel(QWidget):
         }:
             self._show_from_tray()
 
+    def _zowie_action_text(self) -> str:
+        return self._tr(
+            "Zowie eklentisi · CS2'de {game}, sonra {desktop}",
+            game=ZOWIE_MODE_LABELS[normalise_zowie_mode(
+                self.settings.get("zowie_game_mode"), ZOWIE_DEFAULT_GAME_MODE,
+            )],
+            desktop=ZOWIE_MODE_LABELS[normalise_zowie_mode(
+                self.settings.get("zowie_desktop_mode"), ZOWIE_DEFAULT_DESKTOP_MODE,
+            )],
+        )
+
+    def _configure_zowie_monitor(self) -> None:
+        self.zowie_monitor.configure(
+            bool(self.settings.get("zowie_auto_mode")),
+            str(self.settings.get("zowie_game_mode", ZOWIE_DEFAULT_GAME_MODE)),
+            str(self.settings.get("zowie_desktop_mode", ZOWIE_DEFAULT_DESKTOP_MODE)),
+        )
+
+    def start_zowie_monitor(self) -> None:
+        self.zowie_monitor.start()
+
+    # ---- Lock screen: blank the LCD while Windows is locked ---------------
+    WM_WTSSESSION_CHANGE = 0x02B1
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK = 0x7, 0x8
+
+    def register_session_notifications(self) -> None:
+        """Ask Windows for lock/unlock messages (real launches only)."""
+        if os.name != "nt" or self._session_notifications:
+            return
+        try:
+            hwnd = int(self.winId())
+            if ctypes.WinDLL("wtsapi32").WTSRegisterSessionNotification(ctypes.c_void_p(hwnd), 0):
+                self._session_notifications = True
+        except Exception as exc:
+            _runtime_log(f"session notifications unavailable: {type(exc).__name__}: {exc}")
+
+    def unregister_session_notifications(self) -> None:
+        if not self._session_notifications:
+            return
+        self._session_notifications = False
+        try:
+            ctypes.WinDLL("wtsapi32").WTSUnRegisterSessionNotification(ctypes.c_void_p(int(self.winId())))
+        except Exception:
+            pass
+
+    def nativeEvent(self, event_type, message):  # noqa: N802 - Qt override
+        if event_type == b"windows_generic_MSG" or event_type == "windows_generic_MSG":
+            try:
+                msg = ctypes.wintypes.MSG.from_address(int(message))
+                if msg.message == self.WM_WTSSESSION_CHANGE:
+                    self._session_changed(int(msg.wParam))
+            except Exception:
+                pass
+        return super().nativeEvent(event_type, message)
+
+    def _session_changed(self, code: int) -> None:
+        if code == self.WTS_SESSION_LOCK:
+            self._windows_locked = True
+        elif code == self.WTS_SESSION_UNLOCK:
+            self._windows_locked = False
+        else:
+            return
+        self._apply_display_suspension()
+
+    def _apply_display_suspension(self) -> None:
+        suspend = self._windows_locked and bool(self.settings.get("screen_off_when_locked", True))
+        if suspend and not self.display_suspended.is_set():
+            self.display_suspended.set()
+            _runtime_log("windows locked; mini display off")
+        elif not suspend and self.display_suspended.is_set():
+            self.display_suspended.clear()
+            _runtime_log("mini display resumed")
+
+    def _lock_off_toggled(self, checked: bool) -> None:
+        # Live setting (not an edit control): saved at once, works while running.
+        self.settings = {**self.settings, "screen_off_when_locked": bool(checked)}
+        self._apply_display_suspension()
+        try:
+            save_settings_file(self.settings)
+        except Exception as exc:
+            _runtime_log(f"lock setting save failed: {type(exc).__name__}: {exc}")
+
+    # ---- Update check (read-only; never downloads) -------------------------
+    def start_update_checks(self) -> None:
+        """Real launches only: first look shortly after start, then daily."""
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(lambda: self._check_updates(manual=False))
+        self.update_timer.start(UPDATE_CHECK_INTERVAL_SECONDS * 1000)
+        QTimer.singleShot(45_000, lambda: self._check_updates(manual=False))
+
+    def _update_check_toggled(self, checked: bool) -> None:
+        self.settings = {**self.settings, "update_check": bool(checked)}
+        try:
+            save_settings_file(self.settings)
+        except Exception as exc:
+            _runtime_log(f"update setting save failed: {type(exc).__name__}: {exc}")
+
+    def _check_updates(self, manual: bool) -> None:
+        if self._update_check_running:
+            return
+        if not manual and not self.settings.get("update_check", True):
+            return
+        self._update_check_running = True
+        self.update_check_button.setEnabled(False)
+        self.update_status_label.setText(self._tr("Denetleniyor…"))
+
+        def work() -> None:
+            try:
+                info = fetch_latest_release(APP_VERSION)
+                self.signals.update_result.emit(info, "", manual)
+            except Exception as exc:
+                self.signals.update_result.emit(None, f"{type(exc).__name__}: {exc}", manual)
+
+        threading.Thread(target=work, name="update-check", daemon=True).start()
+
+    def _update_result(self, info: UpdateInfo | None, error: str, manual: bool) -> None:
+        self._update_check_running = False
+        self.update_check_button.setEnabled(True)
+        if info is None:
+            _runtime_log(f"update check failed: {error}")
+            self.update_status_label.setText(self._tr("Denetlenemedi · internet bağlantısını kontrol edin"))
+            return
+        self.update_info = info
+        if not info.newer:
+            self.update_status_label.setText(self._tr("Güncel · en son sürüm {version}", version=info.latest))
+            self.update_open_button.setVisible(False)
+            return
+        self.update_status_label.setText(self._tr("Yeni sürüm var: {version}", version=info.latest))
+        self.update_open_button.setVisible(True)
+        _runtime_log(f"update available; latest={info.latest}")
+        if not manual and self.tray_icon is not None and self._update_notified != info.latest:
+            self._update_notified = info.latest
+            self.tray_icon.showMessage(
+                self._tr(APP_DISPLAY_NAME),
+                self._tr("Yeni sürüm var: {version}", version=info.latest),
+                QSystemTrayIcon.MessageIcon.Information, 6000,
+            )
+
+    def _open_update_page(self) -> None:
+        info = self.update_info
+        if info is not None and is_trusted_release_url(info.url):
+            QDesktopServices.openUrl(QUrl(info.url))
+
+    def _refresh_zowie_status(self, force: bool = False) -> None:
+        """Show the monitor's current mode; DDC reads only while the window is visible."""
+        monitor = self.zowie_monitor
+        visible = self.isVisible() and not self.isMinimized()
+        if visible and not monitor.status_wanted:
+            monitor._status_read_at = -1e9  # read at once when the window opens
+        monitor.status_wanted = visible
+        if not hasattr(self, "zowie_status_label"):
+            return
+        if monitor.monitor_found is False:
+            text, color = self._tr("Monitör bulunamadı"), "#E3B866"
+        elif monitor.current_mode:
+            label = ZOWIE_MODE_LABELS.get(monitor.current_mode, monitor.current_mode)
+            text, color = self._tr("Şu an: {mode}", mode=label), ACCENT
+        else:
+            text, color = self._tr("Mod okunuyor…"), "#8C97A8"
+        if force or self.zowie_status_label.text() != text:
+            self.zowie_status_label.setText(text)
+            self.zowie_status_label.setStyleSheet(f"color: {color};")
+
+    def _zowie_toggled(self, checked: bool) -> None:
+        # Saved straight away (like rotation): the window checkbox and the
+        # tray entry work even while the form is locked by a running screen.
+        checked = bool(checked)
+        if checked == bool(self.settings.get("zowie_auto_mode")):
+            return
+        for control in (getattr(self, "zowie_check", None), getattr(self, "tray_zowie_action", None)):
+            if control is not None and control.isChecked() != checked:
+                control.blockSignals(True)
+                control.setChecked(checked)
+                control.blockSignals(False)
+        self.settings = {**self.settings, "zowie_auto_mode": checked}
+        self._configure_zowie_monitor()
+        self._refresh_zowie_status()
+        try:
+            save_settings_file(self.settings)
+        except Exception as exc:
+            _runtime_log(f"zowie setting save failed: {type(exc).__name__}: {exc}")
+        _runtime_log(f"zowie add-on {'on' if checked else 'off'}")
+
     def _show_from_tray(self) -> None:
         self.showNormal()
         self.ensurePolished()
@@ -2192,6 +2686,8 @@ class ControlPanel(QWidget):
 
     def _exit_application(self) -> None:
         self._exit_requested = True
+        self.zowie_monitor.stop(timeout=1.0)
+        self.unregister_session_notifications()
         if self.tray_icon is not None:
             self.tray_icon.hide()
         if self.worker and self.worker.is_alive():
@@ -2226,6 +2722,8 @@ class ControlPanel(QWidget):
         self._exit_requested = True
         if self.tray_icon is not None:
             self.tray_icon.hide()
+        self.zowie_monitor.stop(timeout=1.0)
+        self.unregister_session_notifications()
         self.stop_event.set()
         worker = self.worker
         if worker and worker.is_alive() and worker is not threading.current_thread():
@@ -2303,6 +2801,13 @@ class ControlPanel(QWidget):
             "custom_palettes": {
                 name: dict(colors) for name, colors in self.settings.get("custom_palettes", {}).items()
             },
+            # Zowie add-on is toggled from the tray, not from the form.
+            "zowie_auto_mode": bool(self.settings.get("zowie_auto_mode", False)),
+            "zowie_game_mode": self.settings.get("zowie_game_mode", ZOWIE_DEFAULT_GAME_MODE),
+            "zowie_desktop_mode": self.settings.get("zowie_desktop_mode", ZOWIE_DEFAULT_DESKTOP_MODE),
+            "screen_off_when_locked": self.lock_off_check.isChecked(),
+            "update_check": self.update_auto_check.isChecked(),
+            "ui_theme": self.ui_theme,
         }
 
     def _selected_palette_name(self) -> str:
@@ -2881,6 +3386,26 @@ class ControlPanel(QWidget):
                 # retry loop and replace the process automatically.
                 self._screen_progress_at = time.monotonic()
                 current = dict(self.settings)
+                if self.display_suspended.is_set():
+                    # Windows is locked: blank the panel and release the USB
+                    # session. On unlock the normal connect path below wakes
+                    # the panel (ScreenOn) and sends a fresh full frame.
+                    if screen is not None:
+                        try:
+                            screen.power_off()
+                        except Exception as exc:
+                            _runtime_log(f"lock blank failed: {type(exc).__name__}: {exc}")
+                        try:
+                            screen.close()
+                        except Exception:
+                            pass
+                        screen = None
+                        self.screen_connected.clear()
+                        self.signals.status.emit(translate(
+                            "Windows kilitli · mini ekran kapalı", current.get("language", "tr"),
+                        ))
+                    self.stop_event.wait(1.0)
+                    continue
                 if screen is None:
                     try:
                         brightness = effective_brightness(current)
@@ -3608,6 +4133,9 @@ def main() -> int:
             args=(bool(panel.settings.get("autostart")),),
             name="autostart-reconcile", daemon=True,
         ).start()
+        panel.start_zowie_monitor()
+        panel.register_session_notifications()
+        panel.start_update_checks()
     if panel.tray_icon is not None:
         app.setQuitOnLastWindowClosed(False)
     if hasattr(app, "commitDataRequest"):

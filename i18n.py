@@ -71,6 +71,47 @@ ENGLISH: dict[str, str] = {
     "Mini ekranı başlat": "Start mini display",
     "Mini ekranı durdur": "Stop mini display",
     "Çıkış": "Exit",
+    "Zowie eklentisi · CS2'de {game}, sonra {desktop}": "Zowie add-on · {game} in CS2, then {desktop}",
+    "Zowie monitör": "Zowie monitor",
+    # v1.2 sidebar layout
+    "Tema": "Theme",
+    "Açık": "Light",
+    "Koyu": "Dark",
+    "Genel bakış": "Overview",
+    "Bilgiler": "Information",
+    "Hakkında": "About",
+    "Mini ekranın parlaklığı, yönü ve tasarımı": "Brightness, orientation and design of the mini display",
+    "Başlangıç": "Startup",
+    "Kilit ekranı": "Lock screen",
+    "Windows kilitlenince mini ekranı kapat": "Turn the mini display off when Windows is locked",
+    "Bilgisayar kilitlenince mini ekranın ışığı kapanır; kilit açılınca geri gelir.": (
+        "The mini display goes dark while the PC is locked and comes back when you unlock it."
+    ),
+    "Mini ekranda görünen adlar ve hava durumu şehirleri": "Names and weather cities shown on the mini display",
+    "Hava durumu": "Weather",
+    "Otomatik mod": "Automatic mode",
+    "Monitör modu": "Monitor mode",
+    "Sürüm": "Version",
+    "Güncellemeler": "Updates",
+    "İndirme sayfasını aç": "Open download page",
+    "Şimdi denetle": "Check now",
+    "Yeni sürümleri otomatik denetle": "Check for new versions automatically",
+    "Günde bir kez GitHub'daki sürüm listesine bakar. Hiçbir şeyi kendiliğinden indirmez.": (
+        "Looks at the GitHub release list once a day. Never downloads anything by itself."
+    ),
+    "Denetleniyor…": "Checking…",
+    "Denetlenemedi · internet bağlantısını kontrol edin": "Could not check · check your internet connection",
+    "Güncel · en son sürüm {version}": "Up to date · latest version {version}",
+    "Yeni sürüm var: {version}": "New version available: {version}",
+    "Henüz denetlenmedi": "Not checked yet",
+    "Windows kilitli · mini ekran kapalı": "Windows locked · mini display off",
+    "CS2'de otomatik mod": "Auto mode for CS2",
+    "Monitör bulunamadı": "Monitor not found",
+    "Şu an: {mode}": "Now: {mode}",
+    "Mod okunuyor…": "Reading mode…",
+    "CS2 açılınca monitörü oyun moduna, kapanınca masaüstü moduna alır.": (
+        "Switches the monitor to the game mode when CS2 starts and back to the desktop mode when it exits."
+    ),
     "Dil": "Language",
     # Palette and layout names
     "Kuzey": "North",

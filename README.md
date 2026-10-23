@@ -1,6 +1,24 @@
 # Sabasakal Mini Screen 3.5″
 
-Version 1.1.12
+Version 1.2.0
+
+1.2.0 changes: a new, simpler control panel: a sidebar (Overview, Display,
+Information, Colours, Zowie monitor, About), one scrolling page and a fixed
+"Save and start" bar. The default theme is light (white with pink-yellow
+gradients); a Dark theme is available at the bottom left. The mini display turns off while Windows is locked and
+comes back on unlock (can be switched off under Display). The About section
+has an update check: once a day it reads the public GitHub release list, tells
+you about a newer version and only opens this repository's download page; it
+never downloads or runs anything by itself.
+
+1.1.13 changes: Zowie add-on, toggled from the tray (off by default). When
+CS2 (`cs2.exe`) starts, a ZOWIE XL monitor switches once to GAMER 2; when it
+exits, once to GAMER 3. Nothing is enforced while the game runs, so GAMER 1 /
+GAMER 2 can be picked freely on the monitor and alt-tab changes nothing. The
+monitor is driven over DDC/CI (VCP 0xDC); there is no contact with the game.
+No handle is kept between switches; memory and handle counts stayed flat over
+2000 real switches. The modes can be changed in `settings.json` via
+`zowie_game_mode` / `zowie_desktop_mode` (GAMER1/GAMER2/GAMER3).
 
 1.1.12 changes: the CPU sensor helper stays at a few MB. .NET sized its gen0
 budget from the 96 MB L3 cache of X3D CPUs, so it collected nothing for about
