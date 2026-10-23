@@ -38,7 +38,7 @@ from app import (
     COLORS,
     HEIGHT,
     MAX_HARDWARE_LABEL_LENGTH, MEDIA_VIS_REGION, MEDIA_VIS_REGION_WITH_BATTERY,
-    SENSOR_CACHE_PATH, SENSOR_MONITOR, ScreenSession,
+    NVIDIA_MONITOR, SENSOR_CACHE_PATH, SENSOR_MONITOR, ScreenSession,
     cs2_is_running,
     get_auto_hardware_labels, get_metrics,
     normalise_hardware_label,
@@ -54,13 +54,17 @@ from msfs_runtime import (
     FlightPhaseState, FlightPhaseTracker, FlightTelemetry, LandingRecord, MSFSTelemetryMonitor,
 )
 from screens_new import (
-    NewScreenContext, ScreenStabilizer, new_design_mode, render_new_screen,
+    NewScreenContext, ScreenStabilizer, available_pages, new_design_mode, render_new_screen,
 )
 from weather_runtime import (
     DEFAULT_WEATHER_CITIES, WeatherMonitor, WeatherReading, format_city_name,
     normalise_city_names,
 )
 from i18n import SUPPORTED_LANGUAGES, normalize_language, translate
+from energy_runtime import (
+    DEFAULT_OTHER_WATTS, DEFAULT_PSU_EFFICIENCY, EnergyMeter, EnergySummary, price_per_kwh,
+)
+from faceit_runtime import FaceitMatch, FaceitMonitor, FaceitSnapshot, protect_secret
 from update_runtime import (
     CHECK_INTERVAL_SECONDS as UPDATE_CHECK_INTERVAL_SECONDS, UpdateInfo, fetch_latest_release,
     is_trusted_release_url,
@@ -75,7 +79,7 @@ from zowie_runtime import (
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.4.0"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -171,10 +175,67 @@ NAV_SECTIONS = (
     ("overview", "Genel bakış", "layout-dashboard"),
     ("display", "Ekran", "monitor"),
     ("info", "Bilgiler", "cpu"),
+    ("energy", "Elektrik", "zap"),
     ("colors", "Renkler", "palette"),
     ("zowie", "Zowie monitör", "gamepad-2"),
+    ("faceit", "FACEIT", "trophy"),
     ("about", "Hakkında", "info"),
 )
+
+
+class _LastInputInfo(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+def user_idle_seconds() -> float:
+    """Seconds since the last keyboard/mouse input in this session (0 if unknown)."""
+    if os.name != "nt":
+        return 0.0
+    info = _LastInputInfo()
+    info.cbSize = ctypes.sizeof(info)
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetTickCount.restype = ctypes.c_uint
+        if not user32.GetLastInputInfo(ctypes.byref(info)):
+            return 0.0
+        return ((kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
+    except (AttributeError, OSError):
+        return 0.0
+
+
+def _format_number(value: float, language: str, digits: int = 2) -> str:
+    rendered = f"{value:.{digits}f}".rstrip("0").rstrip(".")
+    return rendered.replace(".", ",") if language == "tr" else rendered
+
+
+def _parse_number(text: str) -> float | None:
+    """Accepts "3,24", "3.24", "1.234,5" and "1,234.5"; None if not a number."""
+    cleaned = str(text or "").strip().replace(" ", "").replace("₺", "").replace("TL", "")
+    if not cleaned:
+        return 0.0
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    else:
+        cleaned = cleaned.replace(",", ".")
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None
+    return value if value == value else None
+
+
+def carousel_page(settings: dict, idle_seconds: float, pages: tuple[str, ...], now: float) -> str:
+    """Desktop page to show: the system screen while in use, a rotation when idle."""
+    if not settings.get("carousel_enabled", True) or not pages:
+        return "main"
+    if idle_seconds < float(settings.get("carousel_idle_seconds", 60)):
+        return "main"
+    period = max(5.0, float(settings.get("carousel_seconds", 15)))
+    return pages[int(now // period) % len(pages)]
 
 
 def _tinted_svg_icon(name: str, color: str, size: int = 36) -> QIcon:
@@ -485,6 +546,31 @@ DEFAULT_SETTINGS = {
     "update_check": True,
     # Control-panel look: "light" (pink-yellow) or "dark".
     "ui_theme": DEFAULT_UI_THEME,
+    # Desktop carousel while the PC is idle (Claude design).
+    "carousel_enabled": True,
+    "carousel_seconds": 15,
+    "carousel_idle_seconds": 60,
+    # Electricity estimate.
+    "energy_price_mode": "bill",  # bill | unit
+    "energy_bill_amount": 0.0,
+    "energy_bill_kwh": 0.0,
+    "energy_unit_price": 0.0,
+    "energy_other_watts": DEFAULT_OTHER_WATTS,
+    "energy_psu_efficiency": DEFAULT_PSU_EFFICIENCY,
+    # FACEIT card: nickname + DPAPI-encrypted server-side API key.
+    "faceit_nickname": "",
+    "faceit_key_protected": "",
+}
+FACEIT_DEVELOPERS_URL = "https://developers.faceit.com/"
+CAROUSEL_SECONDS_CHOICES = (10, 15, 30, 60)
+CAROUSEL_IDLE_CHOICES = (30, 60, 120, 300)
+# (min, max) of the numeric electricity settings.
+ENERGY_LIMITS = {
+    "energy_bill_amount": (0.0, 1_000_000.0),
+    "energy_bill_kwh": (0.0, 100_000.0),
+    "energy_unit_price": (0.0, 1_000.0),
+    "energy_other_watts": (0.0, 400.0),
+    "energy_psu_efficiency": (50.0, 100.0),
 }
 
 AUTO_BRIGHTNESS_DAY = 90
@@ -1263,6 +1349,27 @@ def load_settings() -> dict:
                 settings[flag] = saved[flag]
         if saved.get("ui_theme") in UI_THEMES:
             settings["ui_theme"] = saved["ui_theme"]
+        if isinstance(saved.get("carousel_enabled"), bool):
+            settings["carousel_enabled"] = saved["carousel_enabled"]
+        if saved.get("carousel_seconds") in CAROUSEL_SECONDS_CHOICES:
+            settings["carousel_seconds"] = saved["carousel_seconds"]
+        if saved.get("carousel_idle_seconds") in CAROUSEL_IDLE_CHOICES:
+            settings["carousel_idle_seconds"] = saved["carousel_idle_seconds"]
+        nickname = saved.get("faceit_nickname")
+        if isinstance(nickname, str):
+            settings["faceit_nickname"] = nickname.strip()[:32]
+        protected = saved.get("faceit_key_protected")
+        if isinstance(protected, str) and len(protected) < 4096:
+            settings["faceit_key_protected"] = protected
+        if saved.get("energy_price_mode") in ("bill", "unit"):
+            settings["energy_price_mode"] = saved["energy_price_mode"]
+        for key, (low, high) in ENERGY_LIMITS.items():
+            try:
+                value = float(saved.get(key, settings[key]))
+            except (TypeError, ValueError):
+                continue
+            if value == value:  # not NaN
+                settings[key] = max(low, min(high, value))
         settings["zowie_game_mode"] = normalise_zowie_mode(
             saved.get("zowie_game_mode"), ZOWIE_DEFAULT_GAME_MODE,
         )
@@ -1564,6 +1671,7 @@ class WorkerSignals(QObject):
     stopped = Signal()
     autostart_result = Signal(bool, str)
     update_result = Signal(object, str, bool)  # UpdateInfo | None, error, manual
+    faceit_result = Signal(object)  # FaceitSnapshot
 
 
 class ControlPanel(QWidget):
@@ -1605,6 +1713,20 @@ class ControlPanel(QWidget):
         # Zowie add-on; the thread is started by main() in real launches only.
         self.zowie_monitor = ZowieModeMonitor(cs2_is_running, log=_runtime_log)
         self._configure_zowie_monitor()
+        # Electricity estimate; the sampling thread is started by main() only.
+        self.energy_meter = EnergyMeter(
+            read_power=lambda: (SENSOR_MONITOR.read().get("cpu_power"), NVIDIA_MONITOR.read_power_watts()),
+            store_path=APP_DATA / "energy.json",
+            settings=lambda: self.settings,
+            log=_runtime_log,
+        )
+        # FACEIT card; the refresh thread is started by main() only.
+        self.faceit_monitor = FaceitMonitor(
+            settings=lambda: self.settings,
+            cache_path=APP_DATA / "faceit.json",
+            game_running=cs2_is_running,
+            log=_runtime_log,
+        )
         # Lock screen + update check state.
         self.display_suspended = threading.Event()
         self._windows_locked = False
@@ -1613,6 +1735,7 @@ class ControlPanel(QWidget):
         self._update_check_running = False
         self._update_notified = ""
         self.signals.update_result.connect(self._update_result)
+        self.signals.faceit_result.connect(self._faceit_result)
         self.ui_theme = self.settings.get("ui_theme", DEFAULT_UI_THEME)
         if self.ui_theme not in UI_THEMES:
             self.ui_theme = DEFAULT_UI_THEME
@@ -1635,6 +1758,7 @@ class ControlPanel(QWidget):
         self.liveness_timer.start(INSTANCE_HEARTBEAT_INTERVAL_MS)
         self.zowie_status_timer = QTimer(self)
         self.zowie_status_timer.timeout.connect(self._refresh_zowie_status)
+        self.zowie_status_timer.timeout.connect(self._refresh_energy_readout)
         self.zowie_status_timer.start(1000)
         self._refresh_zowie_status()
         self.update_status_label.setText(self._tr("Henüz denetlenmedi"))
@@ -1749,7 +1873,7 @@ class ControlPanel(QWidget):
             QScrollArea#mainScroll, QWidget#page, QWidget#section {{ background: {p['window_bg']}; border: 0; }}
             QLabel#pageTitle {{ font-size: 20px; font-weight: 700; }}
             QFrame#group {{ background: {p['card_bg']}; border: 1px solid {p['edge']}; border-radius: 14px; }}
-            QFrame#group QLabel, QFrame#group QCheckBox {{ background: transparent; }}
+            QFrame#group QLabel, QFrame#group QCheckBox, QWidget#inline {{ background: transparent; }}
             QFrame#actionBar {{ background: {p['window_bg']}; border-top: 1px solid {p['action_border']}; }}
             QScrollBar:vertical {{ background: transparent; width: 10px; margin: 4px 2px; }}
             QScrollBar::handle:vertical {{ background: {p['scroll_handle']}; border-radius: 3px; min-height: 40px; }}
@@ -1940,9 +2064,9 @@ class ControlPanel(QWidget):
         preview_modes = QHBoxLayout()
         preview_modes.setSpacing(6)
         for mode, caption in (
-            ("daily", "Günlük"), ("cs2", "CS2 teması"),
-            ("msfs", "MSFS"), ("weather", "Hava"),
-            ("wireless", "Kablosuz"),
+            ("daily", "Günlük"), ("clock", "Saat"), ("weather", "Hava"),
+            ("energy", "Elektrik"), ("faceit", "FACEIT"), ("cs2", "CS2 teması"),
+            ("msfs", "MSFS"), ("wireless", "Kablosuz"),
         ):
             button = QPushButton(caption)
             button.setObjectName("previewMode")
@@ -2068,6 +2192,51 @@ class ControlPanel(QWidget):
         self.lock_off_check.setChecked(bool(self.settings.get("screen_off_when_locked", True)))
         self.lock_off_check.toggled.connect(self._lock_off_toggled)
         screen_grid.addWidget(self.lock_off_check, row, 1, Qt.AlignmentFlag.AlignLeft)
+        # Idle carousel (live settings, usable while the screen runs).
+        row += 1
+        screen_grid.addWidget(self._label("Boştayken"), row, 0)
+        self.carousel_check = QCheckBox("Saat, hava, sistem ve elektrik ekranlarını döndür")
+        self.carousel_check.setToolTip(
+            "Klavye ve fareye bir süre dokunulmayınca mini ekran bu sayfalar arasında döner. "
+            "Oyun ve uçuş ekranlarını etkilemez."
+        )
+        self.carousel_check.setChecked(bool(self.settings.get("carousel_enabled", True)))
+        self.carousel_check.toggled.connect(
+            lambda checked: self._set_live_setting("carousel_enabled", bool(checked))
+        )
+        screen_grid.addWidget(self.carousel_check, row, 1, Qt.AlignmentFlag.AlignLeft)
+        row += 1
+        screen_grid.addWidget(self._label("Döndürme"), row, 0)
+        carousel_line = QHBoxLayout()
+        carousel_line.setSpacing(10)
+        self.carousel_idle_combo = QComboBox()
+        for seconds in CAROUSEL_IDLE_CHOICES:
+            label = (
+                self._tr("{n} sn dokunulmayınca", n=seconds) if seconds < 60
+                else self._tr("{n} dk dokunulmayınca", n=seconds // 60)
+            )
+            self.carousel_idle_combo.addItem(label, seconds)
+        self.carousel_idle_combo.setCurrentIndex(max(0, self.carousel_idle_combo.findData(
+            self.settings.get("carousel_idle_seconds", 60))))
+        self.carousel_idle_combo.currentIndexChanged.connect(
+            lambda _i: self._set_live_setting(
+                "carousel_idle_seconds", int(self.carousel_idle_combo.currentData()))
+        )
+        self.carousel_seconds_combo = QComboBox()
+        for seconds in CAROUSEL_SECONDS_CHOICES:
+            self.carousel_seconds_combo.addItem(self._tr("{n} sn'de bir", n=seconds), seconds)
+        self.carousel_seconds_combo.setCurrentIndex(max(0, self.carousel_seconds_combo.findData(
+            self.settings.get("carousel_seconds", 15))))
+        self.carousel_seconds_combo.currentIndexChanged.connect(
+            lambda _i: self._set_live_setting(
+                "carousel_seconds", int(self.carousel_seconds_combo.currentData()))
+        )
+        for combo in (self.carousel_idle_combo, self.carousel_seconds_combo):
+            combo.setFixedHeight(34)
+            combo.setMinimumWidth(180)
+            carousel_line.addWidget(combo)
+        carousel_line.addStretch()
+        screen_grid.addLayout(carousel_line, row, 1)
         display.addWidget(self.quick_card)
 
         # Information shown on the screen: hardware names + weather
@@ -2125,6 +2294,83 @@ class ControlPanel(QWidget):
         info_grid.addLayout(weather_line, 4, 1)
         info.addWidget(info_card)
         self._sync_design_dependent_controls()
+
+        # Electricity estimate (live settings)
+        energy = section(
+            "energy", "Elektrik",
+            "İşlemci ve ekran kartı güç sensörlerinden tahmini tüketim ve maliyet",
+        )
+        energy_card, energy_grid = group()
+        energy_grid.addWidget(self._label("Fiyat"), 0, 0)
+        self.energy_mode_combo = QComboBox()
+        self.energy_mode_combo.addItem(self._tr("Son faturadan hesapla"), "bill")
+        self.energy_mode_combo.addItem(self._tr("Birim fiyatı kendim gireceğim"), "unit")
+        self.energy_mode_combo.setCurrentIndex(max(0, self.energy_mode_combo.findData(
+            self.settings.get("energy_price_mode", "bill"))))
+        self.energy_mode_combo.setFixedHeight(34)
+        self.energy_mode_combo.setMinimumWidth(260)
+        self.energy_mode_combo.currentIndexChanged.connect(self._energy_mode_changed)
+        energy_grid.addWidget(self.energy_mode_combo, 0, 1, Qt.AlignmentFlag.AlignLeft)
+        self.energy_inputs: dict[str, QLineEdit] = {}
+
+        def energy_field(key: str, placeholder: str, suffix: str) -> QHBoxLayout:
+            line = QHBoxLayout()
+            line.setSpacing(6)
+            field = QLineEdit()
+            field.setFixedHeight(34)
+            field.setFixedWidth(130)
+            field.setPlaceholderText(self._tr(placeholder))
+            field.setProperty("i18n_placeholder", placeholder)
+            value = float(self.settings.get(key, DEFAULT_SETTINGS[key]) or 0.0)
+            field.setText(_format_number(value, self.language) if value else "")
+            field.editingFinished.connect(lambda key=key: self._energy_field_changed(key))
+            self.energy_inputs[key] = field
+            line.addWidget(field)
+            line.addWidget(self._label(suffix, "device"))
+            return line
+
+        self.energy_bill_caption = self._label("Son fatura")
+        energy_grid.addWidget(self.energy_bill_caption, 1, 0)
+        bill_line = QHBoxLayout()
+        bill_line.setSpacing(14)
+        bill_line.addLayout(energy_field("energy_bill_amount", "Toplam tutar", "TL"))
+        bill_line.addLayout(energy_field("energy_bill_kwh", "Tüketim", "kWh"))
+        bill_line.addStretch()
+        bill_line.setContentsMargins(0, 0, 0, 0)
+        self.energy_bill_line = QWidget(objectName="inline")
+        self.energy_bill_line.setLayout(bill_line)
+        energy_grid.addWidget(self.energy_bill_line, 1, 1)
+        self.energy_unit_caption = self._label("Birim fiyat")
+        energy_grid.addWidget(self.energy_unit_caption, 2, 0)
+        unit_line = energy_field("energy_unit_price", "Örn. 3,24", "TL/kWh")
+        unit_line.addStretch()
+        unit_line.setContentsMargins(0, 0, 0, 0)
+        self.energy_unit_line = QWidget(objectName="inline")
+        self.energy_unit_line.setLayout(unit_line)
+        energy_grid.addWidget(self.energy_unit_line, 2, 1)
+        energy_grid.addWidget(self._label("Hesaplanan"), 3, 0)
+        self.energy_price_label = self._label("", "section")
+        energy_grid.addWidget(self.energy_price_label, 3, 1)
+        energy_grid.addWidget(self._label("Tahmin ayarı"), 4, 0)
+        tuning_line = QHBoxLayout()
+        tuning_line.setSpacing(14)
+        tuning_line.addLayout(energy_field("energy_other_watts", "60", "W diğer parçalar"))
+        tuning_line.addLayout(energy_field("energy_psu_efficiency", "90", "% güç kaynağı verimi"))
+        tuning_line.addStretch()
+        energy_grid.addLayout(tuning_line, 4, 1)
+        energy_grid.addWidget(self._label("Tüketim"), 5, 0)
+        self.energy_readout_label = self._label("", "section")
+        energy_grid.addWidget(self.energy_readout_label, 5, 1)
+        energy_note = self._label(
+            "Tahmindir: işlemci ve ekran kartı sensörlerine anakart, bellek, disk ve fanlar için "
+            "bir pay eklenir ve güç kaynağı verimine bölünür. Monitörler ile uygulamanın kapalı "
+            "olduğu süre sayılmaz. En doğru fiyat için son faturanızdaki toplam tutarı ve kWh'i girin.",
+            "device",
+        )
+        energy_note.setWordWrap(True)
+        energy_grid.addWidget(energy_note, 6, 0, 1, 2)
+        energy.addWidget(energy_card)
+        self._sync_energy_controls()
 
         # Colours
         colours = section("colors", "Renkler", "Halka, zemin ve yazı renklerinden birini seçin.")
@@ -2243,6 +2489,53 @@ class ControlPanel(QWidget):
         zowie_grid.addWidget(self.zowie_status_label, 1, 1)
         zowie.addWidget(zowie_card)
 
+        # FACEIT card (live: usable while the screen runs)
+        faceit = section(
+            "faceit", "FACEIT kartı",
+            "ELO, seviye ve son maçların; yalnızca FACEIT'in resmi web API'sinden okunur, oyuna dokunulmaz.",
+        )
+        faceit_card, faceit_grid = group()
+        faceit_grid.addWidget(self._label("Kullanıcı adı"), 0, 0)
+        self.faceit_nickname_input = QLineEdit()
+        self.faceit_nickname_input.setFixedHeight(34)
+        self.faceit_nickname_input.setMaxLength(32)
+        self.faceit_nickname_input.setMinimumWidth(260)
+        self.faceit_nickname_input.setPlaceholderText(self._tr("FACEIT kullanıcı adın"))
+        self.faceit_nickname_input.setText(str(self.settings.get("faceit_nickname", "")))
+        faceit_grid.addWidget(self.faceit_nickname_input, 0, 1, Qt.AlignmentFlag.AlignLeft)
+        faceit_grid.addWidget(self._label("API anahtarı"), 1, 0)
+        key_line = QHBoxLayout()
+        key_line.setSpacing(10)
+        self.faceit_key_input = QLineEdit()
+        self.faceit_key_input.setFixedHeight(34)
+        self.faceit_key_input.setMinimumWidth(260)
+        self.faceit_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.faceit_key_input.setMaxLength(128)
+        key_line.addWidget(self.faceit_key_input)
+        self.faceit_help_button = QPushButton("Anahtar nasıl alınır?")
+        self.faceit_help_button.clicked.connect(
+            lambda _checked=False: QDesktopServices.openUrl(QUrl(FACEIT_DEVELOPERS_URL))
+        )
+        key_line.addWidget(self.faceit_help_button)
+        key_line.addStretch()
+        faceit_grid.addLayout(key_line, 1, 1)
+        faceit_grid.addWidget(self._label("Durum"), 2, 0)
+        status_line = QHBoxLayout()
+        status_line.setSpacing(10)
+        self.faceit_status_label = self._label("", "section")
+        status_line.addWidget(self.faceit_status_label, 1)
+        self.faceit_save_button = QPushButton("Kaydet ve doğrula", objectName="accent")
+        self.faceit_save_button.clicked.connect(self._faceit_save_and_verify)
+        status_line.addWidget(self.faceit_save_button)
+        faceit_grid.addLayout(status_line, 2, 1)
+        faceit_note = self._label(
+            "Anahtar Windows'un şifrelemesiyle (DPAPI) yalnızca bu Windows hesabına özel saklanır.",
+            "device",
+        )
+        faceit_note.setWordWrap(True)
+        faceit_grid.addWidget(faceit_note, 3, 0, 1, 2)
+        faceit.addWidget(faceit_card)
+
         # About + updates
         about = section("about", "Hakkında")
         about_card, about_grid = group()
@@ -2357,6 +2650,7 @@ class ControlPanel(QWidget):
     # while the screen is running, or an old brightness percentage).
     DYNAMIC_LABEL_ATTRIBUTES = (
         "status_label", "brightness_value", "zowie_status_label", "update_status_label",
+        "energy_price_label", "energy_readout_label", "faceit_status_label",
     )
 
     def _register_static_translations(self) -> None:
@@ -2376,6 +2670,23 @@ class ControlPanel(QWidget):
                     widget.setProperty("i18n_tooltip", widget.toolTip())
 
     def _retranslate_combo_items(self) -> None:
+        for combo, labels in (
+            (self.carousel_idle_combo, {
+                seconds: (self._tr("{n} sn dokunulmayınca", n=seconds) if seconds < 60
+                          else self._tr("{n} dk dokunulmayınca", n=seconds // 60))
+                for seconds in CAROUSEL_IDLE_CHOICES
+            }),
+            (self.carousel_seconds_combo, {
+                seconds: self._tr("{n} sn'de bir", n=seconds) for seconds in CAROUSEL_SECONDS_CHOICES
+            }),
+            (self.energy_mode_combo, {
+                "bill": self._tr("Son faturadan hesapla"),
+                "unit": self._tr("Birim fiyatı kendim gireceğim"),
+            }),
+            (self.theme_combo, {value: self._tr(label) for label, value in UI_THEME_NAMES.items()}),
+        ):
+            for index in range(combo.count()):
+                combo.setItemText(index, labels.get(combo.itemData(index), combo.itemText(index)))
         selected_palette = self._selected_palette_name()
         self._rebuild_palette_combo(selected_palette)
         selected_layout = str(self.msfs_layout_combo.currentData() or "cockpit")
@@ -2408,6 +2719,12 @@ class ControlPanel(QWidget):
         self._sync_brightness_controls()
         if hasattr(self, "zowie_monitor"):
             self._refresh_zowie_status()
+        if hasattr(self, "faceit_monitor"):
+            self._sync_faceit_controls()
+        if hasattr(self, "energy_mode_combo"):
+            for field in self.energy_inputs.values():
+                field.setPlaceholderText(self._tr(str(field.property("i18n_placeholder") or "")))
+            self._sync_energy_controls()
         self.hardware_limit_label.setText(self._tr(
             "En fazla {count} karakter", count=MAX_HARDWARE_LABEL_LENGTH,
         ))
@@ -2567,6 +2884,123 @@ class ControlPanel(QWidget):
             self.display_suspended.clear()
             _runtime_log("mini display resumed")
 
+    # ---- Live settings (saved at once; usable while the screen runs) -------
+    def _set_live_setting(self, key: str, value) -> None:
+        if self.settings.get(key) == value:
+            return
+        self.settings = {**self.settings, key: value}
+        try:
+            save_settings_file(self.settings)
+        except Exception as exc:
+            _runtime_log(f"setting save failed; key={key}: {type(exc).__name__}: {exc}")
+
+    def _sync_energy_controls(self) -> None:
+        bill = self.energy_mode_combo.currentData() == "bill"
+        for widget in (self.energy_bill_caption, self.energy_bill_line):
+            widget.setVisible(bill)
+        for widget in (self.energy_unit_caption, self.energy_unit_line):
+            widget.setVisible(not bill)
+        price = price_per_kwh(self.settings)
+        self.energy_price_label.setText(
+            self._tr("{price} TL/kWh", price=_format_number(price, self.language, 3)) if price
+            else self._tr("Fiyat girilmedi")
+        )
+        self._refresh_energy_readout()
+
+    def _energy_mode_changed(self, _index: int) -> None:
+        self._set_live_setting("energy_price_mode", str(self.energy_mode_combo.currentData()))
+        self._sync_energy_controls()
+
+    def _energy_field_changed(self, key: str) -> None:
+        field = self.energy_inputs[key]
+        value = _parse_number(field.text())
+        low, high = ENERGY_LIMITS[key]
+        if value is None:
+            value = float(self.settings.get(key, DEFAULT_SETTINGS[key]) or 0.0)
+        value = max(low, min(high, value)) if value else (0.0 if low == 0 else DEFAULT_SETTINGS[key])
+        field.setText(_format_number(value, self.language) if value else "")
+        self._set_live_setting(key, value)
+        self._sync_energy_controls()
+
+    def _refresh_energy_readout(self) -> None:
+        if not hasattr(self, "energy_readout_label"):
+            return
+        if not self.energy_meter.running:
+            text = self._tr("Ölçüm uygulama açıldığında başlar")
+        else:
+            summary = self.energy_meter.summary()
+            watts = "—" if summary.watts_now is None else f"{int(round(summary.watts_now))} W"
+            parts = [
+                self._tr("Şu an {watts}", watts=watts),
+                self._tr("bugün {kwh} kWh", kwh=_format_number(summary.today_kwh, self.language)),
+                self._tr("bu ay {kwh} kWh", kwh=_format_number(summary.month_kwh, self.language)),
+            ]
+            if summary.month_cost is not None:
+                parts.append(self._tr("≈ {cost} TL", cost=_format_number(summary.month_cost, self.language)))
+            text = " · ".join(parts)
+        if self.energy_readout_label.text() != text:
+            self.energy_readout_label.setText(text)
+
+    # ---- FACEIT ---------------------------------------------------------------
+    def _sync_faceit_controls(self) -> None:
+        if not hasattr(self, "faceit_key_input"):
+            return
+        has_key = bool(self.settings.get("faceit_key_protected"))
+        self.faceit_key_input.setPlaceholderText(self._tr(
+            "Kayıtlı (değiştirmek için yenisini yapıştır)" if has_key else "Server side API anahtarı"
+        ))
+        self.faceit_nickname_input.setPlaceholderText(self._tr("FACEIT kullanıcı adın"))
+        self._show_faceit_status(self.faceit_monitor.snapshot())
+
+    def _show_faceit_status(self, snapshot: FaceitSnapshot) -> None:
+        if snapshot.ready:
+            text = self._tr(
+                "Bağlandı: {name} · Seviye {level} · {elo} ELO",
+                name=snapshot.nickname, level=snapshot.level or "—", elo=snapshot.elo,
+            )
+            color = ACCENT
+            if snapshot.error:
+                text += f" · {self._tr(snapshot.error)}"
+        elif snapshot.error:
+            text, color = self._tr(snapshot.error), "#E3B866"
+        else:
+            text, color = self._tr("Ayarlanmadı"), MUTED
+        self.faceit_status_label.setText(text)
+        self.faceit_status_label.setStyleSheet(f"color: {color};")
+
+    def _faceit_save_and_verify(self, _checked: bool = False) -> None:
+        nickname = self.faceit_nickname_input.text().strip()[:32]
+        new_key = self.faceit_key_input.text().strip()
+        updates = {"faceit_nickname": nickname}
+        if new_key:
+            try:
+                updates["faceit_key_protected"] = protect_secret(new_key)
+            except OSError as exc:
+                _runtime_log(f"faceit key protect failed: {type(exc).__name__}")
+                self.faceit_status_label.setText(self._tr("FACEIT'e bağlanılamadı"))
+                return
+        # The plain key never stays in the widget or in memory longer than needed.
+        self.faceit_key_input.clear()
+        self.settings = {**self.settings, **updates}
+        try:
+            save_settings_file(self.settings)
+        except Exception as exc:
+            _runtime_log(f"faceit setting save failed: {type(exc).__name__}: {exc}")
+        self._sync_faceit_controls()
+        self.faceit_save_button.setEnabled(False)
+        self.faceit_status_label.setText(self._tr("Doğrulanıyor…"))
+        monitor = self.faceit_monitor
+        threading.Thread(
+            target=lambda: self.signals.faceit_result.emit(monitor.refresh()),
+            name="faceit-verify", daemon=True,
+        ).start()
+
+    def _faceit_result(self, snapshot: FaceitSnapshot) -> None:
+        self.faceit_save_button.setEnabled(True)
+        self._show_faceit_status(snapshot)
+        if snapshot.ready:
+            _runtime_log(f"faceit connected; level={snapshot.level}")
+
     def _lock_off_toggled(self, checked: bool) -> None:
         # Live setting (not an edit control): saved at once, works while running.
         self.settings = {**self.settings, "screen_off_when_locked": bool(checked)}
@@ -2687,6 +3121,8 @@ class ControlPanel(QWidget):
     def _exit_application(self) -> None:
         self._exit_requested = True
         self.zowie_monitor.stop(timeout=1.0)
+        self.energy_meter.stop(timeout=1.0)
+        self.faceit_monitor.stop(timeout=1.0)
         self.unregister_session_notifications()
         if self.tray_icon is not None:
             self.tray_icon.hide()
@@ -2723,6 +3159,8 @@ class ControlPanel(QWidget):
         if self.tray_icon is not None:
             self.tray_icon.hide()
         self.zowie_monitor.stop(timeout=1.0)
+        self.energy_meter.stop(timeout=1.0)
+        self.faceit_monitor.stop(timeout=1.0)
         self.unregister_session_notifications()
         self.stop_event.set()
         worker = self.worker
@@ -2738,6 +3176,14 @@ class ControlPanel(QWidget):
 
     def _sync_design_dependent_controls(self) -> None:
         classic = self._is_classic_design()
+        # The idle carousel pages exist only in the Claude design.
+        for mode in ("clock", "energy", "faceit"):
+            button = getattr(self, "preview_buttons", {}).get(mode)
+            if button is not None:
+                button.setVisible(not classic)
+                if classic and self.preview_mode == mode:
+                    self.preview_mode = "daily"
+                    self.preview_buttons["daily"].setChecked(True)
         if hasattr(self, "msfs_layout_caption"):
             self.msfs_layout_caption.setVisible(classic)
             self.msfs_layout_combo.setVisible(classic)
@@ -2808,6 +3254,12 @@ class ControlPanel(QWidget):
             "screen_off_when_locked": self.lock_off_check.isChecked(),
             "update_check": self.update_auto_check.isChecked(),
             "ui_theme": self.ui_theme,
+            # Live settings (saved as they change) are carried over unchanged.
+            **{key: self.settings.get(key, DEFAULT_SETTINGS[key]) for key in (
+                "carousel_enabled", "carousel_seconds", "carousel_idle_seconds",
+                "energy_price_mode", *ENERGY_LIMITS,
+                "faceit_nickname", "faceit_key_protected",
+            )},
         }
 
     def _selected_palette_name(self) -> str:
@@ -2833,7 +3285,7 @@ class ControlPanel(QWidget):
         self._refresh_preview()
 
     def _set_preview_mode(self, mode: str) -> None:
-        if mode not in {"daily", "cs2", "msfs", "weather", "wireless"}:
+        if mode not in {"daily", "clock", "energy", "faceit", "cs2", "msfs", "weather", "wireless"}:
             return
         self.preview_mode = mode
         self._refresh_preview()
@@ -3047,7 +3499,11 @@ class ControlPanel(QWidget):
             }
             if str(self.design_combo.currentData() or "new") == "new":
                 new_labels = {
-                    "daily": "Yeni tasarım · masaüstü", "weather": "Yeni tasarım · masaüstü",
+                    "daily": "Yeni tasarım · masaüstü",
+                    "clock": "Boştayken dönen ekran · saat",
+                    "weather": "Boştayken dönen ekran · hava durumu",
+                    "energy": "Boştayken dönen ekran · elektrik",
+                    "faceit": "Boştayken dönen ekran · FACEIT",
                     "wireless": "Yeni tasarım · masaüstü",
                     "cs2": "Yeni tasarım · CS2 açıkken turuncu tema",
                     "msfs": "Yeni tasarım · MSFS seyir",
@@ -3154,6 +3610,20 @@ class ControlPanel(QWidget):
                     phase="cruise", route_total_nm=1450.0, route_remaining_nm=612.0,
                     fuel_at_destination_lbs=6830.0, fuel_flow_pph=5400.0,
                 ),
+            )
+        elif mode in {"clock", "weather", "energy", "faceit"}:
+            faceit = self.faceit_monitor.snapshot()
+            if not faceit.ready:  # sample card until the user's own data arrives
+                faceit = FaceitSnapshot(
+                    "Sabasakal", 7, 1654, 25,
+                    tuple(FaceitMatch(won) for won in (True, True, False, True, False)), 1.15, 46.6,
+                )
+            context = NewScreenContext(
+                **common, weather=self._preview_weather_readings(), page=mode,
+                energy=EnergySummary(
+                    412.0, 1.84, 41.3, price_per_kwh(self.settings) or 3.24,
+                ),
+                faceit=faceit,
             )
         else:
             context = NewScreenContext(**common, weather=self._preview_weather_readings())
@@ -3579,12 +4049,30 @@ class ControlPanel(QWidget):
                             # MSFS closed: the next session starts clean.
                             phase_tracker.reset()
                             flight_state = None
-                        requested_phase = getattr(flight_state, "phase", "") if design_mode == "msfs" else ""
-                        design_mode, shown_phase = screen_stabilizer.update(
-                            (design_mode, requested_phase), cycle_started,
+                        energy_summary = (
+                            self.energy_meter.summary() if self.energy_meter.running else None
                         )
-                        if design_mode == "msfs" and flight_state is not None and shown_phase:
-                            flight_state = dataclasses.replace(flight_state, phase=shown_phase)
+                        faceit_snapshot = (
+                            self.faceit_monitor.snapshot() if self.faceit_monitor.configured() else None
+                        )
+                        if design_mode == "msfs":
+                            requested_detail = getattr(flight_state, "phase", "")
+                        elif design_mode == "desktop":
+                            requested_detail = carousel_page(
+                                current, user_idle_seconds(),
+                                available_pages(NewScreenContext(
+                                    metrics={}, weather=weather_snapshot.readings,
+                                    energy=energy_summary, faceit=faceit_snapshot,
+                                )),
+                                time.time(),
+                            )
+                        else:
+                            requested_detail = ""
+                        design_mode, shown_detail = screen_stabilizer.update(
+                            (design_mode, requested_detail), cycle_started,
+                        )
+                        if design_mode == "msfs" and flight_state is not None and shown_detail:
+                            flight_state = dataclasses.replace(flight_state, phase=shown_detail)
                         frame = render_new_screen(NewScreenContext(
                             metrics=cached_metrics,
                             batteries=battery_snapshot.devices,
@@ -3594,6 +4082,9 @@ class ControlPanel(QWidget):
                             flight=flight_telemetry,
                             flight_state=flight_state,
                             hardware_labels=labels,
+                            page=(shown_detail or "main") if design_mode == "desktop" else "main",
+                            energy=energy_summary,
+                            faceit=faceit_snapshot,
                         ))
                         media_patch = None
                         if last_view_mode is None or sent_frame is None:
@@ -4134,6 +4625,8 @@ def main() -> int:
             name="autostart-reconcile", daemon=True,
         ).start()
         panel.start_zowie_monitor()
+        panel.energy_meter.start()
+        panel.faceit_monitor.start()
         panel.register_session_notifications()
         panel.start_update_checks()
     if panel.tray_icon is not None:

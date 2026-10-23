@@ -122,6 +122,10 @@ class NewScreenContext:
     flight: object | None = None  # msfs_runtime.FlightTelemetry
     flight_state: object | None = None  # msfs_runtime.FlightPhaseState
     hardware_labels: dict = field(default_factory=dict)
+    # Desktop carousel page: main | clock | weather | energy (v1.3).
+    page: str = "main"
+    energy: object | None = None  # energy_runtime.EnergySummary
+    faceit: object | None = None  # faceit_runtime.FaceitSnapshot (v1.4)
 
 
 # ---------------------------------------------------------------------------
@@ -991,11 +995,217 @@ class ScreenStabilizer:
         return self.shown
 
 
+# ---------------------------------------------------------------------------
+# Desktop carousel pages (shown while the PC is idle, v1.3)
+# ---------------------------------------------------------------------------
+
+ICON_ROOT = Path(getattr(sys, "_MEIPASS", ROOT)) / "icons" / "png"
+WEATHER_ICONS = {
+    "clear": "sun", "cloud": "cloud", "fog": "cloud-fog",
+    "snow": "snowflake", "storm": "cloud-lightning", "rain": "cloud-rain",
+}
+MONTHS = ("Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz",
+          "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık")
+WEEKDAYS = ("Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar")
+CAROUSEL_PAGES = ("clock", "weather", "main", "faceit", "energy")
+
+
+@functools.lru_cache(maxsize=16)
+def _icon(name: str, size: int, color: str) -> Image.Image | None:
+    """A Lucide PNG recoloured to ``color`` (alpha kept), or None if missing."""
+    try:
+        with Image.open(ICON_ROOT / f"{name}.png") as source:
+            alpha = source.convert("RGBA").getchannel("A").resize((size, size), Image.Resampling.LANCZOS)
+    except OSError:
+        return None
+    tinted = Image.new("RGBA", (size, size), _rgb(color) + (0,))
+    tinted.putalpha(alpha)
+    return tinted
+
+
+def available_pages(ctx: NewScreenContext) -> tuple[str, ...]:
+    """Carousel pages that have something to show."""
+    pages = []
+    for page in CAROUSEL_PAGES:
+        if page == "weather" and not ctx.weather:
+            continue
+        if page == "energy" and ctx.energy is None:
+            continue
+        if page == "faceit" and getattr(ctx.faceit, "elo", None) is None:
+            continue
+        pages.append(page)
+    return tuple(pages)
+
+
+def _date_line(ctx: NewScreenContext, now: dt.datetime) -> str:
+    month = _t(ctx, MONTHS[now.month - 1])
+    weekday = _t(ctx, WEEKDAYS[now.weekday()])
+    if ctx.language == "en":
+        return f"{weekday}, {month} {now.day}"
+    return f"{now.day} {month} {weekday}"
+
+
+def _weather_icon_name(reading, now: dt.datetime) -> str:
+    kind = _weather_kind(int(getattr(reading, "weather_code", 0)))
+    if kind == "clear" and not 7 <= now.hour < 19:
+        return "moon"
+    return WEATHER_ICONS[kind]
+
+
+def render_clock_page(ctx: NewScreenContext) -> Image.Image:
+    background = MODE_DESKTOP[0]
+    image = Image.new("RGB", (WIDTH, HEIGHT), background)
+    draw = ImageDraw.Draw(image)
+    now = ctx.now or dt.datetime.now()
+    text(draw, (WIDTH / 2, 178), now.strftime("%H:%M"), 132, TEXT, condensed=True, anchor="ms")
+    text(draw, (WIDTH / 2, 224), _date_line(ctx, now), 22, MODE_DESKTOP[2], anchor="ms")
+    if ctx.weather:
+        reading = ctx.weather[0]
+        kind = _weather_kind(int(getattr(reading, "weather_code", 0)))
+        line = f"{reading.city} {int(round(reading.temperature_c))}° · {_t(ctx, WEATHER_TEXT[kind])}"
+        text(draw, (WIDTH / 2, 278), fit(draw, line, 16, WIDTH - 60), 16, WHITE, anchor="ms")
+    return image
+
+
+def render_weather_page(ctx: NewScreenContext) -> Image.Image:
+    background = MODE_DESKTOP[0]
+    image = Image.new("RGB", (WIDTH, HEIGHT), background)
+    draw = ImageDraw.Draw(image)
+    now = ctx.now or dt.datetime.now()
+    text(draw, (14, 30), now.strftime("%H:%M"), 22, TEXT, condensed=True, anchor="ls")
+    readings = tuple(ctx.weather)[:3]
+    if not readings:
+        return image
+    first = readings[0]
+    kind = _weather_kind(int(getattr(first, "weather_code", 0)))
+    icon = _icon(_weather_icon_name(first, now), 112, MODE_DESKTOP[2])
+    top = 52 if len(readings) > 1 else 78
+    if icon is not None:
+        image.paste(icon, (34, top + 6), icon)
+    text(draw, (170, top + 84), f"{int(round(first.temperature_c))}°", 92, TEXT, condensed=True, anchor="ls")
+    text(draw, (172, top + 112), fit(draw, first.city, 22, WIDTH - 190), 22, WHITE, anchor="ls")
+    text(draw, (172, top + 136), _t(ctx, WEATHER_TEXT[kind]), 16, MODE_DESKTOP[2], anchor="ls")
+    others = readings[1:]
+    if others:
+        for (left, right), reading in zip(_columns(14, WIDTH - 14, len(others), 10), others):
+            box = (left, HEIGHT - 72, right, HEIGHT - 14)
+            rounded(draw, box, 10, panel_color(background))
+            small = _icon(_weather_icon_name(reading, now), 30, WHITE)
+            if small is not None:
+                image.paste(small, (left + 12, HEIGHT - 58), small)
+            text(draw, (left + 52, HEIGHT - 38), f"{int(round(reading.temperature_c))}°", 26,
+                 TEXT, condensed=True, anchor="ls")
+            text(draw, (left + 52, HEIGHT - 22), fit(draw, reading.city, 13, right - left - 62),
+                 13, WHITE, anchor="ls")
+    return image
+
+
+def _kwh(ctx, value: float) -> str:
+    return f"{_num(value, 2 if value < 10 else 1, ctx.language)} kWh"
+
+
+def _money(ctx, value: float | None) -> str:
+    if value is None:
+        return _t(ctx, "fiyat girilmedi")
+    return f"≈ {_num(value, 2, ctx.language)} TL"
+
+
+def render_energy_page(ctx: NewScreenContext) -> Image.Image:
+    background = MODE_DESKTOP[0]
+    image = Image.new("RGB", (WIDTH, HEIGHT), background)
+    draw = ImageDraw.Draw(image)
+    now = ctx.now or dt.datetime.now()
+    text(draw, (14, 38), _t(ctx, "Elektrik"), 24, TEXT, anchor="ls")
+    text(draw, (WIDTH - 14, 38), now.strftime("%H:%M"), 22, TEXT, condensed=True, anchor="rs")
+    energy = ctx.energy
+    if energy is None:
+        return image
+    watts = getattr(energy, "watts_now", None)
+    _stat_panel(draw, (14, 56, WIDTH - 14, 150), background, _t(ctx, "Şu an (tahmini)"),
+                "—" if watts is None else f"{int(round(watts))} W",
+                value_size=54, value_color=MODE_DESKTOP[2])
+    cells = (
+        (_t(ctx, "Bugün"), _kwh(ctx, energy.today_kwh), _money(ctx, energy.today_cost)),
+        (_t(ctx, "Bu ay"), _kwh(ctx, energy.month_kwh), _money(ctx, energy.month_cost)),
+    )
+    for (left, right), (label, value, sub) in zip(_columns(14, WIDTH - 14, 2, 10), cells):
+        _stat_panel(draw, (left, 160, right, 284), background, label, value, sub, value_size=38)
+    text(draw, (WIDTH / 2, 306), _t(ctx, "CPU + GPU + diğer parçalar · monitör hariç"), 12,
+         WHITE, anchor="ms")
+    return image
+
+
+FACEIT_ORANGE = "#FF5500"
+# FACEIT's own skill-level colours.
+FACEIT_LEVEL_COLORS = {1: "#EEEEEE", 2: "#1CE400", 3: "#1CE400", 4: "#FFC800", 5: "#FFC800",
+                       6: "#FFC800", 7: "#FFC800", 8: "#FF6309", 9: "#FF6309", 10: "#FE1F00"}
+
+
+def render_faceit_page(ctx: NewScreenContext) -> Image.Image:
+    background = MODE_DESKTOP[0]
+    image = Image.new("RGB", (WIDTH, HEIGHT), background)
+    draw = ImageDraw.Draw(image)
+    now = ctx.now or dt.datetime.now()
+    data = ctx.faceit
+    text(draw, (14, 38), "FACEIT", 24, FACEIT_ORANGE, anchor="ls")
+    nickname = getattr(data, "nickname", "") or ""
+    text(draw, (WIDTH - 14, 38), fit(draw, nickname or now.strftime("%H:%M"), 18, 240), 18, TEXT, anchor="rs")
+    if data is None or getattr(data, "elo", None) is None:
+        text(draw, (WIDTH / 2, 170), _t(ctx, getattr(data, "error", "") or "FACEIT verisi bekleniyor"),
+             18, WHITE, anchor="mm")
+        return image
+    # Level badge + ELO
+    level = getattr(data, "level", None)
+    level_color = FACEIT_LEVEL_COLORS.get(level or 0, WHITE)
+    ring(image, (66, 116), 88, 8, (level or 0) / 10.0, level_color, panel_color(background, 0.12))
+    text(draw, (66, 132), str(level or "—"), 40, level_color, condensed=True, anchor="ms")
+    text(draw, (130, 132), str(data.elo), 76, TEXT, condensed=True, anchor="ls")
+    elo_width = _tlen(str(data.elo), font(76, True))
+    text(draw, (136 + elo_width, 104), "ELO", 16, WHITE, anchor="ls")
+    change = getattr(data, "elo_today", None)
+    if change is not None:
+        sign = "+" if change > 0 else ""
+        color = GREEN if change > 0 else RED if change < 0 else WHITE
+        text(draw, (136 + elo_width, 132), _t(ctx, "bugün {change}", change=f"{sign}{change}"), 18,
+             color, anchor="ls")
+    # Last five results, newest first
+    recent = tuple(getattr(data, "recent", ()))[:5]
+    text(draw, (14, 186), _t(ctx, "Son maçlar"), 14, WHITE, anchor="ls")
+    for index, match in enumerate(recent):
+        left = 14 + index * 52
+        box = (left, 196, left + 44, 238)
+        rounded(draw, box, 8, "#14361F" if match.won else "#3A1414")
+        text(draw, ((box[0] + box[2]) / 2, 225), _t(ctx, "G") if match.won else _t(ctx, "M"), 22,
+             GREEN if match.won else RED, condensed=True, anchor="ms")
+    # K/D and HS% over the recent matches
+    cells = (
+        ("K/D", "—" if data.kd is None else _num(data.kd, 2, ctx.language)),
+        ("HS%", "—" if data.headshots is None else f"{int(round(data.headshots))}%"),
+    )
+    for (left, right), (label, value) in zip(_columns(290, WIDTH - 14, 2, 10), cells):
+        _stat_panel(draw, (left, 168, right, 238), background, label, value, value_size=30)
+    footer = _t(ctx, "Son {n} maç ortalaması", n=len(recent)) if recent else ""
+    if getattr(data, "error", ""):
+        footer = _t(ctx, data.error)
+    text(draw, (14, 300), footer, 13, WHITE, anchor="ls")
+    return image
+
+
+PAGE_RENDERERS = {
+    "clock": render_clock_page,
+    "weather": render_weather_page,
+    "energy": render_energy_page,
+    "faceit": render_faceit_page,
+}
+
+
 def render_new_screen(ctx: NewScreenContext) -> Image.Image:
     ctx.language = normalize_language(ctx.language)
     if ctx.mode == "msfs":
         phase = getattr(ctx.flight_state, "phase", "ground") or "ground"
         return MSFS_RENDERERS.get(phase, render_msfs_ground)(ctx)
+    if ctx.mode == "desktop" and ctx.page in PAGE_RENDERERS:
+        return PAGE_RENDERERS[ctx.page](ctx)
     return render_main(ctx)
 
 

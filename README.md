@@ -1,6 +1,24 @@
 # Sabasakal Mini Screen 3.5″
 
-Version 1.2.0
+Version 1.4.0
+
+1.4.0 changes: FACEIT card: ELO, level, today's ELO change, the last five
+matches and their average K/D and HS% appear in the FACEIT section and the idle
+carousel. Only FACEIT's official Data API (open.faceit.com) is read with the
+user's own "Server side" key; there is no contact with the game and nothing is
+requested during a match. The key is stored encrypted with Windows DPAPI for
+that Windows account only. Refreshes every 10 minutes and 2 and 5 minutes after
+CS2 closes.
+
+1.3.0 changes: electricity estimate: an allowance for the other parts
+(default 60 W) is added to the processor and graphics card power sensors and
+divided by the power supply efficiency (default 90%); daily and monthly kWh and
+the TL amount appear in the Electricity section and on the mini display. The
+price comes from the last bill (amount / kWh) or a manual unit price. Monitors
+and time while the app is closed or the PC sleeps are not counted. Idle
+carousel (Claude design): when the keyboard and mouse are left alone for a
+while (default 1 min) the mini display cycles through clock, weather, system
+and electricity pages; game and flight screens are unaffected.
 
 1.2.0 changes: a new, simpler control panel: a sidebar (Overview, Display,
 Information, Colours, Zowie monitor, About), one scrolling page and a fixed

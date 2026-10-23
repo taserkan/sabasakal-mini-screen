@@ -2011,7 +2011,7 @@ class UiAndConnectionScenarios(unittest.TestCase):
         panel = self.make_panel()
         self.assertEqual(
             set(panel.preview_buttons),
-            {"daily", "cs2", "msfs", "weather", "wireless"},
+            {"daily", "clock", "weather", "energy", "faceit", "cs2", "msfs", "wireless"},
         )
         for design in ("new", "classic"):
             panel.design_combo.setCurrentIndex(panel.design_combo.findData(design))
@@ -2743,6 +2743,8 @@ class ZZRealProfileGuardScenarios(unittest.TestCase):
     LIVE_APP_FILES = {
         "runtime.log", "runtime-current.log", "elevated-sensors.json", "instance.json",
         "show-window.request", "show-window.ack", "msfs-landings.json",
+        # v1.3/v1.4: saved every minute / after each refresh by a running instance.
+        "energy.json", "faceit.json",
     }
 
     def _real_instance_running(self) -> bool:
@@ -2773,6 +2775,17 @@ class ZZRealProfileGuardScenarios(unittest.TestCase):
     def test_test_profile_received_the_writes(self) -> None:
         gui.save_settings_file(default_settings())
         self.assertTrue((_TEST_ROOT / "Roaming" / "CS2Screen" / "settings.json").is_file())
+
+    def test_energy_and_faceit_stores_point_at_the_test_profile(self) -> None:
+        # Whitelisting them above is only safe because tests can never reach
+        # the real files: a test panel stores both under the throw-away profile.
+        with patch.object(gui, "load_settings", side_effect=default_settings), patch.object(
+            gui, "get_auto_hardware_labels", return_value={"cpu": "", "gpu": "", "ram": ""},
+        ), patch.object(gui, "get_metrics", return_value={}):
+            panel = gui.ControlPanel(smoke_test=True)
+        self.addCleanup(panel.close)
+        for path in (panel.energy_meter._path, panel.faceit_monitor._path):
+            self.assertTrue(str(path).startswith(str(_TEST_ROOT)), path)
 
 
 class Fix111Base(unittest.TestCase):
@@ -4779,6 +4792,339 @@ class LockScreenScenarios(Fix111Base):
         self.assertIs(snapshot["update_check"], False)
 
 
+class EnergyScenarios(unittest.TestCase):
+    """v1.3: electricity estimate from the CPU/GPU power sensors."""
+
+    def meter(self, readings, settings=None, start=1000.0):
+        import datetime as dt
+        import energy_runtime as er
+        clock = {"t": start}
+        values = iter(readings)
+        directory = tempfile.mkdtemp()
+        cfg = {"energy_other_watts": 60.0, "energy_psu_efficiency": 90.0, **(settings or {})}
+        meter = er.EnergyMeter(
+            lambda: next(values), Path(directory) / "energy.json", lambda: cfg,
+            clock=lambda: clock["t"], today=lambda: dt.date(2026, 10, 23),
+        )
+        return meter, clock, Path(directory) / "energy.json", cfg
+
+    def test_wall_power_adds_other_parts_and_psu_loss(self) -> None:
+        import energy_runtime as er
+        self.assertAlmostEqual(er.wall_watts(100.0, 200.0, 60.0, 90.0), 400.0)
+        self.assertAlmostEqual(er.wall_watts(None, 200.0, 0.0, 100.0), 200.0)
+        self.assertIsNone(er.wall_watts(None, None, 60.0, 90.0))
+        self.assertAlmostEqual(er.wall_watts(0.0, 0.0, 50.0, 10.0), 100.0)  # efficiency floor 50%
+
+    def test_one_hour_at_400_watts_is_0_4_kwh(self) -> None:
+        meter, clock, _path, _cfg = self.meter([(100.0, 200.0)] * 721)
+        for _ in range(721):
+            meter.sample()
+            clock["t"] += 5.0
+        self.assertAlmostEqual(meter.summary().today_kwh, 0.4, places=3)
+        self.assertAlmostEqual(meter.summary().watts_now, 400.0)
+
+    def test_sleep_gap_is_not_counted(self) -> None:
+        meter, clock, _path, _cfg = self.meter([(100.0, 200.0)] * 3)
+        meter.sample()
+        clock["t"] += 8 * 3600  # PC slept all night
+        meter.sample()
+        self.assertEqual(meter.summary().today_kwh, 0.0)
+        clock["t"] += 5.0
+        meter.sample()
+        self.assertGreater(meter.summary().today_kwh, 0.0)
+
+    def test_totals_survive_a_restart_and_price_modes(self) -> None:
+        import energy_runtime as er
+        meter, clock, path, cfg = self.meter([(100.0, 200.0)] * 50)
+        for _ in range(50):
+            meter.sample()
+            clock["t"] += 5.0
+        meter.stop()  # saves
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIn("2026-10-23", saved["days"])
+        again, _clock, _p, _c = self.meter([], start=0.0)
+        again._path = path
+        again._days = again._load()
+        self.assertAlmostEqual(again.summary().today_kwh, meter.summary().today_kwh, places=3)
+        self.assertAlmostEqual(er.price_per_kwh(
+            {"energy_price_mode": "bill", "energy_bill_amount": 1296.4, "energy_bill_kwh": 400}), 3.241)
+        self.assertIsNone(er.price_per_kwh({"energy_price_mode": "bill", "energy_bill_amount": 500}))
+        self.assertEqual(er.price_per_kwh({"energy_price_mode": "unit", "energy_unit_price": 3.24}), 3.24)
+        summary = er.EnergySummary(400.0, 2.0, 40.0, 3.0)
+        self.assertEqual((summary.today_cost, summary.month_cost), (6.0, 120.0))
+
+    def test_corrupt_store_starts_empty(self) -> None:
+        meter, _clock, path, _cfg = self.meter([])
+        path.write_text("{oops", encoding="utf-8")
+        self.assertEqual(meter._load(), {})
+
+    def test_turkish_and_english_numbers_parse(self) -> None:
+        for text, value in (("3,24", 3.24), ("3.24", 3.24), ("1.296,40", 1296.4),
+                            ("1,296.40", 1296.4), ("₺ 812", 812.0), ("", 0.0)):
+            self.assertAlmostEqual(gui._parse_number(text), value)
+        self.assertIsNone(gui._parse_number("abc"))
+        self.assertIsNone(gui._parse_number("nan"))
+
+    def test_energy_settings_are_clamped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "settings.json"
+            path.write_text(json.dumps({
+                "energy_psu_efficiency": 5, "energy_other_watts": -3, "energy_price_mode": "x",
+                "energy_unit_price": "3,24",
+            }), encoding="utf-8")
+            with patch.object(gui, "APP_DATA", root), patch.object(gui, "SETTINGS_PATH", path):
+                loaded = gui.load_settings()
+        self.assertEqual(loaded["energy_psu_efficiency"], 50.0)
+        self.assertEqual(loaded["energy_other_watts"], 0.0)
+        self.assertEqual(loaded["energy_price_mode"], "bill")
+        self.assertEqual(loaded["energy_unit_price"], 0.0)  # strings are not numbers here
+
+
+class EnergyPanelScenarios(Fix111Base):
+    def test_placeholders_follow_language_changes(self) -> None:
+        panel = self.make_panel()
+        field = panel.energy_inputs["energy_unit_price"]
+        self.assertEqual(field.placeholderText(), "Örn. 3,24")
+        panel.language_combo.setCurrentIndex(panel.language_combo.findData("en"))
+        self.assertEqual(field.placeholderText(), "e.g. 3.24")
+        panel.language_combo.setCurrentIndex(panel.language_combo.findData("tr"))
+        self.assertEqual(field.placeholderText(), "Örn. 3,24")
+
+    def test_unit_price_entry_updates_the_calculated_price(self) -> None:
+        panel = self.make_panel()
+        panel.energy_mode_combo.setCurrentIndex(panel.energy_mode_combo.findData("unit"))
+        panel.energy_inputs["energy_unit_price"].setText("3,25")
+        panel._energy_field_changed("energy_unit_price")
+        self.assertEqual(panel.settings["energy_unit_price"], 3.25)
+        self.assertIn("3,25", panel.energy_price_label.text())
+        self.assertEqual(json.loads(gui.SETTINGS_PATH.read_text(encoding="utf-8"))["energy_unit_price"], 3.25)
+
+
+class FakeFaceitClient:
+    """Stand-in for faceit_runtime.FaceitClient: no network in tests."""
+    elo = 1654
+    calls: list = []
+    fail: Exception | None = None
+
+    def __init__(self, key: str) -> None:
+        FakeFaceitClient.calls.append(("key", key))
+
+    def player(self, nickname):
+        if FakeFaceitClient.fail is not None:
+            raise FakeFaceitClient.fail
+        FakeFaceitClient.calls.append(("player", nickname))
+        return "pid-1", nickname, 7, FakeFaceitClient.elo
+
+    def recent(self, player_id, limit=5):
+        import faceit_runtime as fr
+        return (fr.FaceitMatch(True, 20, 1.5, 50.0), fr.FaceitMatch(False, 10, 0.5, 30.0))
+
+
+class FaceitScenarios(unittest.TestCase):
+    """v1.4: FACEIT card from the official Data API with a DPAPI-protected key."""
+
+    def setUp(self) -> None:
+        FakeFaceitClient.calls = []
+        FakeFaceitClient.elo = 1654
+        FakeFaceitClient.fail = None
+
+    def monitor(self, settings=None, in_game=lambda: False, start=0.0):
+        import datetime as dt
+        import faceit_runtime as fr
+        clock = {"t": start}
+        cfg = {"faceit_nickname": "Sabasakal", "faceit_key_protected": fr.protect_secret("KEY-123"),
+               **(settings or {})}
+        monitor = fr.FaceitMonitor(
+            lambda: cfg, Path(tempfile.mkdtemp()) / "faceit.json", in_game,
+            client_factory=FakeFaceitClient, clock=lambda: clock["t"],
+            today=lambda: dt.date(2026, 10, 23),
+        )
+        return monitor, clock, cfg
+
+    def test_api_payloads_are_parsed(self) -> None:
+        import faceit_runtime as fr
+        player = {"player_id": "p1", "nickname": "Sabasakal",
+                  "games": {"cs2": {"skill_level": 7, "faceit_elo": 1654}}}
+        self.assertEqual(fr.parse_player(player), ("p1", "Sabasakal", 7, 1654))
+        with self.assertRaises(ValueError):
+            fr.parse_player({"errors": []})
+        recent = fr.parse_recent_matches({"items": [
+            {"stats": {"Result": "1", "Kills": "24", "K/D Ratio": "1.41", "Headshots %": "52", "Map": "de_mirage"}},
+            {"stats": {"Result": "0", "Kills": "12", "K/D Ratio": "0.71", "Headshots %": "38"}},
+            {"stats": {"Result": "?"}},
+        ]})
+        self.assertEqual([match.won for match in recent], [True, False])
+        self.assertEqual((recent[0].kills, recent[0].kd, recent[0].map_name), (24, 1.41, "Mirage"))
+
+    def test_today_change_uses_the_first_reading_of_the_day(self) -> None:
+        monitor, _clock, _cfg = self.monitor()
+        self.assertEqual(monitor.refresh().elo_today, 0)
+        FakeFaceitClient.elo = 1679
+        snapshot = monitor.refresh()
+        self.assertEqual((snapshot.elo, snapshot.elo_today), (1679, 25))
+        self.assertAlmostEqual(snapshot.kd, 1.0)
+        self.assertIn(("key", "KEY-123"), FakeFaceitClient.calls)  # decrypted only for the request
+
+    def test_no_requests_during_a_match_and_refresh_after_it(self) -> None:
+        state = {"game": True}
+        monitor, clock, _cfg = self.monitor(in_game=lambda: state["game"])
+        self.assertFalse(monitor.tick())  # in game: never poll
+        state["game"] = False
+        self.assertTrue(monitor.tick())  # first look after the match
+        clock["t"] += 60
+        self.assertFalse(monitor.tick())
+        clock["t"] += 70  # +130 s: the 2-minute after-game refresh
+        self.assertTrue(monitor.tick())
+        clock["t"] += 200  # +330 s: the 5-minute one
+        self.assertTrue(monitor.tick())
+        clock["t"] += 60
+        self.assertFalse(monitor.tick())
+
+    def test_errors_keep_the_last_good_card(self) -> None:
+        import urllib.error
+        monitor, _clock, _cfg = self.monitor()
+        monitor.refresh()
+        FakeFaceitClient.fail = urllib.error.HTTPError("u", 429, "limit", {}, None)
+        snapshot = monitor.refresh()
+        self.assertEqual(snapshot.elo, 1654)
+        self.assertEqual(snapshot.error, "FACEIT istek sınırı doldu")
+        FakeFaceitClient.fail = urllib.error.HTTPError("u", 401, "bad", {}, None)
+        self.assertEqual(monitor.refresh().error, "API anahtarı geçersiz")
+
+    def test_unconfigured_monitor_never_calls_the_api(self) -> None:
+        monitor, _clock, _cfg = self.monitor({"faceit_key_protected": ""})
+        self.assertFalse(monitor.configured())
+        self.assertFalse(monitor.tick())
+        self.assertEqual(monitor.refresh().error, "FACEIT ayarlanmadı")
+        self.assertEqual(FakeFaceitClient.calls, [])
+
+    def test_cache_survives_a_restart(self) -> None:
+        import datetime as dt
+        import faceit_runtime as fr
+        monitor, _clock, cfg = self.monitor()
+        monitor.refresh()
+        again = fr.FaceitMonitor(lambda: cfg, monitor._path, lambda: False,
+                                 client_factory=FakeFaceitClient, today=lambda: dt.date(2026, 10, 23))
+        self.assertEqual(again.snapshot().elo, 1654)
+        self.assertEqual(len(again.snapshot().recent), 2)
+
+    def test_key_is_never_stored_in_plain_text(self) -> None:
+        import faceit_runtime as fr
+        protected = fr.protect_secret("SECRET-KEY-42")
+        self.assertNotIn("SECRET-KEY-42", protected)
+        self.assertEqual(fr.unprotect_secret(protected), "SECRET-KEY-42")
+        self.assertEqual(fr.unprotect_secret("garbage=="), "")
+
+    def test_runtime_only_talks_to_the_official_faceit_api(self) -> None:
+        import re
+        source = (Path(__file__).parent / "faceit_runtime.py").read_text(encoding="utf-8")
+        hosts = set(re.findall(r"https?://([\w.-]+)", source))
+        self.assertEqual(hosts, {"open.faceit.com"})
+        lowered = source.lower()
+        for api in ("readprocessmemory", "writeprocessmemory", "openprocess", "sendinput",
+                    "steam", "gamestate", "cs2.exe", "subprocess"):
+            self.assertNotIn(api, lowered, api)
+
+
+class FaceitPanelScenarios(Fix111Base):
+    def test_save_and_verify_stores_only_the_encrypted_key(self) -> None:
+        panel = self.make_panel()
+        panel.faceit_monitor._client_factory = FakeFaceitClient
+        panel.faceit_nickname_input.setText("Sabasakal")
+        panel.faceit_key_input.setText("PLAIN-KEY-777")
+        with patch.object(gui.threading, "Thread") as thread:
+            panel._faceit_save_and_verify()
+            target = thread.call_args.kwargs["target"]
+        self.assertEqual(panel.faceit_key_input.text(), "")  # cleared from the widget
+        raw = gui.SETTINGS_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("PLAIN-KEY-777", raw)
+        self.assertEqual(json.loads(raw)["faceit_nickname"], "Sabasakal")
+        target()  # run the verification synchronously
+        self.app.processEvents()
+        self.assertIn("1654", panel.faceit_status_label.text())
+        self.assertTrue(panel.faceit_save_button.isEnabled())
+        self.assertIn("Kayıtlı", panel.faceit_key_input.placeholderText())
+
+
+class CarouselScenarios(unittest.TestCase):
+    """v1.3: desktop pages rotate only while the PC is idle."""
+
+    def test_page_follows_idle_time_and_rotation_period(self) -> None:
+        pages = ("clock", "weather", "main", "energy")
+        settings = {"carousel_enabled": True, "carousel_seconds": 15, "carousel_idle_seconds": 60}
+        self.assertEqual(gui.carousel_page(settings, 10.0, pages, 0.0), "main")  # in use
+        self.assertEqual(gui.carousel_page(settings, 61.0, pages, 0.0), "clock")
+        self.assertEqual(gui.carousel_page(settings, 61.0, pages, 15.0), "weather")
+        self.assertEqual(gui.carousel_page(settings, 61.0, pages, 45.0), "energy")
+        self.assertEqual(gui.carousel_page(settings, 61.0, pages, 60.0), "clock")
+        self.assertEqual(gui.carousel_page({**settings, "carousel_enabled": False}, 999.0, pages, 15.0), "main")
+        self.assertEqual(gui.carousel_page(settings, 999.0, (), 15.0), "main")
+
+    def test_pages_without_data_are_skipped(self) -> None:
+        import screens_new as sn
+        from energy_runtime import EnergySummary
+        bare = sn.NewScreenContext(metrics={})
+        self.assertEqual(sn.available_pages(bare), ("clock", "main"))
+        full = sn.NewScreenContext(
+            metrics={}, weather=(WeatherReading("Batman", 24.0, 0),),
+            energy=EnergySummary(400.0, 1.0, 2.0, None),
+        )
+        self.assertEqual(sn.available_pages(full), ("clock", "weather", "main", "energy"))
+
+    def test_every_page_renders_in_both_languages(self) -> None:
+        import datetime as dt
+        import screens_new as sn
+        from energy_runtime import EnergySummary
+        for language in ("tr", "en"):
+            for page in ("clock", "weather", "energy", "main"):
+                for energy in (EnergySummary(412.0, 1.84, 41.3, 3.24), EnergySummary(None, 0.0, 0.0, None)):
+                    image = sn.render_new_screen(sn.NewScreenContext(
+                        metrics={}, language=language, page=page, energy=energy,
+                        now=dt.datetime(2026, 10, 23, 14, 52),
+                        weather=(WeatherReading("Batman", 24.0, 0), WeatherReading("Muğla", 19.0, 61)),
+                    ))
+                    self.assertEqual(image.size, (480, 320))
+        # A game or flight never shows a carousel page.
+        cs2 = sn.render_new_screen(sn.NewScreenContext(metrics={}, mode="cs2", page="clock"))
+        main_cs2 = sn.render_new_screen(sn.NewScreenContext(metrics={}, mode="cs2"))
+        self.assertIsNone(ImageChops.difference(cs2, main_cs2).getbbox())
+
+    def test_carousel_settings_default_and_validate(self) -> None:
+        self.assertIs(gui.DEFAULT_SETTINGS["carousel_enabled"], True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "settings.json"
+            path.write_text('{"carousel_seconds": 7, "carousel_idle_seconds": 120}', encoding="utf-8")
+            with patch.object(gui, "APP_DATA", root), patch.object(gui, "SETTINGS_PATH", path):
+                loaded = gui.load_settings()
+        self.assertEqual((loaded["carousel_seconds"], loaded["carousel_idle_seconds"]), (15, 120))
+
+
+class CarouselWorkerScenarios(Fix111Base):
+    def test_worker_shows_carousel_pages_only_while_idle(self) -> None:
+        for idle, expected in ((999.0, "clock"), (0.0, "main")):
+            with self.subTest(idle=idle):
+                panel = self.make_panel()
+                renders: list = []
+                with patch.object(gui, "user_idle_seconds", return_value=idle), patch.object(
+                    gui, "carousel_page",
+                    side_effect=lambda settings, seconds, pages, now: "clock" if seconds >= 60 else "main",
+                ):
+                    DesignSwitchScenarios.run_worker(self, panel, cycles=3, design_renders=renders)
+                self.assertTrue(renders)
+                self.assertEqual(renders[0].page, expected)
+                self.assertEqual(renders[0].mode, "desktop")
+
+    def test_game_screen_ignores_idle_time(self) -> None:
+        panel = self.make_panel()
+        renders: list = []
+        with patch.object(gui, "user_idle_seconds", return_value=999.0):
+            DesignSwitchScenarios.run_worker(self, panel, cycles=3, design_renders=renders, cs2=True)
+        self.assertTrue(renders)
+        self.assertTrue(all(context.page == "main" and context.mode == "cs2" for context in renders))
+
+
 class ThemeScenarios(Fix111Base):
     """v1.2: light (pink-yellow) default theme, live switch to dark."""
 
@@ -4863,9 +5209,10 @@ class UpdateCheckScenarios(unittest.TestCase):
         ), patch.object(gui, "get_metrics", return_value={}):
             panel = gui.ControlPanel(smoke_test=True)
         self.addCleanup(panel.close)
-        newer = ur.evaluate_release(self.release(), gui.APP_VERSION)
+        # A version far above the app's own, so a version bump never breaks this.
+        newer = ur.evaluate_release(self.release(tag_name="v99.0.0"), gui.APP_VERSION)
         panel._update_result(newer, "", True)
-        self.assertIn("1.3.0", panel.update_status_label.text())
+        self.assertIn("99.0.0", panel.update_status_label.text())
         self.assertFalse(panel.update_open_button.isHidden())
         with patch.object(gui.QDesktopServices, "openUrl") as opened:
             panel._open_update_page()

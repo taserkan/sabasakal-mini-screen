@@ -1,6 +1,23 @@
 # Sabasakal Mini Screen 3.5″
 
-Sürüm 1.2.0
+Sürüm 1.4.0
+
+1.4.0 değişiklikleri: FACEIT kartı: ELO, seviye, bugünkü ELO değişimi, son 5
+maç ve bu maçların K/D ve HS% ortalaması FACEIT bölümünde ve dönen ekranlarda
+görünür. Yalnızca FACEIT'in resmi Data API'si (open.faceit.com) kullanıcının
+kendi "Server side" anahtarıyla okunur; oyunla hiçbir iletişim yoktur ve maç
+sırasında hiç istek gönderilmez. Anahtar Windows DPAPI ile yalnızca o Windows
+hesabına özel şifreli saklanır. 10 dakikada bir ve CS2 kapandıktan 2 ve 5
+dakika sonra güncellenir.
+
+1.3.0 değişiklikleri: Elektrik tahmini: işlemci ve ekran kartı güç
+sensörlerine diğer parçalar için bir pay (varsayılan 60 W) eklenir, güç kaynağı
+verimine (varsayılan %90) bölünür; günlük ve aylık kWh ile TL tutarı Elektrik
+bölümünde ve mini ekranda görünür. Fiyat son faturadan (tutar ÷ kWh) ya da
+elle birim fiyatla girilir. Monitörler ve uygulamanın kapalı/uykuda olduğu
+süre sayılmaz. Boştayken dönen ekranlar (Claude tasarımı): klavye ve fareye
+bir süre (varsayılan 1 dk) dokunulmayınca mini ekran saat, hava, sistem ve
+elektrik sayfaları arasında döner; oyun ve uçuş ekranları etkilenmez.
 
 1.2.0 değişiklikleri: Yeni, sade kontrol paneli: solda menü (Genel bakış,
 Ekran, Bilgiler, Renkler, Zowie monitör, Hakkında), sağda kaydırılan tek
