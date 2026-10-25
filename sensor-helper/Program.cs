@@ -103,7 +103,15 @@ internal static class Program
         return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
     }
 
-    private static bool OwnerIsAlive(string ownerPath)
+    // instance.json is replaced by the UI every second; a read can land on the
+    // replace and fail (sharing violation, file briefly missing). One failed
+    // check made the host exit and the UI watchdog restart it mid-game, so the
+    // owner must be missing for this many consecutive checks (~1 s apart).
+    private const int OwnerMissLimit = 5;
+
+    private static bool OwnerIsAlive(string ownerPath) => OwnerIsAlive(ownerPath, out _);
+
+    private static bool OwnerIsAlive(string ownerPath, out string reason)
     {
         try
         {
@@ -114,14 +122,20 @@ internal static class Program
             double heartbeat = root.GetProperty("heartbeat").GetDouble();
             double now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
             if (pid <= 0 || now - heartbeat > OwnerStaleSeconds)
+            {
+                reason = $"heartbeat {now - heartbeat:0.0} s old";
                 return false;
+            }
             using Process owner = Process.GetProcessById(pid);
             double actualCreatedAt = new DateTimeOffset(owner.StartTime.ToUniversalTime())
                 .ToUnixTimeMilliseconds() / 1000.0;
-            return !owner.HasExited && Math.Abs(actualCreatedAt - createdAt) <= 1.0;
+            bool alive = !owner.HasExited && Math.Abs(actualCreatedAt - createdAt) <= 1.0;
+            reason = alive ? "" : "owner process gone";
+            return alive;
         }
-        catch
+        catch (Exception exception)
         {
+            reason = exception.GetType().Name;
             return false;
         }
     }
@@ -152,7 +166,10 @@ internal static class Program
         }
     }
 
-    private static void AppendErrorLog(string cachePath, Exception exception)
+    private static void AppendErrorLog(string cachePath, Exception exception) =>
+        AppendNote(cachePath, exception.GetType().Name + ": " + exception.Message);
+
+    private static void AppendNote(string cachePath, string message)
     {
         try
         {
@@ -163,7 +180,7 @@ internal static class Program
             File.AppendAllText(
                 logPath,
                 DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
-                + " " + exception.GetType().Name + ": " + exception.Message + Environment.NewLine);
+                + " " + message + Environment.NewLine);
         }
         catch
         {
@@ -274,8 +291,26 @@ internal static class Program
             }) { IsBackground = true, Name = "LhmSampler" };
             sampler.Start();
             int consecutiveWriteErrors = 0;
-            while (OwnerIsAlive(ownerPath))
+            int ownerMisses = 0;
+            string ownerMissReason = "";
+            while (true)
             {
+                if (OwnerIsAlive(ownerPath, out string reason))
+                {
+                    if (ownerMisses > 0)
+                        AppendNote(cachePath, $"owner check recovered after {ownerMisses} miss(es): {ownerMissReason}");
+                    ownerMisses = 0;
+                }
+                else
+                {
+                    ownerMisses++;
+                    ownerMissReason = reason;
+                    if (ownerMisses >= OwnerMissLimit)
+                    {
+                        AppendNote(cachePath, $"exit: owner not alive for {ownerMisses} checks: {reason}");
+                        break;
+                    }
+                }
                 float? temp, clock, power;
                 long sampleAge;
                 lock (gate)
@@ -287,6 +322,7 @@ internal static class Program
                 // UI starts a fresh host instead of showing frozen values.
                 if (sampleAge > 60_000)
                 {
+                    AppendNote(cachePath, $"exit: sampler wedged for {sampleAge / 1000} s");
                     stop.Cancel();
                     return 2;
                 }

@@ -35,10 +35,49 @@ class Finding:
     name: str  # process name or service name
     label: str  # what to show the user
     pid: int | None = None
+    vendor: str = ""  # matched BOOSTER_NAMES entry, e.g. "exitlag"
 
 
 def _matches(*values: object) -> bool:
     return any(value and _PATTERN.search(str(value)) for value in values)
+
+
+def vendor_of(*values: object) -> str:
+    """The booster a name/path belongs to ("exitlag", "noping"...), or ""."""
+    for value in values:
+        match = _PATTERN.search(str(value or ""))
+        if match:
+            return match.group(0).lower()
+    return ""
+
+
+def vendors_with_app_open(process_names: Iterable[str], service_binaries: Iterable[str]) -> set[str]:
+    """Boosters with a program running that is not one of their services."""
+    services = {name.lower() for name in service_binaries}
+    return {
+        vendor for vendor in (vendor_of(name) for name in process_names
+                              if str(name).lower() not in services)
+        if vendor
+    }
+
+
+DISPLAY_NAMES = ("ExitLag", "NoPing", "WTFast", "Mudfish", "GearUP", "LagoFast", "Haste",
+                 "Outfox", "PingZapper", "Battle Ping", "Speedify")
+
+
+@dataclass(frozen=True)
+class ScanReport:
+    findings: tuple[Finding, ...]
+    processes_checked: int
+    services_checked: int
+    # Executables of every installed booster service (running or not), so a
+    # service's own process is never mistaken for the program's window.
+    service_binaries: frozenset[str] = frozenset()
+
+
+# Service name -> command line. Service configs almost never change; a
+# reinstalled booster keeps its name, and a new one is simply a new key.
+_SERVICE_BINPATHS: dict[str, str] = {}
 
 
 def scan(
@@ -46,25 +85,73 @@ def scan(
     services: Callable[[], Iterable] = lambda: psutil.win_service_iter(),
 ) -> list[Finding]:
     """Running booster processes and services (nothing is changed)."""
-    found: list[Finding] = []
-    for process in processes():
-        try:
-            info = process.info
-            if _matches(info.get("name"), info.get("exe")):
-                found.append(Finding("process", str(info.get("name") or ""), str(info.get("name") or ""),
-                                     int(info.get("pid") or 0)))
-        except (psutil.Error, AttributeError, TypeError, ValueError):
-            continue
+    return list(scan_report(processes, services).findings)
+
+
+def scan_report(
+    processes: Callable[[], Iterable] = lambda: psutil.process_iter(["pid", "name", "exe"]),
+    services: Callable[[], Iterable] = lambda: psutil.win_service_iter(),
+) -> ScanReport:
+    """Like scan(), plus how many processes and services were checked.
+
+    A service's own executable is reported once, as the service: killing it
+    as a process would look like a crash to Windows, and a service set to
+    "restart on failure" (ExitLag's is) would simply come back.
+    """
+    services_found: list[Finding] = []
+    service_binaries: set[str] = set()  # running booster services
+    installed_binaries: set[str] = set()  # every booster service
+    service_count = 0
     for service in services():
+        service_count += 1
         try:
-            data = service.as_dict()
+            # Name and display name come with the enumeration; the command
+            # line costs a query per service, so it is remembered, and the
+            # status is only asked of booster services.
+            name, display = str(service.name()), str(service.display_name() or "")
+            binpath = _SERVICE_BINPATHS.get(name)
+            if binpath is None:
+                binpath = _SERVICE_BINPATHS[name] = str(service.binpath() or "")
+            vendor = vendor_of(name, display, binpath)
+            if not vendor:
+                continue
+            status = service.status()
         except (psutil.Error, OSError, AttributeError):
             continue
-        if data.get("status") not in ("running", "start_pending") or not _matches(
-                data.get("name"), data.get("display_name"), data.get("binpath")):
+        binary = _binary_name(binpath)
+        if binary:
+            installed_binaries.add(binary)
+        if status not in ("running", "start_pending"):
             continue
-        found.append(Finding("service", str(data.get("name")), str(data.get("display_name") or data.get("name"))))
-    return found
+        services_found.append(Finding("service", name, display or name, vendor=vendor))
+        if binary:
+            service_binaries.add(binary)
+    processes_found: list[Finding] = []
+    process_count = 0
+    for process in processes():
+        process_count += 1
+        try:
+            info = process.info
+            name = str(info.get("name") or "")
+            vendor = vendor_of(name, info.get("exe"))
+            if not vendor or name.lower() in service_binaries:
+                continue
+            processes_found.append(Finding("process", name, name, int(info.get("pid") or 0), vendor))
+        except (psutil.Error, AttributeError, TypeError, ValueError):
+            continue
+    return ScanReport(tuple(processes_found + services_found), process_count, service_count,
+                      frozenset(installed_binaries))
+
+
+def _binary_name(binpath) -> str:
+    """File name of a service command line (quoted or not), lower case."""
+    text = str(binpath or "").strip()
+    if text.startswith('"'):
+        text = text[1:].split('"', 1)[0]
+    else:
+        end = text.lower().find(".exe")
+        text = text[: end + 4] if end >= 0 else text.split(" ", 1)[0]
+    return text.replace("/", "\\").rsplit("\\", 1)[-1].lower()
 
 
 def _hidden() -> int:

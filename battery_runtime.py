@@ -468,7 +468,9 @@ WINDOWS_SCAN_KEEP_FAILURES = 3
 WINDOWS_SCAN_MAX_BACKOFF = 120.0
 # A full PnP enumeration lists every device node (~500); battery levels change
 # slowly and G HUB devices are updated live, so do not repeat it every 2 s.
-WINDOWS_SCAN_MIN_INTERVAL = 10.0
+# Measured 2026-10-23: each pass costs ~230 ms of kernel time on Windows'
+# thread pool, half of the whole app's CPU at a 10 s cadence.
+WINDOWS_SCAN_MIN_INTERVAL = 60.0
 # Cache-backed kinds only; see BatteryDeviceMonitor._scan_windows.
 WINDOWS_SCAN_KINDS = (
     DeviceInformationKind.DEVICE_CONTAINER,

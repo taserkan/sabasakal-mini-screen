@@ -25,8 +25,13 @@ from typing import Callable
 API_ROOT = "https://open.faceit.com/data/v4"
 GAME = "cs2"
 REFRESH_SECONDS = 10 * 60
+# While the FACEIT card is pinned (CS2 + FACEIT AC) a finished match shows up
+# on the card within a few minutes: two small requests every 3 minutes.
+PINNED_REFRESH_SECONDS = 3 * 60
 # After the game closes the match result reaches FACEIT within a few minutes.
 AFTER_GAME_DELAYS = (120, 300)
+# After a followed match ends (faceit_live): the result lands within a minute or two.
+AFTER_MATCH_DELAYS = (60, 180)
 MAX_RESPONSE_BYTES = 512 * 1024
 
 
@@ -80,6 +85,8 @@ class FaceitMatch:
     kd: float | None = None
     headshots: float | None = None
     map_name: str = ""
+    match_id: str = ""
+    score: str = ""  # "13-6", own team first
 
 
 @dataclass(frozen=True)
@@ -93,6 +100,9 @@ class FaceitSnapshot:
     headshots: float | None = None
     updated_at: float = 0.0
     error: str = ""
+    # ELO won/lost in the newest match; None when unknown, or when several
+    # matches finished between two readings (the change can't be split).
+    last_change: int | None = None
 
     @property
     def ready(self) -> bool:
@@ -134,8 +144,19 @@ def parse_recent_matches(payload: dict, limit: int = 5) -> tuple[FaceitMatch, ..
             kd=_number(stats.get("K/D Ratio")),
             headshots=_number(stats.get("Headshots %")),
             map_name=str(stats.get("Map", "")).replace("de_", "").capitalize(),
+            match_id=str(stats.get("Match Id", "") or ""),
+            score=_score(stats.get("Score"), result == "1"),
         ))
     return tuple(matches)
+
+
+def _score(value, won: bool) -> str:
+    """'13 / 6' -> '13-6' with the player's own team first."""
+    parts = [part.strip() for part in str(value or "").split("/")]
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        return ""
+    high, low = sorted((int(parts[0]), int(parts[1])), reverse=True)
+    return f"{high}-{low}" if won else f"{low}-{high}"
 
 
 def _average(values) -> float | None:
@@ -193,10 +214,13 @@ class FaceitMonitor:
         clock: Callable[[], float] = time.monotonic,
         today: Callable[[], dt.date] = dt.date.today,
         log: Callable[[str], None] | None = None,
+        pinned: Callable[[], bool] = lambda: False,
     ) -> None:
         self._settings = settings
         self._path = Path(cache_path)
         self._game_running = game_running
+        self._pinned = pinned
+        self._refreshed_at: float | None = None
         self._client_factory = client_factory
         self._clock = clock
         self._today = today
@@ -210,6 +234,8 @@ class FaceitMonitor:
         self._was_in_game: bool | None = None
         cache = self._load()
         self._baseline: dict = cache.get("baseline", {})
+        # The previous reading: {"elo", "match_id" (newest match), "change"}.
+        self._last: dict = cache.get("last", {}) if isinstance(cache.get("last"), dict) else {}
         self._snapshot = self._snapshot_from_cache(cache.get("snapshot", {}))
 
     # ---- cache ---------------------------------------------------------
@@ -224,7 +250,8 @@ class FaceitMonitor:
     def _snapshot_from_cache(data: dict) -> FaceitSnapshot:
         try:
             recent = tuple(FaceitMatch(**match) for match in data.get("recent", []))
-            fields = {k: data.get(k) for k in ("nickname", "level", "elo", "elo_today", "kd", "headshots")}
+            fields = {k: data.get(k) for k in (
+                "nickname", "level", "elo", "elo_today", "last_change", "kd", "headshots")}
             return FaceitSnapshot(**{k: v for k, v in fields.items() if v is not None}, recent=recent)
         except (TypeError, ValueError, AttributeError):
             return FaceitSnapshot()
@@ -234,9 +261,11 @@ class FaceitMonitor:
         payload = {
             "version": 1,
             "baseline": self._baseline,
+            "last": self._last,
             "snapshot": {
                 "nickname": snapshot.nickname, "level": snapshot.level, "elo": snapshot.elo,
-                "elo_today": snapshot.elo_today, "kd": snapshot.kd, "headshots": snapshot.headshots,
+                "elo_today": snapshot.elo_today, "last_change": snapshot.last_change,
+                "kd": snapshot.kd, "headshots": snapshot.headshots,
                 "recent": [match.__dict__ for match in snapshot.recent],
             },
         }
@@ -281,7 +310,8 @@ class FaceitMonitor:
             with self._lock:
                 self._snapshot = FaceitSnapshot(**{
                     **{k: getattr(self._snapshot, k) for k in (
-                        "nickname", "level", "elo", "elo_today", "recent", "kd", "headshots", "updated_at")},
+                        "nickname", "level", "elo", "elo_today", "last_change", "recent", "kd",
+                        "headshots", "updated_at")},
                     "error": message,
                 })
                 return self._snapshot
@@ -289,9 +319,11 @@ class FaceitMonitor:
         if elo is not None and (self._baseline.get("date") != today or self._baseline.get("player") != player_id):
             self._baseline = {"date": today, "player": player_id, "elo": elo}
         start = self._baseline.get("elo")
+        last_change = self._newest_match_change(elo, recent)
         snapshot = FaceitSnapshot(
             nickname=name or nickname, level=level, elo=elo,
             elo_today=(elo - start) if elo is not None and isinstance(start, int) else None,
+            last_change=last_change,
             recent=recent,
             kd=_average(match.kd for match in recent),
             headshots=_average(match.headshots for match in recent),
@@ -301,6 +333,34 @@ class FaceitMonitor:
             self._snapshot = snapshot
         self._save()
         return snapshot
+
+    def _newest_match_change(self, elo: int | None, recent: tuple[FaceitMatch, ...]) -> int | None:
+        """ELO change of the newest match, from two readings around it."""
+        previous = self._last
+        newest = recent[0].match_id if recent else ""
+        change = previous.get("change") if isinstance(previous.get("change"), int) else None
+        if elo is None or not newest:
+            return change
+        before = previous.get("elo") if isinstance(previous.get("elo"), int) else None
+        if newest == previous.get("match_id"):
+            # Same newest match. A different ELO means FACEIT updated the ELO
+            # before the match list: keep the pre-match reading until it lands.
+            if before is None:
+                self._last = {**previous, "elo": elo}
+            return change
+        if before is not None and elo == before:
+            return change  # the match is listed but its ELO is not settled yet
+        ids = [match.match_id for match in recent]
+        new_matches = ids.index(previous["match_id"]) if previous.get("match_id") in ids else None
+        change = elo - before if new_matches == 1 and before is not None else None
+        self._last = {"elo": elo, "match_id": newest, "change": change}
+        return change
+
+    def match_finished(self) -> None:
+        """A followed match just ended: look for its result shortly."""
+        now = self._clock()
+        self._after_game = sorted(set(self._after_game) | {now + d for d in AFTER_MATCH_DELAYS})
+        self._wake.set()
 
     # ---- thread ----------------------------------------------------------
     @property
@@ -332,10 +392,13 @@ class FaceitMonitor:
         due_after_game = any(now >= at for at in self._after_game)
         if due_after_game:
             self._after_game = [at for at in self._after_game if at > now]
-        if not self.configured() or in_game:
-            return False  # never poll during a match
-        if now >= self._next_at or due_after_game:
+        pinned = bool(self._pinned())
+        if not self.configured() or (in_game and not pinned and not due_after_game):
+            return False  # a plain CS2 session is never polled
+        due_pinned = pinned and (self._refreshed_at is None or now - self._refreshed_at >= PINNED_REFRESH_SECONDS)
+        if now >= self._next_at or due_after_game or due_pinned:
             self._next_at = now + REFRESH_SECONDS
+            self._refreshed_at = now
             self.refresh()
             return True
         return False

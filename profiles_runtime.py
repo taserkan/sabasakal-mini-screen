@@ -164,8 +164,14 @@ class GameProfileMonitor:
             self._first = False
             with self._lock:
                 self._active = found
-            if found is None:
+            leftover = self._read_state()
+            if found is None or (leftover and leftover.get("exe") != found.exe):
                 self._restore_leftovers()
+            if found is not None and self._enabled():
+                # The app (re)started while the game runs, e.g. after an update:
+                # apply now. A state file left for this game still holds the
+                # values from before it started, so those are kept.
+                self._apply(found, keep_state=bool(leftover) and leftover.get("exe") == found.exe)
             return
         with self._lock:
             current = self._active
@@ -200,13 +206,14 @@ class GameProfileMonitor:
             self._log(f"profiles: {label} failed: {type(exc).__name__}: {exc}")
             return None
 
-    def _apply(self, profile: GameProfile) -> None:
-        state: dict = {"exe": profile.exe}
-        if profile.vibrance is not None:
+    def _apply(self, profile: GameProfile, keep_state: bool = False) -> None:
+        state: dict = (self._read_state() or {}) if keep_state else {}
+        state["exe"] = profile.exe
+        if profile.vibrance is not None and "vibrance" not in state:
             previous = self._safe("read vibrance", self._actions.get_vibrance)
             if previous is not None:
                 state["vibrance"] = int(previous)
-        if profile.audio_device:
+        if profile.audio_device and "audio_device" not in state:
             previous = self._safe("read audio", self._actions.get_audio)
             if previous:
                 state["audio_device"] = previous

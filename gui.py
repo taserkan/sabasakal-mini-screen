@@ -40,7 +40,7 @@ from app import (
     HEIGHT,
     MAX_HARDWARE_LABEL_LENGTH, MEDIA_VIS_REGION, MEDIA_VIS_REGION_WITH_BATTERY, PROCESS_SCANNER,
     NVIDIA_MONITOR, SENSOR_CACHE_PATH, SENSOR_MONITOR, ScreenSession,
-    cs2_is_running,
+    cs2_is_running, faceit_ac_is_running,
     get_auto_hardware_labels, get_metrics,
     normalise_hardware_label,
     msfs_session_seconds, render_media_visual_patch, render_screen,
@@ -66,6 +66,8 @@ from energy_runtime import (
     DEFAULT_OTHER_WATTS, DEFAULT_PSU_EFFICIENCY, EnergyMeter, EnergySummary, price_per_kwh,
 )
 from faceit_runtime import FaceitMatch, FaceitMonitor, FaceitSnapshot, protect_secret
+from faceit_live import FaceitLiveMonitor
+from ghub_profiles import GHubProfileGuard
 from audio_devices import (
     default_output_device_id, list_output_devices, set_default_output_device,
 )
@@ -89,7 +91,7 @@ from zowie_runtime import (
 RUN_VALUE_NAME = "CS2Screen"
 STARTUP_TASK_NAME = "SabasakalMiniScreen"
 STARTUP_SHORTCUT_NAME = "Sabasakal Mini Screen.lnk"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "CS2Screen"
 SETTINGS_PATH = APP_DATA / "settings.json"
 RUNTIME_LOG_PATH = APP_DATA / "runtime.log"
@@ -247,6 +249,12 @@ def carousel_progress(settings: dict, idle_seconds: float, pages: tuple[str, ...
         return None
     period = max(5.0, float(settings.get("carousel_seconds", 15)))
     return (now % period) / period
+
+
+def faceit_should_pin(cs2_running: bool, faceit_ac_running: bool, faceit_configured: bool) -> bool:
+    """CS2 with FACEIT AC open means a FACEIT session: keep the FACEIT card on
+    screen (it still rotates with the other idle pages the rest of the time)."""
+    return cs2_running and faceit_ac_running and faceit_configured
 
 
 def carousel_page(settings: dict, idle_seconds: float, pages: tuple[str, ...], now: float) -> str:
@@ -555,6 +563,9 @@ def plan_new_design_update(
         used += cost
     return "tiles", chosen
 NEW_DESIGN_WORKER_INTERVAL = 0.5
+# While a game runs the panel refreshes once a second: half the render and
+# USB work, and a game strip has nothing that needs faster updates.
+NEW_DESIGN_GAME_INTERVAL = 1.0
 NEW_DESIGN_MSFS_INTERVAL = 0.25
 DEFAULT_SETTINGS = {
     "palette": "Kuzey", "colors": PALETTES["Kuzey"], "brightness": 55,
@@ -571,6 +582,8 @@ DEFAULT_SETTINGS = {
     "zowie_desktop_mode": ZOWIE_DEFAULT_DESKTOP_MODE,
     # Blank the LCD while Windows is locked.
     "screen_off_when_locked": True,
+    # When a ping booster's program closes, stop the service it leaves behind.
+    "network_stop_leftovers": False,
     # Read-only daily look at the GitHub release list (never downloads).
     "update_check": True,
     # Control-panel look: "light" (pink-yellow) or "dark".
@@ -593,6 +606,8 @@ DEFAULT_SETTINGS = {
     "screen_transition": "fade",
     # v1.5 game profiles (replace the 1.1.13 Zowie-only add-on).
     "game_profiles_enabled": True,
+    # While a profile game is in front, keep G HUB on that game's own profile.
+    "ghub_profile_guard": True,
     "game_profiles": [],
 }
 TOAST_SECONDS = 3.0
@@ -1390,7 +1405,7 @@ def load_settings() -> dict:
             }
         if isinstance(saved.get("zowie_auto_mode"), bool):
             settings["zowie_auto_mode"] = saved["zowie_auto_mode"]
-        for flag in ("screen_off_when_locked", "update_check"):
+        for flag in ("screen_off_when_locked", "update_check", "network_stop_leftovers", "ghub_profile_guard"):
             if isinstance(saved.get(flag), bool):
                 settings[flag] = saved[flag]
         if saved.get("ui_theme") in UI_THEMES:
@@ -1877,6 +1892,8 @@ class ControlPanel(QWidget):
         self.edit_controls: list[QWidget] = []
         self._editing_enabled = True
         self._preview_image: QImage | None = None
+        # Read by the screen worker; refreshed once a second on the GUI thread.
+        self._preview_visible = True
         self.preview_mode = "daily"
         self._exit_requested = False
         self._session_shutdown_started = False
@@ -1937,6 +1954,21 @@ class ControlPanel(QWidget):
             cache_path=APP_DATA / "faceit.json",
             game_running=cs2_is_running,
             log=_runtime_log,
+            pinned=lambda: cs2_is_running() and faceit_ac_is_running(),
+        )
+        # G HUB kept on a profile game's own profile; started by main().
+        self.ghub_guard = GHubProfileGuard(
+            game_exes=lambda: [profile.exe for profile in self._profiles()],
+            enabled=lambda: bool(self.settings.get("ghub_profile_guard", True)),
+            log=_runtime_log,
+        )
+        # The FACEIT match being played (room read from the browser); started by main().
+        self.faceit_live = FaceitLiveMonitor(
+            settings=lambda: self.settings,
+            active=lambda: faceit_should_pin(
+                cs2_is_running(), faceit_ac_is_running(), self.faceit_monitor.configured()),
+            on_finished=self.faceit_monitor.match_finished,
+            log=_runtime_log,
         )
         # Lock screen + update check state.
         self.display_suspended = threading.Event()
@@ -1978,6 +2010,7 @@ class ControlPanel(QWidget):
         self.zowie_status_timer.timeout.connect(self._refresh_zowie_status)
         self.zowie_status_timer.timeout.connect(self._refresh_energy_readout)
         self.zowie_status_timer.timeout.connect(self._network_tick)
+        self.zowie_status_timer.timeout.connect(self._refresh_preview_visibility)
         self.zowie_status_timer.start(1000)
         self._refresh_zowie_status()
         self.update_status_label.setText(self._tr("Henüz denetlenmedi"))
@@ -2750,6 +2783,16 @@ class ControlPanel(QWidget):
         games_grid.addWidget(self._label("Monitör modu"), 4, 0)
         self.zowie_status_label = self._label("", "section")
         games_grid.addWidget(self.zowie_status_label, 4, 1)
+        games_grid.addWidget(self._label("G HUB"), 5, 0)
+        self.ghub_guard_check = QCheckBox("Oyun öndeyken G HUB'ı oyunun profiline geçir")
+        self.ghub_guard_check.setToolTip(
+            "G HUB oyunun açıldığını bazen kaçırır ve masaüstü DPI'ı kalır. Eklediğin oyun "
+            "öndeyken G HUB'ın kendi oyun profili etkin değilse onu etkinleştirir."
+        )
+        self.ghub_guard_check.setChecked(bool(self.settings.get("ghub_profile_guard", True)))
+        self.ghub_guard_check.toggled.connect(
+            lambda checked: self._set_live_setting("ghub_profile_guard", bool(checked)))
+        games_grid.addWidget(self.ghub_guard_check, 5, 1, Qt.AlignmentFlag.AlignLeft)
         games.addWidget(games_card)
         self._rebuild_profile_rows()
 
@@ -2822,13 +2865,25 @@ class ControlPanel(QWidget):
         network_buttons.addWidget(self.network_stop_button)
         network_buttons.addStretch()
         network_grid.addLayout(network_buttons, 1, 1)
+        self.network_detail_label = self._label("", "device")
+        self.network_detail_label.setWordWrap(True)
+        network_grid.addWidget(self.network_detail_label, 2, 1)
+        network_grid.addWidget(self._label("Otomatik"), 3, 0)
+        self.network_auto_check = QCheckBox("Program kapanınca arkada kalan servisini de kapat")
+        self.network_auto_check.setToolTip(
+            "ExitLag'i kapatınca yalnızca ExitLag'in, NoPing'i kapatınca yalnızca NoPing'in arkada "
+            "kalan servisi kapatılır. Program açıkken hiçbir şeye dokunulmaz."
+        )
+        self.network_auto_check.setChecked(bool(self.settings.get("network_stop_leftovers", False)))
+        self.network_auto_check.toggled.connect(self._network_auto_toggled)
+        network_grid.addWidget(self.network_auto_check, 3, 1, Qt.AlignmentFlag.AlignLeft)
         network_note = self._label(
             "Yalnızca bu programların süreçlerini ve servislerini kapatır; sürücülere, ağ "
             "ayarlarına ve oyuna dokunmaz. Kapattıktan sonra açık olan oyunu yeniden başlatman önerilir.",
             "device",
         )
         network_note.setWordWrap(True)
-        network_grid.addWidget(network_note, 2, 0, 1, 2)
+        network_grid.addWidget(network_note, 4, 0, 1, 2)
         network.addWidget(network_card)
 
         # About + updates
@@ -2946,7 +3001,7 @@ class ControlPanel(QWidget):
     DYNAMIC_LABEL_ATTRIBUTES = (
         "status_label", "brightness_value", "zowie_status_label", "update_status_label",
         "energy_price_label", "energy_readout_label", "faceit_status_label",
-        "network_status_label",
+        "network_status_label", "network_detail_label",
     )
 
     def _register_static_translations(self) -> None:
@@ -3235,30 +3290,78 @@ class ControlPanel(QWidget):
         self._network_next_scan = 0.0
 
     def _network_tick(self) -> None:
-        if not getattr(self, "_network_watch", False) or self._network_busy:
+        if not getattr(self, "_network_watch", False):
+            return
+        auto = bool(self.settings.get("network_stop_leftovers", False))
+        binaries = getattr(self, "_network_service_binaries", None)
+        if auto and binaries is not None:
+            # A booster's own program closed (ExitLag.exe, NoPing...): stop
+            # what it left behind, for that booster only.
+            open_now = network_tools.vendors_with_app_open(PROCESS_SCANNER.names(), binaries)
+            closed = getattr(self, "_network_apps_open", set()) - open_now
+            self._network_apps_open = open_now
+            self._network_stop_vendors = (getattr(self, "_network_stop_vendors", set()) | closed) - open_now
+        else:
+            self._network_apps_open, self._network_stop_vendors = set(), set()
+        if self._network_busy:
+            return
+        if self._network_stop_vendors:
+            vendors, self._network_stop_vendors = self._network_stop_vendors, set()
+            _runtime_log(f"network tools: {', '.join(sorted(vendors))} closed, stopping its leftovers")
+            self._stop_network_tools(vendors)
             return
         now = time.monotonic()
         if now < self._network_next_scan:
             return
-        # Scanning is only useful while someone looks or a game runs.
-        if (self.isVisible() and not self.isMinimized()) or cs2_is_running() or self.profile_monitor.active:
+        # Scanning is only useful while someone looks or a game runs (or the
+        # automatic option still needs to learn the boosters' service names).
+        if (self.isVisible() and not self.isMinimized()) or cs2_is_running() or self.profile_monitor.active \
+                or (auto and binaries is None):
             self._network_next_scan = now + self.NETWORK_SCAN_SECONDS
             self._scan_network_tools()
+
+    NETWORK_MIN_SCANNING_MS = 700  # long enough to see that something happened
 
     def _scan_network_tools(self) -> None:
         if self._network_busy:
             return
         self._network_busy = True
+        self._network_scan_started = time.monotonic()
         self.network_scan_button.setEnabled(False)
+        self.network_scan_button.setText(self._tr("Taranıyor…"))
+        self.network_status_label.setText(self._tr("Taranıyor…"))
+        self.network_status_label.setStyleSheet(f"color: {MUTED};")
         threading.Thread(
-            target=lambda: self.signals.network_scan.emit(network_tools.scan()),
+            target=lambda: self.signals.network_scan.emit(network_tools.scan_report()),
             name="network-scan", daemon=True,
         ).start()
 
-    def _network_scan_result(self, findings) -> None:
+    def _network_scan_result(self, result) -> None:
+        started = getattr(self, "_network_scan_started", None)
+        self._network_scan_started = None
+        if started is not None:
+            remaining = int(self.NETWORK_MIN_SCANNING_MS - (time.monotonic() - started) * 1000)
+            if remaining > 0:
+                QTimer.singleShot(remaining, lambda: self._network_scan_result(result))
+                return
+        report = result if isinstance(result, network_tools.ScanReport) else None
+        findings = list(report.findings) if report is not None else list(result)
+        if report is not None:
+            self._network_service_binaries = report.service_binaries
         self._network_busy = False
         self.network_scan_button.setEnabled(True)
-        self.network_findings = list(findings)
+        self.network_scan_button.setText(self._tr("Yeniden tara"))
+        detail = self._tr(
+            "Son tarama {time}", time=dt.datetime.now().strftime("%H:%M:%S"),
+        )
+        if report is not None:
+            detail += " · " + self._tr(
+                "{processes} süreç ve {services} servis kontrol edildi",
+                processes=report.processes_checked, services=report.services_checked,
+            )
+        detail += " · " + self._tr("Aranan: {names}", names=", ".join(network_tools.DISPLAY_NAMES))
+        self.network_detail_label.setText(detail)
+        self.network_findings = findings
         self.network_stop_button.setEnabled(bool(findings))
         if findings:
             parts = [
@@ -3286,7 +3389,8 @@ class ControlPanel(QWidget):
         if not in_game:
             self._network_warned = False
 
-    def _stop_network_tools(self) -> None:
+    def _stop_network_tools(self, vendors: set[str] | None = None) -> None:
+        """Stop every booster, or only the given ones (their program closed)."""
         if self._network_busy:
             return
         self._network_busy = True
@@ -3296,6 +3400,9 @@ class ControlPanel(QWidget):
 
         def work() -> None:
             findings = network_tools.scan()  # fresh list: never act on stale pids
+            if vendors is not None:
+                reopened = {f.vendor for f in findings if f.kind == "process"}
+                findings = [f for f in findings if f.vendor in vendors - reopened]
             done, failed = network_tools.stop_all(findings)
             self.signals.network_stopped.emit(done, failed)
 
@@ -3371,6 +3478,14 @@ class ControlPanel(QWidget):
         self._show_faceit_status(snapshot)
         if snapshot.ready:
             _runtime_log(f"faceit connected; level={snapshot.level}")
+
+    def _network_auto_toggled(self, checked: bool) -> None:
+        # Live setting, saved at once like the lock-screen one.
+        self.settings = {**self.settings, "network_stop_leftovers": bool(checked)}
+        try:
+            save_settings_file(self.settings)
+        except Exception as exc:
+            _runtime_log(f"network setting save failed: {type(exc).__name__}: {exc}")
 
     def _lock_off_toggled(self, checked: bool) -> None:
         # Live setting (not an edit control): saved at once, works while running.
@@ -3586,6 +3701,8 @@ class ControlPanel(QWidget):
         self.zowie_monitor.stop(timeout=1.0)
         self.energy_meter.stop(timeout=1.0)
         self.faceit_monitor.stop(timeout=1.0)
+        self.faceit_live.stop(timeout=1.0)
+        self.ghub_guard.stop(timeout=1.0)
         self.profile_monitor.stop(timeout=1.0)
         self.profile_monitor.restore_now()
         self.unregister_session_notifications()
@@ -3626,6 +3743,8 @@ class ControlPanel(QWidget):
         self.zowie_monitor.stop(timeout=1.0)
         self.energy_meter.stop(timeout=1.0)
         self.faceit_monitor.stop(timeout=1.0)
+        self.faceit_live.stop(timeout=1.0)
+        self.ghub_guard.stop(timeout=1.0)
         self.profile_monitor.stop(timeout=1.0)
         self.profile_monitor.restore_now()
         self.unregister_session_notifications()
@@ -3727,6 +3846,7 @@ class ControlPanel(QWidget):
                 "energy_price_mode", *ENERGY_LIMITS,
                 "faceit_nickname", "faceit_key_protected",
                 "game_profiles_enabled", "game_profiles", "screen_transition",
+                "network_stop_leftovers", "ghub_profile_guard",
             )},
         }
 
@@ -4102,6 +4222,9 @@ class ControlPanel(QWidget):
             context = NewScreenContext(**common, weather=self._preview_weather_readings())
         return render_new_screen(context)
 
+    def _refresh_preview_visibility(self) -> None:
+        self._preview_visible = self.isVisible() and not self.isMinimized()
+
     def _show_preview(self, image: QImage) -> None:
         self._preview_image = image
         self._update_preview_pixmap()
@@ -4263,6 +4386,7 @@ class ControlPanel(QWidget):
         cached_metrics = None
         game_active = False
         active_profile = None
+        faceit_pinned = False
         msfs_active = False
         msfs_elapsed: float | None = None
         applied_cs2_theme: bool | None = None
@@ -4404,6 +4528,10 @@ class ControlPanel(QWidget):
                     ):
                         active_profile = self.profile_monitor.active
                         game_active = cs2_is_running() or active_profile is not None
+                        # CS2 + FACEIT AC together = a FACEIT match: pin its card.
+                        faceit_pinned = faceit_should_pin(
+                            cs2_is_running(), faceit_ac_is_running(), self.faceit_monitor.configured(),
+                        )
                         msfs_elapsed = msfs_session_seconds()
                         msfs_active = msfs_elapsed is not None
                         last_context_refresh = cycle_started
@@ -4513,7 +4641,8 @@ class ControlPanel(QWidget):
                     elif audio_wanted and not audio_monitor.running:
                         audio_monitor.start()
                     if new_design_active:
-                        if cached_metrics is None or cycle_started - last_metrics_refresh >= 0.5:
+                        metrics_age = NEW_DESIGN_GAME_INTERVAL if game_active else NEW_DESIGN_WORKER_INTERVAL
+                        if cached_metrics is None or cycle_started - last_metrics_refresh >= metrics_age:
                             cached_metrics = get_metrics()
                             last_metrics_refresh = cycle_started
                         language = current.get("language", "tr")
@@ -4543,7 +4672,11 @@ class ControlPanel(QWidget):
                             progress_now = carousel_progress(current, idle_now, pages_now, wall_now)
                         else:
                             requested_detail = ""
-                        if design_mode == "cs2" and active_profile is not None and active_profile.screen == "strip":
+                        live_match = self.faceit_live.snapshot() if faceit_pinned else None
+                        if design_mode == "cs2" and faceit_pinned:
+                            design_mode = "desktop"
+                            requested_detail = "faceit_live" if live_match is not None and live_match.ready else "faceit"
+                        elif design_mode == "cs2" and active_profile is not None and active_profile.screen == "strip":
                             design_mode = "game"
                         design_mode, shown_detail = screen_stabilizer.update(
                             (design_mode, requested_detail), cycle_started,
@@ -4562,6 +4695,7 @@ class ControlPanel(QWidget):
                             page=(shown_detail or "main") if design_mode == "desktop" else "main",
                             energy=energy_summary,
                             faceit=faceit_snapshot,
+                            faceit_live=live_match,
                             toast=self.current_toast(),
                             game_name=active_profile.title if active_profile is not None else "",
                             carousel_progress=progress_now if design_mode == "desktop" else None,
@@ -4880,7 +5014,9 @@ class ControlPanel(QWidget):
                 last_battery_layout_signature = battery_layout_signature
                 last_weather_signature = weather_signature
                 now = time.monotonic()
-                if now - last_preview_refresh >= 0.25:
+                # The settings preview is only worth converting while someone
+                # can see it (the window is usually hidden in the tray).
+                if now - last_preview_refresh >= 0.25 and self._preview_visible:
                     preview_frame = frame
                     if media_patch is not None:
                         preview_frame = frame.copy()
@@ -4918,7 +5054,9 @@ class ControlPanel(QWidget):
                     last_status_message = translated_status
                 elapsed = time.monotonic() - cycle_started
                 target_interval = (
-                    (NEW_DESIGN_MSFS_INTERVAL if msfs_active else NEW_DESIGN_WORKER_INTERVAL)
+                    (NEW_DESIGN_MSFS_INTERVAL if msfs_active
+                     else NEW_DESIGN_GAME_INTERVAL if game_active and not self.current_toast()
+                     else NEW_DESIGN_WORKER_INTERVAL)
                     if new_design_active
                     else 0.045 if media_mode else MSFS_WORKER_INTERVAL if msfs_active
                     else float(current["interval"])
@@ -5124,6 +5262,8 @@ def main() -> int:
         panel.start_zowie_monitor()
         panel.energy_meter.start()
         panel.faceit_monitor.start()
+        panel.faceit_live.start()
+        panel.ghub_guard.start()
         panel.profile_monitor.start()
         panel.start_network_watch()
         panel.register_session_notifications()

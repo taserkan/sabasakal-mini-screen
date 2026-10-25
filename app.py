@@ -197,6 +197,15 @@ def cs2_is_running() -> bool:
     return PROCESS_SCANNER.running("cs2.exe")
 
 
+# FACEIT AC (C:\Program Files\FACEIT AC): the client window and its service.
+FACEIT_AC_PROCESSES = ("faceitclient.exe", "faceitservice.exe")
+
+
+def faceit_ac_is_running() -> bool:
+    names = PROCESS_SCANNER.names()
+    return any(name in names for name in FACEIT_AC_PROCESSES)
+
+
 def msfs_session_seconds() -> float | None:
     """Return the current MSFS 2024 process age, or None when it is closed."""
     started_at = PROCESS_SCANNER.created_at("flightsimulator2024.exe")

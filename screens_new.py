@@ -126,6 +126,7 @@ class NewScreenContext:
     page: str = "main"
     energy: object | None = None  # energy_runtime.EnergySummary
     faceit: object | None = None  # faceit_runtime.FaceitSnapshot (v1.4)
+    faceit_live: object | None = None  # faceit_live.LiveMatch (match being played)
     # v1.5: short banner (e.g. "GAMER 2") drawn over any screen.
     toast: str = ""
     game_name: str = ""
@@ -160,6 +161,12 @@ def _digit_cell(typeface) -> float:
     return max(typeface.getlength(d) for d in "0123456789")
 
 
+@functools.lru_cache(maxsize=2048)
+def _glyph_width(typeface, char: str) -> float:
+    """typeface.getlength, cached: the same labels and glyphs are measured every frame."""
+    return typeface.getlength(char)
+
+
 def _tabular(value: str) -> bool:
     return any(ch.isdigit() for ch in value)
 
@@ -173,9 +180,9 @@ def _tlen(value: str, typeface, spacing: float = 0.0) -> float:
     only, never of the digits shown.
     """
     if not _tabular(value):
-        return typeface.getlength(value) + spacing * max(0, len(value) - 1)
+        return _glyph_width(typeface, value) + spacing * max(0, len(value) - 1)
     cell = _digit_cell(typeface)
-    width = sum(cell if ch.isdigit() else typeface.getlength(ch) for ch in value)
+    width = sum(cell if ch.isdigit() else _glyph_width(typeface, ch) for ch in value)
     return width + spacing * max(0, len(value) - 1)
 
 
@@ -211,12 +218,12 @@ def text(draw: ImageDraw.ImageDraw, xy, value: str, size: int, color: str = WHIT
     cell = _digit_cell(typeface)
     for char in value:
         if char.isdigit():
-            glyph = typeface.getlength(char)
+            glyph = _glyph_width(typeface, char)
             draw.text((x + (cell - glyph) / 2, y), char, font=typeface, fill=color, anchor=vertical)
             x += cell + spacing
         else:
             draw.text((x, y), char, font=typeface, fill=color, anchor=vertical)
-            x += typeface.getlength(char) + spacing
+            x += _glyph_width(typeface, char) + spacing
     return width
 
 
@@ -1057,50 +1064,53 @@ def _weather_icon_name(reading, now: dt.datetime) -> str:
     return WEATHER_ICONS[kind]
 
 
-def render_clock_page(ctx: NewScreenContext) -> Image.Image:
-    background = MODE_DESKTOP[0]
+def _idle_page(ctx: NewScreenContext) -> tuple[Image.Image, ImageDraw.ImageDraw, str]:
+    """Idle carousel page base: the CPU/GPU/RAM/battery strip stays on top."""
+    background, strip_bg, accent = MODE_DESKTOP
     image = Image.new("RGB", (WIDTH, HEIGHT), background)
-    draw = ImageDraw.Draw(image)
+    draw_strip(image, ctx, strip_bg, accent)
+    return image, ImageDraw.Draw(image), background
+
+
+def render_clock_page(ctx: NewScreenContext) -> Image.Image:
+    image, draw, _background = _idle_page(ctx)
     now = ctx.now or dt.datetime.now()
-    text(draw, (WIDTH / 2, 178), now.strftime("%H:%M"), 132, TEXT, condensed=True, anchor="ms")
-    text(draw, (WIDTH / 2, 224), _date_line(ctx, now), 22, MODE_DESKTOP[2], anchor="ms")
+    text(draw, (WIDTH / 2, 172), now.strftime("%H:%M"), 116, TEXT, condensed=True, anchor="ms")
+    text(draw, (WIDTH / 2, 212), _date_line(ctx, now), 20, MODE_DESKTOP[2], anchor="ms")
     if ctx.weather:
         reading = ctx.weather[0]
         kind = _weather_kind(int(getattr(reading, "weather_code", 0)))
         line = f"{reading.city} {int(round(reading.temperature_c))}° · {_t(ctx, WEATHER_TEXT[kind])}"
-        text(draw, (WIDTH / 2, 278), fit(draw, line, 16, WIDTH - 60), 16, WHITE, anchor="ms")
+        text(draw, (WIDTH / 2, 270), fit(draw, line, 16, WIDTH - 60), 16, WHITE, anchor="ms")
     return image
 
 
 def render_weather_page(ctx: NewScreenContext) -> Image.Image:
-    background = MODE_DESKTOP[0]
-    image = Image.new("RGB", (WIDTH, HEIGHT), background)
-    draw = ImageDraw.Draw(image)
+    image, draw, background = _idle_page(ctx)
     now = ctx.now or dt.datetime.now()
-    text(draw, (14, 30), now.strftime("%H:%M"), 22, TEXT, condensed=True, anchor="ls")
     readings = tuple(ctx.weather)[:3]
     if not readings:
         return image
     first = readings[0]
     kind = _weather_kind(int(getattr(first, "weather_code", 0)))
-    icon = _icon(_weather_icon_name(first, now), 112, MODE_DESKTOP[2])
-    top = 52 if len(readings) > 1 else 78
+    icon = _icon(_weather_icon_name(first, now), 96, MODE_DESKTOP[2])
+    top = 66 if len(readings) > 1 else 104
     if icon is not None:
-        image.paste(icon, (34, top + 6), icon)
-    text(draw, (170, top + 84), f"{int(round(first.temperature_c))}°", 92, TEXT, condensed=True, anchor="ls")
-    text(draw, (172, top + 112), fit(draw, first.city, 22, WIDTH - 190), 22, WHITE, anchor="ls")
-    text(draw, (172, top + 136), _t(ctx, WEATHER_TEXT[kind]), 16, MODE_DESKTOP[2], anchor="ls")
+        image.paste(icon, (36, top + 4), icon)
+    text(draw, (158, top + 74), f"{int(round(first.temperature_c))}°", 80, TEXT, condensed=True, anchor="ls")
+    text(draw, (160, top + 102), fit(draw, first.city, 20, WIDTH - 176), 20, WHITE, anchor="ls")
+    text(draw, (160, top + 124), _t(ctx, WEATHER_TEXT[kind]), 15, MODE_DESKTOP[2], anchor="ls")
     others = readings[1:]
     if others:
         for (left, right), reading in zip(_columns(14, WIDTH - 14, len(others), 10), others):
-            box = (left, HEIGHT - 72, right, HEIGHT - 14)
+            box = (left, HEIGHT - 70, right, HEIGHT - 14)
             rounded(draw, box, 10, panel_color(background))
             small = _icon(_weather_icon_name(reading, now), 30, WHITE)
             if small is not None:
-                image.paste(small, (left + 12, HEIGHT - 58), small)
-            text(draw, (left + 52, HEIGHT - 38), f"{int(round(reading.temperature_c))}°", 26,
+                image.paste(small, (left + 12, HEIGHT - 57), small)
+            text(draw, (left + 52, HEIGHT - 37), f"{int(round(reading.temperature_c))}°", 26,
                  TEXT, condensed=True, anchor="ls")
-            text(draw, (left + 52, HEIGHT - 22), fit(draw, reading.city, 13, right - left - 62),
+            text(draw, (left + 52, HEIGHT - 21), fit(draw, reading.city, 13, right - left - 62),
                  13, WHITE, anchor="ls")
     return image
 
@@ -1116,26 +1126,22 @@ def _money(ctx, value: float | None) -> str:
 
 
 def render_energy_page(ctx: NewScreenContext) -> Image.Image:
-    background = MODE_DESKTOP[0]
-    image = Image.new("RGB", (WIDTH, HEIGHT), background)
-    draw = ImageDraw.Draw(image)
-    now = ctx.now or dt.datetime.now()
-    text(draw, (14, 38), _t(ctx, "Elektrik"), 24, TEXT, anchor="ls")
-    text(draw, (WIDTH - 14, 38), now.strftime("%H:%M"), 22, TEXT, condensed=True, anchor="rs")
+    image, draw, background = _idle_page(ctx)
     energy = ctx.energy
     if energy is None:
         return image
     watts = getattr(energy, "watts_now", None)
-    _stat_panel(draw, (14, 56, WIDTH - 14, 150), background, _t(ctx, "Şu an (tahmini)"),
+    _stat_panel(draw, (14, 64, WIDTH - 14, 140), background,
+                _t(ctx, "Elektrik") + " · " + _t(ctx, "Şu an (tahmini)"),
                 "—" if watts is None else f"{int(round(watts))} W",
-                value_size=54, value_color=MODE_DESKTOP[2])
+                value_size=44, value_color=MODE_DESKTOP[2])
     cells = (
         (_t(ctx, "Bugün"), _kwh(ctx, energy.today_kwh), _money(ctx, energy.today_cost)),
         (_t(ctx, "Bu ay"), _kwh(ctx, energy.month_kwh), _money(ctx, energy.month_cost)),
     )
     for (left, right), (label, value, sub) in zip(_columns(14, WIDTH - 14, 2, 10), cells):
-        _stat_panel(draw, (left, 160, right, 284), background, label, value, sub, value_size=38)
-    text(draw, (WIDTH / 2, 306), _t(ctx, "CPU + GPU + diğer parçalar · monitör hariç"), 12,
+        _stat_panel(draw, (left, 148, right, 266), background, label, value, sub, value_size=34)
+    text(draw, (WIDTH / 2, 292), _t(ctx, "CPU + GPU + diğer parçalar · monitör hariç"), 12,
          WHITE, anchor="ms")
     return image
 
@@ -1147,40 +1153,38 @@ FACEIT_LEVEL_COLORS = {1: "#EEEEEE", 2: "#1CE400", 3: "#1CE400", 4: "#FFC800", 5
 
 
 def render_faceit_page(ctx: NewScreenContext) -> Image.Image:
-    background = MODE_DESKTOP[0]
-    image = Image.new("RGB", (WIDTH, HEIGHT), background)
-    draw = ImageDraw.Draw(image)
+    image, draw, background = _idle_page(ctx)
     now = ctx.now or dt.datetime.now()
     data = ctx.faceit
-    text(draw, (14, 38), "FACEIT", 24, FACEIT_ORANGE, anchor="ls")
+    text(draw, (14, 86), "FACEIT", 20, FACEIT_ORANGE, anchor="ls")
     nickname = getattr(data, "nickname", "") or ""
-    text(draw, (WIDTH - 14, 38), fit(draw, nickname or now.strftime("%H:%M"), 18, 240), 18, TEXT, anchor="rs")
+    text(draw, (WIDTH - 14, 86), fit(draw, nickname or now.strftime("%H:%M"), 16, 240), 16, TEXT, anchor="rs")
     if data is None or getattr(data, "elo", None) is None:
-        text(draw, (WIDTH / 2, 170), _t(ctx, getattr(data, "error", "") or "FACEIT verisi bekleniyor"),
+        text(draw, (WIDTH / 2, 190), _t(ctx, getattr(data, "error", "") or "FACEIT verisi bekleniyor"),
              18, WHITE, anchor="mm")
         return image
     # Level badge + ELO
     level = getattr(data, "level", None)
     level_color = FACEIT_LEVEL_COLORS.get(level or 0, WHITE)
-    ring(image, (66, 116), 88, 8, (level or 0) / 10.0, level_color, panel_color(background, 0.12))
-    text(draw, (66, 132), str(level or "—"), 40, level_color, condensed=True, anchor="ms")
-    text(draw, (130, 132), str(data.elo), 76, TEXT, condensed=True, anchor="ls")
-    elo_width = _tlen(str(data.elo), font(76, True))
-    text(draw, (136 + elo_width, 104), "ELO", 16, WHITE, anchor="ls")
+    ring(image, (56, 140), 74, 7, (level or 0) / 10.0, level_color, panel_color(background, 0.12))
+    text(draw, (56, 153), str(level or "—"), 34, level_color, condensed=True, anchor="ms")
+    text(draw, (110, 162), str(data.elo), 66, TEXT, condensed=True, anchor="ls")
+    elo_width = _tlen(str(data.elo), font(66, True))
+    text(draw, (116 + elo_width, 136), "ELO", 15, WHITE, anchor="ls")
     change = getattr(data, "elo_today", None)
     if change is not None:
         sign = "+" if change > 0 else ""
         color = GREEN if change > 0 else RED if change < 0 else WHITE
-        text(draw, (136 + elo_width, 132), _t(ctx, "bugün {change}", change=f"{sign}{change}"), 18,
+        text(draw, (116 + elo_width, 160), _t(ctx, "bugün {change}", change=f"{sign}{change}"), 16,
              color, anchor="ls")
     # Last five results, newest first
     recent = tuple(getattr(data, "recent", ()))[:5]
-    text(draw, (14, 186), _t(ctx, "Son maçlar"), 14, WHITE, anchor="ls")
+    text(draw, (14, 204), _t(ctx, "Son maçlar"), 13, WHITE, anchor="ls")
     for index, match in enumerate(recent):
-        left = 14 + index * 52
-        box = (left, 196, left + 44, 238)
+        left = 14 + index * 50
+        box = (left, 212, left + 42, 250)
         rounded(draw, box, 8, "#14361F" if match.won else "#3A1414")
-        text(draw, ((box[0] + box[2]) / 2, 225), _t(ctx, "G") if match.won else _t(ctx, "M"), 22,
+        text(draw, ((box[0] + box[2]) / 2, 239), _t(ctx, "G") if match.won else _t(ctx, "M"), 20,
              GREEN if match.won else RED, condensed=True, anchor="ms")
     # K/D and HS% over the recent matches
     cells = (
@@ -1188,11 +1192,67 @@ def render_faceit_page(ctx: NewScreenContext) -> Image.Image:
         ("HS%", "—" if data.headshots is None else f"{int(round(data.headshots))}%"),
     )
     for (left, right), (label, value) in zip(_columns(290, WIDTH - 14, 2, 10), cells):
-        _stat_panel(draw, (left, 168, right, 238), background, label, value, value_size=30)
-    footer = _t(ctx, "Son {n} maç ortalaması", n=len(recent)) if recent else ""
+        _stat_panel(draw, (left, 186, right, 250), background, label, value, value_size=28)
+    # Newest match: map, score and the ELO it was worth.
     if getattr(data, "error", ""):
-        footer = _t(ctx, data.error)
-    text(draw, (14, 300), footer, 13, WHITE, anchor="ls")
+        text(draw, (14, 292), _t(ctx, data.error), 13, WHITE, anchor="ls")
+    elif recent:
+        last = recent[0]
+        line = " ".join(part for part in (
+            _t(ctx, "Son maç") + ":", last.map_name, getattr(last, "score", "")) if part)
+        text(draw, (14, 292), line, 14, WHITE, anchor="ls")
+        change = getattr(data, "last_change", None)
+        if change is not None:
+            text(draw, (WIDTH - 14, 292), f"{_signed(change)} ELO", 18, _change_color(change),
+                 condensed=True, anchor="rs")
+    return image
+
+
+def _signed(value: int) -> str:
+    return f"+{value}" if value > 0 else f"−{abs(value)}" if value < 0 else "±0"
+
+
+def _change_color(value: int) -> str:
+    return GREEN if value > 0 else RED if value < 0 else WHITE
+
+
+def render_faceit_live_page(ctx: NewScreenContext) -> Image.Image:
+    """The FACEIT match being played: both teams' average ELO, the map and each
+    team's record on it, and the approximate ELO at stake."""
+    live = ctx.faceit_live
+    if live is None or not getattr(live, "ready", False):
+        return render_faceit_page(ctx)
+    image, draw, background = _idle_page(ctx)
+    # Header: map on the left; own ELO and the previous match's change on the right.
+    text(draw, (14, 88), live.map_name or _t(ctx, "Harita seçiliyor…"), 22,
+         TEXT if live.map_name else WHITE, anchor="ls")
+    right = WIDTH - 14
+    change = getattr(ctx.faceit, "last_change", None)
+    if change is not None:
+        label = f"{_t(ctx, 'Önceki maç')} {_signed(change)}"
+        right -= text(draw, (right, 88), label, 15, _change_color(change), anchor="rs") + 12
+    if live.my_elo is not None:
+        right -= text(draw, (right, 88), str(live.my_elo), 15, TEXT, anchor="rs") + 6
+    text(draw, (right, 88), "FACEIT", 15, FACEIT_ORANGE, anchor="rs")
+    draw.line((14, 102, WIDTH - 14, 102), fill=panel_color(background, 0.14), width=1)
+    # Own team on the left, rival on the right: label, average ELO, map record.
+    teams = sorted(live.teams, key=lambda team: not team.mine)
+    text(draw, (WIDTH / 2, 170), "vs", 18, WHITE, anchor="ms")
+    for center, team in zip((WIDTH * 0.25, WIDTH * 0.75), teams):
+        label = _t(ctx, "Sizin takım") if team.mine else _t(ctx, "Rakip")
+        text(draw, (center, 130), label, 13, FACEIT_ORANGE if team.mine else WHITE, anchor="ms")
+        text(draw, (center, 190), str(team.avg_elo), 58, TEXT, condensed=True, anchor="ms")
+        rate = team.map_win_rate
+        if live.map_name and rate is not None:
+            text(draw, (center, 226), f"{live.map_name} {_pct(rate)}", 18,
+                 GREEN if rate >= 50 else RED, condensed=True, anchor="ms")
+    text(draw, (WIDTH / 2, 208), _t(ctx, "ort. ELO"), 12, WHITE, anchor="ms")
+    draw.line((14, 250, WIDTH - 14, 250), fill=panel_color(background, 0.14), width=1)
+    estimate = live.elo_estimate()
+    if estimate is not None:
+        win, loss = estimate
+        text(draw, (WIDTH / 2 - 12, 288), f"{_t(ctx, 'Kazanırsan')} ≈ +{win}", 18, GREEN, anchor="rs")
+        text(draw, (WIDTH / 2 + 12, 288), f"{_t(ctx, 'Kaybedersen')} ≈ −{loss}", 18, RED, anchor="ls")
     return image
 
 
@@ -1201,6 +1261,7 @@ PAGE_RENDERERS = {
     "weather": render_weather_page,
     "energy": render_energy_page,
     "faceit": render_faceit_page,
+    "faceit_live": render_faceit_live_page,  # pinned only, never in the carousel
 }
 
 

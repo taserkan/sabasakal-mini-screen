@@ -89,6 +89,12 @@ ENGLISH: dict[str, str] = {
     ),
     "Yeniden tara": "Scan again",
     "Hepsini kapat": "Stop all",
+    "Otomatik": "Automatic",
+    "Program kapanınca arkada kalan servisini de kapat": "When the program closes, stop the service it leaves behind",
+    "ExitLag'i kapatınca yalnızca ExitLag'in, NoPing'i kapatınca yalnızca NoPing'in arkada kalan servisi kapatılır. Program açıkken hiçbir şeye dokunulmaz.": (
+        "Closing ExitLag stops only ExitLag's leftover service, closing NoPing only NoPing's. "
+        "Nothing is touched while the program is open."
+    ),
     "Yalnızca bu programların süreçlerini ve servislerini kapatır; sürücülere, ağ ayarlarına ve oyuna dokunmaz. Kapattıktan sonra açık olan oyunu yeniden başlatman önerilir.": (
         "Only stops these programs' processes and services; drivers, network settings and the "
         "game are not touched. Restart a running game afterwards."
@@ -105,6 +111,10 @@ ENGLISH: dict[str, str] = {
     "Kapatılamadı: {items}": "Could not stop: {items}",
     "Henüz taranmadı": "Not scanned yet",
     "Ağ araçlarını kapat": "Stop network tools",
+    "Taranıyor…": "Scanning…",
+    "Son tarama {time}": "Last scan {time}",
+    "{processes} süreç ve {services} servis kontrol edildi": "{processes} processes and {services} services checked",
+    "Aranan: {names}": "Looking for: {names}",
     # v1.5 game profiles
     "Oyun profilleri": "Game profiles",
     "Eklediğin oyun açılınca monitör modu, NVIDIA titreşimi, ses çıkışı ve mini ekran ayarlanır; oyun kapanınca hepsi eski haline döner.": (
@@ -146,6 +156,21 @@ ENGLISH: dict[str, str] = {
     # v1.4 FACEIT
     "bugün {change}": "today {change}",
     "Son maçlar": "Recent matches",
+    "Son maç": "Last match",
+    "Önceki maç": "Last match",
+    "Harita seçiliyor…": "Map vote…",
+    "ort. ELO": "avg ELO",
+    "{map} verisi yok": "no {map} data",
+    "{wins}/{matches} maç kazanılmış": "{wins}/{matches} matches won",
+    "Oyun öndeyken G HUB'ı oyunun profiline geçir": "Keep G HUB on the game's profile while the game is in front",
+    "G HUB oyunun açıldığını bazen kaçırır ve masaüstü DPI'ı kalır. Eklediğin oyun öndeyken G HUB'ın kendi oyun profili etkin değilse onu etkinleştirir.": (
+        "G HUB sometimes misses a game starting and the desktop DPI stays. While an added game "
+        "is in front, G HUB's own profile for it is activated if it is not already."
+    ),
+    "Sizin takım": "Your team",
+    "Rakip": "Opponent",
+    "Kazanırsan": "Win",
+    "Kaybedersen": "Loss",
     "G": "W",
     "M": "L",
     "Son {n} maç ortalaması": "Average of the last {n} matches",

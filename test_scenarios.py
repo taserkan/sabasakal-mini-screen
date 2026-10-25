@@ -1751,6 +1751,18 @@ class UiAndConnectionScenarios(unittest.TestCase):
         # Cold start: wait for the owner's first heartbeat instead of exiting.
         self.assertIn("ownerWait.ElapsedMilliseconds > 10_000", sampler)
 
+    def test_sensor_host_survives_a_single_failed_owner_check(self) -> None:
+        # instance.json is replaced every second; one unlucky read must not end
+        # the host (it did, twice in one CS2 session on 2026-10-23).
+        source = (Path(__file__).parent / "sensor-helper" / "Program.cs").read_text(encoding="utf-8")
+        writer = source.split("sampler.Start();", 1)[1]
+        self.assertNotIn("while (OwnerIsAlive(ownerPath))", writer)
+        self.assertIn("ownerMisses >= OwnerMissLimit", writer)
+        self.assertIn("private const int OwnerMissLimit = 5;", source)
+        # Every exit path leaves its reason in the error log.
+        self.assertIn("exit: owner not alive", writer)
+        self.assertIn("exit: sampler wedged", writer)
+
     def test_new_sensor_host_gets_first_sample_grace_period(self) -> None:
         fake = SimpleNamespace(poll=lambda: None)
         previous = gui._SENSOR_HOST_PROCESS
@@ -4911,9 +4923,12 @@ class NetworkToolsScenarios(unittest.TestCase):
         return SimpleNamespace(info={"pid": pid, "name": name, "exe": exe})
 
     def fake_service(self, name, status="running", display="", binpath=""):
-        return SimpleNamespace(as_dict=lambda: {
-            "name": name, "status": status, "display_name": display or name, "binpath": binpath,
-        })
+        import network_tools as nt
+        nt._SERVICE_BINPATHS.pop(name, None)
+        return SimpleNamespace(
+            name=lambda: name, display_name=lambda: display or name,
+            binpath=lambda: binpath, status=lambda: status,
+        )
 
     def test_scan_finds_only_known_boosters(self) -> None:
         import network_tools as nt
@@ -4933,6 +4948,20 @@ class NetworkToolsScenarios(unittest.TestCase):
         self.assertEqual([(f.kind, f.name) for f in found], [
             ("process", "ExitLag.exe"), ("process", "launcher.exe"), ("service", "ExitLagPmService"),
         ])
+
+    def test_a_service_executable_is_never_killed_as_a_process(self) -> None:
+        # Killing ExitLagPmService.exe looks like a crash and Windows restarts the service.
+        import network_tools as nt
+        found = nt.scan(
+            processes=lambda: [
+                self.fake_process(20, "ExitLagPmService.exe", r"C:\Program Files\ExitLag\ExitLagPmService.exe"),
+            ],
+            services=lambda: [
+                self.fake_service("ExitLagPmService", binpath='"C:\\Program Files\\ExitLag\\ExitLagPmService.exe" -k'),
+            ],
+        )
+        self.assertEqual([(f.kind, f.name) for f in found], [("service", "ExitLagPmService")])
+        self.assertEqual(nt._binary_name(r"C:\Program Files\NoPing\np service.exe --run"), "np service.exe")
 
     def test_stop_all_stops_services_first_and_reports(self) -> None:
         import network_tools as nt
@@ -4956,6 +4985,8 @@ class NetworkToolsScenarios(unittest.TestCase):
 
 
 class NetworkToolsPanelScenarios(Fix111Base):
+    fake_service = NetworkToolsScenarios.fake_service
+
     def test_scan_result_and_stop_flow(self) -> None:
         import network_tools as nt
         panel = self.make_panel()
@@ -4970,6 +5001,28 @@ class NetworkToolsPanelScenarios(Fix111Base):
         panel._network_scan_result([])
         self.assertIn("✓", panel.network_status_label.text())
         self.assertFalse(panel.network_stop_button.isEnabled())
+
+    def test_scan_shows_progress_and_what_was_checked(self) -> None:
+        import network_tools as nt
+        panel = self.make_panel()
+        cs2 = patch.object(gui, "cs2_is_running", return_value=False)
+        cs2.start()
+        self.addCleanup(cs2.stop)
+        with patch.object(gui.threading, "Thread") as thread:
+            panel._scan_network_tools()
+        self.assertTrue(thread.called)
+        self.assertEqual(panel.network_status_label.text(), "Taranıyor…")
+        self.assertEqual(panel.network_scan_button.text(), "Taranıyor…")
+        self.assertFalse(panel.network_scan_button.isEnabled())
+        panel._network_scan_started = time.monotonic() - 5  # the scan took long enough
+        panel._network_scan_result(nt.ScanReport((), 231, 289))
+        self.assertIn("✓", panel.network_status_label.text())
+        detail = panel.network_detail_label.text()
+        self.assertIn("231 süreç ve 289 servis", detail)
+        self.assertIn("Son tarama", detail)
+        self.assertIn("NoPing", detail)
+        self.assertTrue(panel.network_scan_button.isEnabled())
+        self.assertEqual(panel.network_scan_button.text(), "Yeniden tara")
 
     def test_leftover_service_during_a_game_warns_once(self) -> None:
         import network_tools as nt
@@ -4993,6 +5046,88 @@ class NetworkToolsPanelScenarios(Fix111Base):
             with patch.object(gui, "cs2_is_running", return_value=True):
                 panel._network_tick()
             self.assertEqual(scan.call_count, 1)
+
+    def test_a_booster_leftover_is_stopped_only_after_its_own_program_closes(self) -> None:
+        panel = self.make_panel()
+        panel.start_network_watch()
+        procs = {"exitlag.exe": 1.0, "exitlagpmservice.exe": 1.0, "noping.exe": 1.0, "cs2.exe": 1.0}
+        scanner = SimpleNamespace(names=lambda: dict(procs))
+        for target in (patch.object(gui, "PROCESS_SCANNER", scanner),
+                       patch.object(gui, "cs2_is_running", return_value=False)):
+            target.start()
+            self.addCleanup(target.stop)
+        with patch.object(panel, "_scan_network_tools") as scan, \
+                patch.object(panel, "_stop_network_tools") as stop, \
+                patch.object(gui, "save_settings_file"):
+            panel.network_auto_check.setChecked(True)
+            self.assertTrue(panel.settings["network_stop_leftovers"])
+            panel._network_tick()  # service names unknown yet: scan first
+            self.assertEqual(scan.call_count, 1)
+            panel._network_service_binaries = frozenset({"exitlagpmservice.exe"})
+            panel._network_tick()
+            del procs["cs2.exe"]  # closing the game alone changes nothing
+            panel._network_tick()
+            self.assertEqual(stop.call_count, 0)
+            del procs["exitlag.exe"]  # the service process alone does not count as the app
+            panel._network_busy = True  # a scan in flight: wait for it
+            panel._network_tick()
+            self.assertEqual(stop.call_count, 0)
+            panel._network_busy = False
+            panel._network_tick()
+            stop.assert_called_once_with({"exitlag"})
+            panel._network_tick()
+            self.assertEqual(stop.call_count, 1)  # once per close
+            panel.network_auto_check.setChecked(False)
+            del procs["noping.exe"]
+            panel._network_tick()
+            self.assertEqual(stop.call_count, 1)  # option off
+
+    def test_stopping_one_booster_leaves_the_others_alone(self) -> None:
+        import network_tools as nt
+        panel = self.make_panel()
+        findings = [
+            nt.Finding("service", "ExitLagPmService", "ExitLagPmService", vendor="exitlag"),
+            nt.Finding("process", "NoPing.exe", "NoPing.exe", 7, vendor="noping"),
+            nt.Finding("service", "NoPingSvc", "NoPingSvc", vendor="noping"),
+        ]
+        with patch.object(gui.threading, "Thread") as thread:
+            panel._stop_network_tools({"exitlag", "noping"})
+        work = thread.call_args.kwargs["target"]
+        with patch.object(nt, "scan", return_value=findings), \
+                patch.object(nt, "stop_all", return_value=([], [])) as stop_all, \
+                patch.object(panel, "signals", SimpleNamespace(network_stopped=SimpleNamespace(emit=lambda *a: None))):
+            work()
+        # NoPing was opened again in the meantime: only ExitLag's service is stopped.
+        self.assertEqual([f.name for f in stop_all.call_args.args[0]], ["ExitLagPmService"])
+
+    def test_repeat_scans_do_not_requery_every_service(self) -> None:
+        import network_tools as nt
+        calls = {"binpath": 0, "status": 0}
+        service = self.fake_service("Spooler", binpath=r"C:\Windows\System32\spoolsv.exe")
+
+        def counted(key, fn):
+            def wrapper():
+                calls[key] += 1
+                return fn()
+            return wrapper
+
+        service.binpath = counted("binpath", service.binpath)
+        service.status = counted("status", service.status)
+        for _ in range(3):
+            nt.scan(processes=lambda: [], services=lambda: [service])
+        self.assertEqual(calls, {"binpath": 1, "status": 0})  # not a booster: status never asked
+
+    def test_scan_learns_installed_service_binaries_and_vendors(self) -> None:
+        import network_tools as nt
+        stopped = self.fake_service("ExitLagPmService", status="stopped",
+                                    binpath=r"C:\Program Files\ExitLag\ExitLagPmService.exe")
+        report = nt.scan_report(
+            processes=lambda: [SimpleNamespace(info={"pid": 3, "name": "ExitLag.exe", "exe": ""})],
+            services=lambda: [stopped],
+        )
+        self.assertEqual(report.service_binaries, frozenset({"exitlagpmservice.exe"}))
+        self.assertEqual([(f.name, f.vendor) for f in report.findings], [("ExitLag.exe", "exitlag")])
+        self.assertEqual(nt.vendors_with_app_open(["ExitLagPmService.exe", "x.exe"], report.service_binaries), set())
 
 
 class FakeProfileHardware:
@@ -5080,12 +5215,32 @@ class GameProfileScenarios(unittest.TestCase):
         self.polls(monitor, 5)
         self.assertEqual(len(hw.calls), 3)  # still applied, never reverted
 
-    def test_startup_with_the_game_running_changes_nothing(self) -> None:
+    def test_startup_with_the_game_running_applies_the_profile(self) -> None:
+        # An update/restart mid-session reverts on exit, so the new instance
+        # must apply again (2026-10-24: monitor stayed off GAMER2 otherwise).
         monitor, running, hw, _cfg = self.make([self.CS2])
         running.add("cs2.exe")
         self.polls(monitor, 5)
-        self.assertEqual(hw.calls, [])
-        self.assertEqual(monitor.active.exe, "cs2.exe")  # the screen still follows the game
+        self.assertEqual(hw.calls, [("vibrance", 60), ("audio", "dev-headset"), ("monitor", "GAMER2")])
+        self.assertEqual(monitor.active.exe, "cs2.exe")
+        running.clear()
+        self.polls(monitor, 3)
+        self.assertEqual((hw.vibrance, hw.audio), (50, "dev-speakers"))
+
+    def test_startup_mid_game_after_a_crash_keeps_the_pre_game_values(self) -> None:
+        state_dir = tempfile.mkdtemp()
+        monitor, running, hw, _cfg = self.make([self.CS2], state_dir=state_dir)
+        monitor.poll_once()
+        running.add("cs2.exe")
+        monitor.poll_once()  # applied; the state file holds 50 / dev-speakers
+        # Crash; the new instance starts while the game still runs (values are the game's now).
+        again, running2, hw2, _cfg2 = self.make([self.CS2], state_dir=state_dir,
+                                                hardware=FakeProfileHardware(vibrance=60, audio="dev-headset"))
+        running2.add("cs2.exe")
+        again.poll_once()
+        running2.clear()
+        self.polls(again, 3)
+        self.assertEqual((hw2.vibrance, hw2.audio), (50, "dev-speakers"))  # not the in-game 60 / headset
 
     def test_switching_games_restores_then_applies(self) -> None:
         other = {"exe": "valorant.exe", "vibrance": 70}
@@ -5256,7 +5411,243 @@ class FakeFaceitClient:
 
     def recent(self, player_id, limit=5):
         import faceit_runtime as fr
+        if FakeFaceitClient.match_ids:
+            return tuple(fr.FaceitMatch(True, match_id=m) for m in FakeFaceitClient.match_ids)
         return (fr.FaceitMatch(True, 20, 1.5, 50.0), fr.FaceitMatch(False, 10, 0.5, 30.0))
+
+    match_ids: list = []  # newest first; empty = the two fixed matches above
+
+
+class FakeLiveClient(FakeFaceitClient):
+    """Adds the three match-room calls of faceit_live.LiveClient."""
+    match_payload: dict = {}
+    profile_calls = 0
+
+    def player(self, nickname):
+        return "me", nickname, 8, FakeFaceitClient.elo
+
+    def match(self, match_id):
+        return FakeLiveClient.match_payload
+
+    def player_by_id(self, player_id):
+        FakeLiveClient.profile_calls += 1
+        elo = {"me": 1600, "a2": 1700, "b1": 1800, "b2": 1900}[player_id]
+        return {"games": {"cs2": {"faceit_elo": elo}}}
+
+    def player_stats(self, player_id):
+        record = {"me": ("10", "6"), "a2": ("30", "12"), "b1": ("20", "15"), "b2": ("0", "0")}[player_id]
+        return {"segments": [
+            {"type": "Map", "mode": "5v5", "label": "Mirage", "stats": {"Matches": record[0], "Wins": record[1]}},
+            {"type": "Map", "mode": "5v5", "label": "Nuke", "stats": {"Matches": "99", "Wins": "99"}},
+        ]}
+
+
+class GHubProfileGuardScenarios(unittest.TestCase):
+    """G HUB missed CS2's first focus and kept 1200 DPI: switch it to the game's profile."""
+
+    APPS = {"applications": [
+        {"applicationId": "app-cs2", "applicationPath": r"C:\Steam\game\bin\win64\cs2.exe"},
+        {"applicationId": "app-desk", "applicationPath": ""},
+    ]}
+    PROFILES = {"profiles": [
+        {"id": "p-cs2", "applicationId": "app-cs2", "activeForApplication": True},
+        {"id": "p-cs2-old", "applicationId": "app-cs2", "activeForApplication": False},
+        {"id": "p-desk", "applicationId": "app-desk", "activeForApplication": True},
+    ]}
+
+    def guard(self, foreground="cs2.exe", active="p-desk", enabled=True):
+        import contextlib
+        import ghub_profiles as gp
+        state = {"active": active, "calls": [], "fg": foreground, "enabled": enabled}
+
+        def call(verb, path, payload=None):
+            state["calls"].append((verb, path))
+            if verb == "SET":
+                state["active"] = payload["id"]
+                return {"result": {"code": "SUCCESS"}}
+            body = {"/applications": self.APPS, "/profiles": self.PROFILES,
+                    "/profile/active": {"id": state["active"]}}[path]
+            return {"result": {"code": "SUCCESS"}, "payload": body}
+
+        @contextlib.contextmanager
+        def session():
+            yield call
+
+        guard = gp.GHubProfileGuard(lambda: ["cs2.exe"], lambda: state["enabled"],
+                                    foreground=lambda: state["fg"], session=session)
+        return guard, state
+
+    def test_catalog_maps_each_game_to_its_active_profile(self) -> None:
+        import ghub_profiles as gp
+        self.assertEqual(gp.game_profile_ids(self.APPS, self.PROFILES), {"cs2.exe": "p-cs2"})
+
+    def test_missed_game_profile_is_activated_once(self) -> None:
+        guard, state = self.guard()
+        self.assertTrue(guard.tick())
+        self.assertEqual(state["active"], "p-cs2")
+        self.assertFalse(guard.tick())  # already right: no further switch
+        self.assertEqual([c for c in state["calls"] if c[0] == "SET"], [("SET", "/profile/active")])
+
+    def test_desktop_other_apps_and_the_switch_off_are_left_alone(self) -> None:
+        for foreground, enabled in (("explorer.exe", True), ("chrome.exe", True), ("", True), ("cs2.exe", False)):
+            guard, state = self.guard(foreground=foreground, enabled=enabled)
+            self.assertFalse(guard.tick())
+            self.assertEqual(state["calls"], [], (foreground, enabled))  # G HUB is not even asked
+            self.assertEqual(state["active"], "p-desk")
+
+    def test_g_hub_closed_is_quiet(self) -> None:
+        import ghub_profiles as gp
+        logs = []
+
+        def session():
+            raise ConnectionRefusedError("G HUB not running")
+
+        guard = gp.GHubProfileGuard(lambda: ["cs2.exe"], lambda: True, foreground=lambda: "cs2.exe",
+                                    session=session, log=logs.append)
+        self.assertFalse(guard.tick())
+        self.assertFalse(guard.tick())
+        self.assertEqual(len(logs), 1)  # logged once, not every 3 s
+
+
+class FaceitLiveScenarios(unittest.TestCase):
+    """The FACEIT match being played: room id from the browser, rest from the Data API."""
+
+    def setUp(self) -> None:
+        FakeFaceitClient.calls, FakeFaceitClient.fail, FakeFaceitClient.match_ids = [], None, []
+        FakeFaceitClient.elo = 1600
+        FakeLiveClient.profile_calls = 0
+        FakeLiveClient.match_payload = self.room("VOTING", [])
+
+    def tearDown(self) -> None:
+        FakeFaceitClient.elo, FakeFaceitClient.match_ids = 1654, []
+
+    @staticmethod
+    def room(status, picks, mine=True):
+        first = [{"player_id": "me" if mine else "a2", "nickname": "Sabasakal", "game_skill_level": 8},
+                 {"player_id": "a2", "nickname": "mate", "game_skill_level": 9}]
+        return {"status": status, "voting": {"map": {"pick": picks}}, "teams": {
+            "faction1": {"name": "team_Sabasakal", "roster": first if mine else first[1:]},
+            "faction2": {"name": "team_rival", "roster": [
+                {"player_id": "b1", "nickname": "x", "game_skill_level": 10},
+                {"player_id": "b2", "nickname": "y", "game_skill_level": 10}]},
+        }}
+
+    def monitor(self, rooms, active=lambda: True):
+        import faceit_live as fl
+        import faceit_runtime as fr
+        clock, finished = {"t": 0.0}, []
+        cfg = {"faceit_nickname": "Sabasakal", "faceit_key_protected": fr.protect_secret("KEY-123")}
+        monitor = fl.FaceitLiveMonitor(
+            lambda: cfg, active, client_factory=FakeLiveClient, find_match=lambda: rooms[0],
+            on_finished=lambda: finished.append(True), clock=lambda: clock["t"],
+        )
+        return monitor, clock, finished
+
+    def test_room_ids_are_taken_only_from_faceit_room_addresses(self) -> None:
+        import faceit_live as fl
+        room = "1-0b2c1a9e-1234-4abc-9def-0123456789ab"
+        for url in (f"www.faceit.com/en/cs2/room/{room}", f"https://www.faceit.com/tr/cs2/room/{room}/scoreboard",
+                    f"faceit.com/cs2/room/{room.upper()}", f"faceit.com/pt-br/cs2/room/{room}"):
+            self.assertEqual(fl.match_id_from_url(url), room, url)
+        for url in ("kick.com/maj3r", f"example.com/?u=faceit.com/en/csgo/room/{room}",
+                    "www.faceit.com/en/players/Sabasakal", ""):
+            self.assertIsNone(fl.match_id_from_url(url), url)
+        windows = [11, 22]
+        urls = {11: "www.faceit.com/en/players/x", 22: f"www.faceit.com/en/cs2/room/{room}"}
+        self.assertEqual(fl.browser_room_match_id(lambda: windows, urls.get), room)
+
+    def test_elo_estimate_is_symmetric_and_favours_the_underdog(self) -> None:
+        import faceit_live as fl
+        self.assertEqual(fl.elo_change_estimate(1700, 1700), (25, 25))
+        win, loss = fl.elo_change_estimate(1650, 1850)
+        self.assertGreater(win, 25)
+        self.assertEqual(win + loss, 50)
+
+    def test_live_card_follows_the_room_until_the_match_ends(self) -> None:
+        rooms = ["1-room"]
+        monitor, clock, finished = self.monitor(rooms)
+        monitor.tick()
+        live = monitor.snapshot()
+        self.assertTrue(live.ready)
+        self.assertEqual(live.map_name, "")  # still voting
+        mine, rival = live.teams
+        self.assertTrue(mine.mine and not rival.mine)
+        self.assertEqual((mine.avg_elo, rival.avg_elo, live.my_elo), (1650, 1850, 1600))
+        self.assertEqual(FakeLiveClient.profile_calls, 4)
+        # The map gets picked: each team's record on it (sum of its players').
+        FakeLiveClient.match_payload = self.room("ONGOING", ["de_mirage"])
+        clock["t"] += 15
+        monitor.tick()
+        live = monitor.snapshot()
+        self.assertEqual(live.map_name, "Mirage")
+        self.assertEqual((live.teams[0].map_matches, live.teams[0].map_wins), (40, 18))
+        self.assertAlmostEqual(live.teams[1].map_win_rate, 75.0)
+        self.assertEqual(FakeLiveClient.profile_calls, 4)  # players are fetched once per match
+        clock["t"] += 30
+        monitor.tick()  # nothing due before a minute
+        FakeLiveClient.match_payload = self.room("FINISHED", ["de_mirage"])
+        clock["t"] += 60
+        monitor.tick()
+        self.assertIsNone(monitor.snapshot())
+        self.assertEqual(finished, [True])  # the FACEIT card refreshes for the result
+        clock["t"] += 10
+        monitor.tick()  # the finished room still open in the browser is not picked again
+        self.assertIsNone(monitor.snapshot())
+
+    def test_someone_elses_room_and_closing_cs2_clear_the_card(self) -> None:
+        state = {"active": True}
+        FakeLiveClient.match_payload = self.room("ONGOING", ["de_mirage"], mine=False)
+        monitor, clock, _finished = self.monitor(["1-friend"], active=lambda: state["active"])
+        monitor.tick()
+        self.assertIsNone(monitor.snapshot())
+        FakeLiveClient.match_payload = self.room("ONGOING", ["de_mirage"])
+        monitor2, _clock2, _f2 = self.monitor(["1-room"], active=lambda: state["active"])
+        monitor2.tick()
+        self.assertIsNotNone(monitor2.snapshot())
+        state["active"] = False
+        monitor2.tick()
+        self.assertIsNone(monitor2.snapshot())
+
+    def test_last_match_change_needs_both_the_new_match_and_the_new_elo(self) -> None:
+        import faceit_runtime as fr
+        pinned = {"on": False}
+        clock = {"t": 0.0}
+        cfg = {"faceit_nickname": "Sabasakal", "faceit_key_protected": fr.protect_secret("KEY-123")}
+        monitor = fr.FaceitMonitor(lambda: cfg, Path(tempfile.mkdtemp()) / "faceit.json", lambda: True,
+                                   client_factory=FakeFaceitClient, clock=lambda: clock["t"],
+                                   pinned=lambda: pinned["on"])
+        FakeFaceitClient.match_ids = ["m1"]
+        self.assertIsNone(monitor.refresh().last_change)  # first reading: unknown
+        FakeFaceitClient.match_ids = ["m2", "m1"]  # listed, ELO not settled yet
+        self.assertIsNone(monitor.refresh().last_change)
+        FakeFaceitClient.elo = 1624
+        self.assertEqual(monitor.refresh().last_change, 24)
+        FakeFaceitClient.elo = 1600  # ELO first, the match list later
+        self.assertEqual(monitor.refresh().last_change, 24)
+        FakeFaceitClient.match_ids = ["m3", "m2", "m1"]
+        self.assertEqual(monitor.refresh().last_change, -24)
+        FakeFaceitClient.elo, FakeFaceitClient.match_ids = 1650, ["m5", "m4", "m3"]
+        self.assertIsNone(monitor.refresh().last_change)  # two matches since: can't split
+        # In game the card is polled only while pinned (CS2 + FACEIT AC), every 3 minutes.
+        self.assertFalse(monitor.tick())
+        pinned["on"] = True
+        self.assertTrue(monitor.tick())
+        clock["t"] += 120
+        self.assertFalse(monitor.tick())
+        clock["t"] += 61
+        self.assertTrue(monitor.tick())
+        self.assertEqual(fr._score("13 / 6", True), "13-6")
+        self.assertEqual(fr._score("13 / 6", False), "6-13")
+        self.assertEqual(fr._score("", True), "")
+
+    def test_live_screen_falls_back_to_the_card_until_both_teams_are_known(self) -> None:
+        import faceit_live as fl
+        import screens_new as sn
+        card = sn.render_new_screen(sn.NewScreenContext(metrics={}, page="faceit"))
+        empty = sn.render_new_screen(sn.NewScreenContext(metrics={}, page="faceit_live",
+                                                         faceit_live=fl.LiveMatch("1-x")))
+        self.assertEqual(card.tobytes(), empty.tobytes())
+        self.assertNotIn("faceit_live", sn.CAROUSEL_PAGES)  # pinned only
 
 
 class FaceitScenarios(unittest.TestCase):
@@ -5501,6 +5892,44 @@ class TransitionScenarios(Fix111Base):
         self.assertNotEqual(half.getpixel((400, 319)), accent)
         game = sn.render_new_screen(sn.NewScreenContext(metrics={}, mode="cs2", carousel_progress=0.5))
         self.assertNotEqual(game.getpixel((100, 319)), accent)  # never on game screens
+
+    def test_faceit_card_is_pinned_only_for_cs2_with_faceit_ac(self) -> None:
+        self.assertTrue(gui.faceit_should_pin(True, True, True))
+        self.assertFalse(gui.faceit_should_pin(True, False, True))  # matchmaking / premier
+        self.assertFalse(gui.faceit_should_pin(False, True, True))  # FACEIT AC alone
+        self.assertFalse(gui.faceit_should_pin(True, True, False))  # no FACEIT account set up
+        scanner = screen_app.ProcessScanner()
+        for names, expected in ((["cs2.exe"], False), (["cs2.exe", "faceitclient.exe"], True),
+                                (["FACEITService.exe"], True)):
+            processes = [SimpleNamespace(info={"name": n, "create_time": 1.0}) for n in names]
+            scanner.invalidate()
+            with patch.object(screen_app.psutil, "process_iter", return_value=processes), \
+                    patch.object(screen_app, "PROCESS_SCANNER", scanner):
+                self.assertEqual(screen_app.faceit_ac_is_running(), expected, names)
+
+    def test_every_idle_page_keeps_the_cpu_gpu_ram_strip_on_top(self) -> None:
+        import screens_new as sn
+        from energy_runtime import EnergySummary
+        from faceit_runtime import FaceitSnapshot
+        metrics = {"cpu_load": 7.0, "cpu_temp": 48.0, "gpu_load": 3.0, "gpu_temp": 41.0, "ram_load": 38.0}
+        ctx = dict(metrics=metrics, weather=(WeatherReading("İstanbul", 17.0, 2),),
+                   energy=EnergySummary(412.0, 1.84, 41.3, 3.24),
+                   faceit=FaceitSnapshot("Sabasakal", 8, 1551, 25, (), 1.15, 46.6))
+        for page in sn.PAGE_RENDERERS:
+            seen: list[str] = []
+            original = sn.draw_strip
+
+            def spy(image, context, *args, **kwargs):
+                layout = original(image, context, *args, **kwargs)
+                seen.extend(name for name, _box in layout)
+                return layout
+
+            with patch.object(sn, "draw_strip", spy):
+                image = sn.render_new_screen(sn.NewScreenContext(**ctx, page=page))
+            self.assertTrue({"cpu", "gpu", "ram"} <= set(seen), page)
+            # Nothing of the page itself is drawn over the strip.
+            background, strip_bg, _accent = sn.MODE_DESKTOP
+            self.assertEqual(image.getpixel((470, 2)), ImageColor.getrgb(strip_bg), page)
 
     def test_backlight_ramp_is_smooth_and_ends_on_target(self) -> None:
         levels: list[int] = []
